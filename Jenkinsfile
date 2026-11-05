@@ -14,6 +14,11 @@ pipeline {
                 sh './gradlew clean build -PacceptMinecraftEula=true --no-daemon --stacktrace'
             }
         }
+        stage('Repeat server GameTests') {
+            steps {
+                sh 'for run in 1 2 3 4 5; do ./gradlew runGameTest -PacceptMinecraftEula=true --no-daemon || exit 1; done'
+            }
+        }
         stage('Client GameTests') {
             options { timeout(time: 8, unit: 'MINUTES') }
             steps {
