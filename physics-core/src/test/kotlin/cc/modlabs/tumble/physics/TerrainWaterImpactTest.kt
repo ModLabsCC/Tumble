@@ -14,6 +14,18 @@ import kotlin.test.assertTrue
 
 class TerrainWaterImpactTest {
     @Test
+    fun `a sleeping buoyant body wakes when water disappears`() {
+        PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+            val body = world.createBody(bodyAt(0.0, 0.0, 0.0, buoyancy = PhysicsBuoyancy(enabled = true)))
+            world.setSubmersion(body, 1f)
+            repeat(360) { world.step() }
+            assertEquals(true, world.isSleeping(body))
+            world.setSubmersion(body, 0f)
+            assertEquals(false, world.isSleeping(body))
+        }
+    }
+
+    @Test
     fun `floating body levels its nearest upper face`() {
         PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector(0.0, -10.0, 0.0))).use { world ->
             val angle = PI / 6.0

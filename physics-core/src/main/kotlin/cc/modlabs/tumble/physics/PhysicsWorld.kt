@@ -355,8 +355,9 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     fun setSubmersion(bodyId: PhysicsBodyId, fraction: Float): Boolean {
         require(fraction.isFinite() && fraction in 0f..1f) { "Submersion must be between 0 and 1" }
         return withBody(bodyId) {
+            val changed = it.submersion != fraction
             it.submersion = fraction
-            if (fraction > 0f && it.buoyancy.enabled) b3Body_SetAwake(it.nativeId, true)
+            if (changed && it.buoyancy.enabled) b3Body_SetAwake(it.nativeId, true)
         }
     }
 
@@ -474,6 +475,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     private fun createNativeWorld(): b3WorldId {
+        check(b3IsDoublePrecision()) { "Tumble requires a double-precision Box3D native library" }
         require(config.workerCount <= B3_MAX_WORKERS) { "Worker count must not exceed $B3_MAX_WORKERS" }
         val definition = b3DefaultWorldDef()
         val gravity = config.gravity.toNativeVector()
@@ -656,10 +658,11 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     private fun rebuildTerrainSection(position: PhysicsSectionPosition) {
         terrainSections.remove(position)?.destroy()
         val boxes = terrainBlocks[position]?.values?.flatten().orEmpty()
-        if (boxes.isNotEmpty()) createTerrainSection(boxes)?.let { terrainSections[position] = it }
+        if (boxes.isNotEmpty()) createTerrainSection(position, boxes)?.let { terrainSections[position] = it }
     }
 
-    private fun createTerrainSection(boxes: List<TerrainBox>): StaticSectionBody? {
+    private fun createTerrainSection(section: PhysicsSectionPosition, boxes: List<TerrainBox>): StaticSectionBody? {
+        val origin = PhysicsVector(section.x * 16.0, section.y * 16.0, section.z * 16.0)
         val faces = linkedMapOf<FaceKey, MeshFace>()
         boxes.forEach { terrainBox ->
             terrainBox.faces().forEach { face ->
@@ -679,7 +682,8 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
             faces.values.forEachIndexed { faceIndex, face ->
                 face.vertices.forEachIndexed { vertexIndex, vertex ->
                     vertices.position(faceIndex * 4L + vertexIndex)
-                        .x(vertex.x.toFloat()).y(vertex.y.toFloat()).z(vertex.z.toFloat())
+                        .x((vertex.x - origin.x).toFloat())
+                        .y((vertex.y - origin.y).toFloat()).z((vertex.z - origin.z).toFloat())
                 }
                 val firstVertex = faceIndex * 4
                 val firstIndex = faceIndex * 6L
@@ -712,6 +716,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
 
             val bodyDefinition = b3DefaultBodyDef()
             val body = try {
+                bodyDefinition._position().x(origin.x).y(origin.y).z(origin.z)
                 b3CreateBody(nativeWorld, bodyDefinition)
             } finally {
                 bodyDefinition.close()
