@@ -48,6 +48,37 @@ import net.minecraft.world.level.storage.TagValueOutput
 
 class AssemblyGameTests {
     @GameTest(maxTicks = 2500)
+    fun assemblyPausesIfTerrainUnloadsBeforeBodyAcknowledgement(helper: GameTestHelper) {
+        val origin = BlockPos(1664, 50, 0)
+        val remote = origin.offset(32, 0, 0)
+        for (position in listOf(origin, remote)) {
+            helper.level.setChunkForced(position.x shr 4, 0, true)
+            helper.level.getChunkAt(position)
+        }
+        val stone = Blocks.STONE.defaultBlockState()
+        val definition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone), AssemblyBlock(BlockPos(32, 0, 0), stone)))
+        val structure = AssemblyStructure.of(definition, listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))),
+            AssemblyCollisionBox(1, PhysicsBox(PhysicsVector(31.5, -0.5, -0.5), PhysicsVector(32.5, 0.5, 0.5)))
+        ))
+        val entity = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        entity.setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+        entity.initializeAssembly(structure)
+        entity.setDeltaMovement(2.0, 0.0, 0.0)
+        helper.assertTrue(helper.level.addFreshEntity(entity), "could not add assembly")
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        runtime.manager.entityLoaded(entity, helper.level)
+        PhysicsServices.chunkUnloaded(helper.level, remote.x shr 4, 0)
+        helper.assertTrue(TumbleApi.status(helper.level, entity.uuid) == TumbleApi.PropStatus.PAUSED, "creation lost the terrain pause")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            val snapshot = TumbleApi.snapshot(helper.level, entity.uuid)
+                ?: return@succeedWhen helper.assertTrue(false, "assembly body is not ready")
+            helper.assertTrue(snapshot.suspended, "created assembly was not suspended")
+        }
+    }
+
+    @GameTest(maxTicks = 2500)
     fun movingAssemblyPausesAndResumesAcrossTerrainUnload(helper: GameTestHelper) {
         val origin = BlockPos(1536, 50, 0)
         val remote = origin.offset(32, 0, 0)

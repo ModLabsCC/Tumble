@@ -178,6 +178,9 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                 }
                 is PhysicsCommand.WakeBody -> worlds[command.dimension]?.wake(command.bodyId)
                 is PhysicsCommand.SuspendBody -> worlds[command.dimension]?.suspend(command.bodyId)
+                is PhysicsCommand.SuspendProp -> bodies[command.propId]?.takeIf { it.dimension == command.dimension }?.let {
+                    worlds[command.dimension]?.suspend(it.bodyId)
+                }
                 is PhysicsCommand.ResumeBody -> worlds[command.dimension]?.resume(command.bodyId)
                 is PhysicsCommand.SetMotionType -> worlds[command.dimension]
                     ?.setMotionType(command.bodyId, command.motionType)

@@ -522,11 +522,13 @@ class PhysicsPropManager(
     }
 
     private fun pauseForTerrain(prop: PhysicsPropEntity, level: ServerLevel, chunks: Set<Long>) {
-        val body = prop.runtimeBodyId ?: return
+        val body = prop.runtimeBodyId
+        if (body == null && (!prop.physicsPending || prop.uuid in deferredAssemblies)) return
         val waiting = terrainWaits[prop.uuid]
         if (waiting != null) {
             waiting.addAll(chunks)
-        } else if (service.submit(PhysicsCommand.SuspendBody(level.physicsDimensionId(), body))) {
+        } else if (service.submit(if (body == null) PhysicsCommand.SuspendProp(level.physicsDimensionId(), prop.uuid)
+            else PhysicsCommand.SuspendBody(level.physicsDimensionId(), body))) {
             terrainWaits[prop.uuid] = chunks.toMutableSet()
             releaseProp(prop.uuid)
         }
@@ -1467,6 +1469,9 @@ class PhysicsPropManager(
             )
         )
         if (!accepted) entity.physicsPending = false
+        else if (entity.uuid in terrainWaits) {
+            service.submit(PhysicsCommand.SuspendProp(level.physicsDimensionId(), entity.uuid))
+        }
     }
 
     private fun drainAcknowledgements() {

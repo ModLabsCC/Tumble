@@ -8,8 +8,6 @@
 
 **Tech stack:** Fabric, Minecraft 26.3, Kotlin/Java, Box3D4j and Minecraft GameTests.
 
-**Spec:** [Voxel Collision & Moving Structures](https://chatgpt.com/space/page_5500055952e48191939bafce80e3d124) and [Delivery Roadmap](https://chatgpt.com/space/page_a1a889ade16c8191af30e016f6dee21b).
-
 ## Constraints and review focus
 
 - One native body for a 250-block staircase; collision must use each block's actual shape.
