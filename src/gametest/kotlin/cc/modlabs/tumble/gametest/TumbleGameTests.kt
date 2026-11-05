@@ -104,7 +104,12 @@ class TumbleGameTests {
             }
             val submerged = MinecraftTerrainAdapter.submersion(helper.level, prop.boundingBox)
             helper.assertTrue(submerged > 0f, "floating prop no longer touches water")
-            helper.assertTrue(prop.y in 3.0..4.1, "oak log did not float near the water surface: y=${prop.y}")
+            helper.assertTrue(
+                prop.y in 3.0..4.1,
+                "oak log did not float: y=${prop.y}, water=$submerged, velocity=${prop.deltaMovement}, " +
+                    "snapshot=${runtime.service.latestFrame(networkProp.dimension).bodies[networkProp.bodyId]}, " +
+                    "waterResponse=${MinecraftTerrainAdapter.buoyancy(prop.blockState)}, service=${runtime.service.debugState()}"
+            )
             helper.assertTrue(abs(prop.deltaMovement.y) < 0.05, "oak log is still bouncing")
             drainedAt = prop.y
             for (x in 0..2) for (z in 0..2) for (y in 1..3) {
