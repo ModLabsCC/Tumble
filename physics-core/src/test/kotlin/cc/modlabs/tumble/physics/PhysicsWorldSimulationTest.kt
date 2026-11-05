@@ -10,6 +10,19 @@ import kotlin.test.assertTrue
 
 class PhysicsWorldSimulationTest {
     @Test
+    fun `combined step snapshots match independent reads for moving and static bodies`() = PhysicsWorld().use { world ->
+        val moving = world.createBody(bodyAt(0.0, 4.0, 0.0))
+        val stationary = world.createBody(bodyAt(4.0, 0.0, 0.0).copy(motionType = PhysicsMotionType.STATIC))
+        repeat(5) {
+            val combined = world.stepAndSnapshots().associateBy { it.bodyId }
+            assertEquals(world.snapshots().associateBy { it.bodyId }, combined)
+            assertEquals(setOf(moving, stationary), combined.keys)
+        }
+        world.destroyBody(moving)
+        assertEquals(setOf(stationary), world.stepAndSnapshots().map { it.bodyId }.toSet())
+    }
+
+    @Test
     fun `weld preserves relative transform and can be removed`() = PhysicsWorld(
         PhysicsWorldConfig(gravity = PhysicsVector.ZERO)
     ).use { world ->
@@ -66,6 +79,7 @@ class PhysicsWorldSimulationTest {
         assertTrue(snapshot.transform.position.y in 1.49..1.51, "body y=${snapshot.transform.position.y}")
         assertTrue(snapshot.sleeping)
         assertEquals(true, world.isSleeping(body))
+        assertEquals(world.snapshots(), world.stepAndSnapshots())
         assertTrue(world.wake(body))
         assertEquals(false, world.isSleeping(body))
     }

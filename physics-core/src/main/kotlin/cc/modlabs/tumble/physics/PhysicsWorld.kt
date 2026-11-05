@@ -43,6 +43,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     private var buoyancyForceScale: Float? = null
 
     /** Owning physics thread only. */
+    @JvmName("createBody")
     fun createBody(definition: PhysicsBodyDefinition): PhysicsBodyId {
         checkUsable()
         val nativeBody = createNativeBody(definition)
@@ -55,6 +56,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. Returns false when the body is already absent. */
+    @JvmName("destroyBody")
     fun destroyBody(bodyId: PhysicsBodyId): Boolean {
         checkUsable()
         val body = bodies.remove(bodyId) ?: return false
@@ -70,6 +72,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. Welds two bodies without changing their current relative transform. */
+    @JvmName("createWeld")
     fun createWeld(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
         checkUsable()
         if (bodyA == bodyB || welds.any { it.connects(bodyA, bodyB) }) return false
@@ -104,6 +107,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("destroyWelds")
     fun destroyWelds(bodyId: PhysicsBodyId): Int {
         checkUsable()
         val matches = welds.filter { it.bodyA == bodyId || it.bodyB == bodyId }
@@ -116,6 +120,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("destroyWeld")
     fun destroyWeld(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
         checkUsable()
         val weld = welds.firstOrNull { it.connects(bodyA, bodyB) } ?: return false
@@ -130,6 +135,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         return welds.size
     }
 
+    @JvmName("createRope")
     fun createRope(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, length: Float): Boolean {
         checkUsable()
         require(length.isFinite() && length > 0f) { "Rope length must be positive" }
@@ -152,6 +158,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         }
     }
 
+    @JvmName("createAxis")
     fun createAxis(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
         checkUsable()
         val first = bodies[bodyA] ?: return false
@@ -173,6 +180,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         }
     }
 
+    @JvmName("createNoCollide")
     fun createNoCollide(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
         checkUsable()
         val first = bodies[bodyA] ?: return false
@@ -186,6 +194,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         }
     }
 
+    @JvmName("destroyToolConstraints")
     fun destroyToolConstraints(bodyId: PhysicsBodyId): Int {
         checkUsable()
         val matches = toolJoints.filter { it.bodyA == bodyId || it.bodyB == bodyId }
@@ -206,11 +215,13 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         return true
     }
 
+    @JvmName("containsBody")
     fun containsBody(bodyId: PhysicsBodyId): Boolean {
         checkUsable()
         return bodyId in bodies
     }
 
+    @JvmName("snapshot")
     fun snapshot(bodyId: PhysicsBodyId): PhysicsBodySnapshot? {
         checkUsable()
         return bodies[bodyId]?.let { snapshotOf(bodyId, it) }
@@ -240,13 +251,21 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         return latestMovedSnapshots
     }
 
+    /** Advances once and reuses move-event snapshots when collecting all bodies. */
+    fun stepAndSnapshots(): List<PhysicsBodySnapshot> {
+        val moved = step().associateBy { it.bodyId }
+        return bodies.map { (id, body) -> moved[id] ?: snapshotOf(id, body) }
+    }
+
     /** Owning physics thread only. */
+    @JvmName("setLinearVelocity")
     fun setLinearVelocity(bodyId: PhysicsBodyId, velocity: PhysicsVector): Boolean = withBody(bodyId) { body ->
         velocity.toNativeVector().use { nativeVelocity -> b3Body_SetLinearVelocity(body.nativeId, nativeVelocity) }
         b3Body_SetAwake(body.nativeId, true)
     }
 
     /** Owning physics thread only. */
+    @JvmName("setTransform")
     fun setTransform(bodyId: PhysicsBodyId, transform: PhysicsTransform): Boolean = withBody(bodyId) { body ->
         transform.position.toNativePosition().use { position ->
             transform.rotation.normalized().toNativeRotation().use { rotation ->
@@ -257,6 +276,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("addLinearVelocity")
     fun addLinearVelocity(bodyId: PhysicsBodyId, delta: PhysicsVector): Boolean = withBody(bodyId) { body ->
         b3Body_GetLinearVelocity(body.nativeId).let { current ->
             try {
@@ -272,17 +292,20 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("setAngularVelocity")
     fun setAngularVelocity(bodyId: PhysicsBodyId, velocity: PhysicsVector): Boolean = withBody(bodyId) { body ->
         velocity.toNativeVector().use { nativeVelocity -> b3Body_SetAngularVelocity(body.nativeId, nativeVelocity) }
         b3Body_SetAwake(body.nativeId, true)
     }
 
     /** Owning physics thread only. */
+    @JvmName("applyCentralForce")
     fun applyCentralForce(bodyId: PhysicsBodyId, force: PhysicsVector): Boolean = withBody(bodyId) { body ->
         force.toNativeVector().use { nativeForce -> b3Body_ApplyForceToCenter(body.nativeId, nativeForce, true) }
     }
 
     /** Owning physics thread only. */
+    @JvmName("applyForceAtPosition")
     fun applyForceAtPosition(
         bodyId: PhysicsBodyId,
         force: PhysicsVector,
@@ -296,6 +319,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("applyCentralImpulse")
     fun applyCentralImpulse(bodyId: PhysicsBodyId, impulse: PhysicsVector): Boolean = withBody(bodyId) { body ->
         impulse.toNativeVector().use { nativeImpulse ->
             b3Body_ApplyLinearImpulseToCenter(body.nativeId, nativeImpulse, true)
@@ -303,16 +327,19 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("wake")
     fun wake(bodyId: PhysicsBodyId): Boolean = withBody(bodyId) {
         b3Body_SetAwake(it.nativeId, true)
     }
 
+    @JvmName("isSleeping")
     fun isSleeping(bodyId: PhysicsBodyId): Boolean? {
         checkUsable()
         return bodies[bodyId]?.let { !b3Body_IsAwake(it.nativeId) }
     }
 
     /** Owning physics thread only. */
+    @JvmName("setMotionType")
     fun setMotionType(bodyId: PhysicsBodyId, motionType: PhysicsMotionType): Boolean = withBody(bodyId) {
         b3Body_SetType(it.nativeId, motionType.nativeValue)
         it.motionType = motionType
@@ -320,6 +347,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. The body must be kinematic. */
+    @JvmName("setKinematicTarget")
     fun setKinematicTarget(
         bodyId: PhysicsBodyId,
         target: PhysicsTransform,
@@ -333,6 +361,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. Creates a kinematic body that destroys itself after lifetimeSteps. */
+    @JvmName("createTemporaryKinematicBody")
     fun createTemporaryKinematicBody(
         definition: PhysicsBodyDefinition,
         targetTransform: PhysicsTransform,
@@ -352,6 +381,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. Returns false for an unknown body. */
+    @JvmName("setSubmersion")
     fun setSubmersion(bodyId: PhysicsBodyId, fraction: Float): Boolean {
         require(fraction.isFinite() && fraction in 0f..1f) { "Submersion must be between 0 and 1" }
         return withBody(bodyId) {
@@ -427,6 +457,16 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         val incoming = geometry.mapTo(hashSetOf()) { it.position }
         val removals = terrainBlocks.values.flatMap { it.keys }
             .filterNot(incoming::contains).map { TerrainBlockGeometry(it, emptyList()) }
+        syncTerrain(removals + geometry)
+    }
+
+    /** Owning physics thread only. Atomically replaces the contents of one section. */
+    fun replaceTerrainSection(section: PhysicsSectionPosition, geometry: Collection<TerrainBlockGeometry>) {
+        checkUsable()
+        require(geometry.all { it.position.section() == section }) { "Geometry must belong to the requested section" }
+        val incoming = geometry.mapTo(hashSetOf()) { it.position }
+        val removals = terrainBlocks[section].orEmpty().keys.filterNot(incoming::contains)
+            .map { TerrainBlockGeometry(it, emptyList()) }
         syncTerrain(removals + geometry)
     }
 
@@ -680,16 +720,17 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
             }
         }
         if (faces.isEmpty()) return null
-        val materials = faces.values.map(MeshFace::material).distinct()
+        val mergedFaces = mergeTerrainFaces(faces.values.toList())
+        val materials = mergedFaces.map(MeshFace::material).distinct()
         require(materials.size <= 256) { "Terrain section contains too many surface materials" }
 
-        val vertices = b3Vec3(faces.size * 4L)
-        val indices = IntPointer(faces.size * 6L)
-        val materialIndices = BytePointer(faces.size * 2L)
+        val vertices = b3Vec3(mergedFaces.size * 4L)
+        val indices = IntPointer(mergedFaces.size * 6L)
+        val materialIndices = BytePointer(mergedFaces.size * 2L)
         val nativeMaterials = b3SurfaceMaterial(materials.size.toLong())
         var mesh: b3MeshData? = null
         try {
-            faces.values.forEachIndexed { faceIndex, face ->
+            mergedFaces.forEachIndexed { faceIndex, face ->
                 face.vertices.forEachIndexed { vertexIndex, vertex ->
                     vertices.position(faceIndex * 4L + vertexIndex)
                         .x((vertex.x - origin.x).toFloat())
@@ -711,8 +752,8 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
                 meshDefinition.vertices(vertices.position(0))
                 meshDefinition.indices(indices.position(0))
                 meshDefinition.materialIndices(materialIndices.position(0))
-                meshDefinition.vertexCount(faces.size * 4)
-                meshDefinition.triangleCount(faces.size * 2)
+                meshDefinition.vertexCount(mergedFaces.size * 4)
+                meshDefinition.triangleCount(mergedFaces.size * 2)
                 meshDefinition.weldTolerance(0.0001f)
                 meshDefinition.weldVertices(true)
                 meshDefinition.useMedianSplit(true)
@@ -742,7 +783,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
                     scale.close()
                     shapeDefinition.close()
                 }
-                return StaticSectionBody(body, createdMesh, faces.size * 2)
+                return StaticSectionBody(body, createdMesh, mergedFaces.size * 2)
             } catch (error: Throwable) {
                 b3DestroyBody(body)
                 body.close()
@@ -966,6 +1007,60 @@ private fun b3SurfaceMaterial.copyFrom(material: PhysicsMaterial): b3SurfaceMate
     } finally {
         tangent.close()
     }
+}
+
+private data class FaceMergeGroup(
+    val axis: Int, val plane: Double, val direction: Boolean, val material: PhysicsMaterial,
+    val fixedMin: Double, val fixedMax: Double
+)
+
+private fun mergeTerrainFaces(faces: List<PhysicsWorld.MeshFace>): List<PhysicsWorld.MeshFace> {
+    fun mergeAlong(input: List<PhysicsWorld.MeshFace>, alongA: Boolean): List<PhysicsWorld.MeshFace> {
+        val groups = input.groupBy { face ->
+            val key = face.key
+            val (a, b, c) = face.vertices
+            val ux = b.x - a.x
+            val uy = b.y - a.y
+            val uz = b.z - a.z
+            val vx = c.x - a.x
+            val vy = c.y - a.y
+            val vz = c.z - a.z
+            val normal = when (key.axis) {
+                0 -> uy * vz - uz * vy
+                1 -> uz * vx - ux * vz
+                else -> ux * vy - uy * vx
+            }
+            FaceMergeGroup(key.axis, key.plane, normal > 0, face.material,
+                if (alongA) key.minB else key.minA, if (alongA) key.maxB else key.maxA)
+        }
+        return groups.values.flatMap { group ->
+            val sorted = group.sortedBy { if (alongA) it.key.minA else it.key.minB }
+            val result = mutableListOf<PhysicsWorld.MeshFace>()
+            for (face in sorted) {
+                val previous = result.lastOrNull()
+                val touches = previous != null && if (alongA) previous.key.maxA == face.key.minA
+                    else previous.key.maxB == face.key.minB
+                if (!touches) {
+                    result += face
+                    continue
+                }
+                val old = previous
+                val oldKey = old.key
+                val key = if (alongA) oldKey.copy(maxA = face.key.maxA) else oldKey.copy(maxB = face.key.maxB)
+                val vertices = old.vertices.map { vertex ->
+                    fun extend(value: Double, oldMax: Double, newMax: Double) = if (value == oldMax) newMax else value
+                    when (key.axis) {
+                        0 -> vertex.copy(y = extend(vertex.y, oldKey.maxA, key.maxA), z = extend(vertex.z, oldKey.maxB, key.maxB))
+                        1 -> vertex.copy(x = extend(vertex.x, oldKey.maxA, key.maxA), z = extend(vertex.z, oldKey.maxB, key.maxB))
+                        else -> vertex.copy(x = extend(vertex.x, oldKey.maxA, key.maxA), y = extend(vertex.y, oldKey.maxB, key.maxB))
+                    }
+                }
+                result[result.lastIndex] = old.copy(key = key, vertices = vertices)
+            }
+            result
+        }
+    }
+    return mergeAlong(mergeAlong(faces, true), false)
 }
 
 private fun TerrainBox.faces(): List<PhysicsWorld.MeshFace> {

@@ -1,0 +1,23 @@
+{
+  "parent": "tumble:gravity_gun",
+  "display": {
+    "icon": {
+      "id": "minecraft:lead"
+    },
+    "title": {
+      "translate": "advancements.tumble.living_grab.title"
+    },
+    "description": {
+      "translate": "advancements.tumble.living_grab.description"
+    },
+    "frame": "task",
+    "show_toast": true,
+    "announce_to_chat": true,
+    "hidden": false
+  },
+  "criteria": {
+    "triggered": {
+      "trigger": "minecraft:impossible"
+    }
+  }
+}

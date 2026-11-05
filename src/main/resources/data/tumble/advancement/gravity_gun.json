@@ -1,0 +1,30 @@
+{
+  "parent": "tumble:root",
+  "display": {
+    "icon": {
+      "id": "tumble:gravity_gun"
+    },
+    "title": {
+      "translate": "advancements.tumble.gravity_gun.title"
+    },
+    "description": {
+      "translate": "advancements.tumble.gravity_gun.description"
+    },
+    "frame": "task",
+    "show_toast": true,
+    "announce_to_chat": true,
+    "hidden": false
+  },
+  "criteria": {
+    "has_gravity_gun": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": "tumble:gravity_gun"
+          }
+        ]
+      }
+    }
+  }
+}

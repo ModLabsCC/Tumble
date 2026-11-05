@@ -1,0 +1,19 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "pattern": [
+    "ENE",
+    "DGD",
+    " E "
+  ],
+  "key": {
+    "E": "minecraft:echo_shard",
+    "N": "minecraft:nether_star",
+    "D": "minecraft:diamond",
+    "G": "tumble:gravity_gun"
+  },
+  "result": {
+    "id": "tumble:physics_gun",
+    "count": 1
+  }
+}

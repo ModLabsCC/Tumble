@@ -1,7 +1,10 @@
 /.gradle/
+**/.gradle/
 /build/
 /run/
 /.idea/
 *.iml
 **/build/
 .kotlin/
+
+/logs/

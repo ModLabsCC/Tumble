@@ -43,7 +43,7 @@ data class PhysicsRotation(val x: Double, val y: Double, val z: Double, val w: D
     }
 }
 
-data class PhysicsTransform(
+data class PhysicsTransform @JvmOverloads constructor(
     val position: PhysicsVector,
     val rotation: PhysicsRotation = PhysicsRotation.IDENTITY
 )

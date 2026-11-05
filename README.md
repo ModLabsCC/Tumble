@@ -2,7 +2,7 @@
 
 Tumble brings physical objects to Minecraft. It is a Fabric mod built around Box3D, with a focus on multiplayer and familiar Minecraft behavior.
 
-Tumble is in early development. The physics core can simulate bodies and terrain, but it is not connected to gameplay yet.
+Tumble is in early development. You can turn blocks into props and move them with the tools in the creative inventory. Multiplayer, saving and performance are still being tested.
 
 ## Try a build
 
@@ -16,13 +16,15 @@ Use JDK 25, then run:
 ./gradlew clean build -PacceptMinecraftEula=true
 ```
 
-This builds the mod and runs the physics tests and Minecraft GameTests. The flag accepts the [Minecraft EULA](https://aka.ms/MinecraftEULA) for the test server. The finished JAR is in `build/libs/`.
+This builds the mod and runs the physics tests and server GameTests. Run `./gradlew runClientGameTest -PacceptMinecraftEula=true` for the client tests, and `./gradlew runProductionGameTest -PacceptMinecraftEula=true` to test the packaged JAR with a Fabric server. The flag accepts the [Minecraft EULA](https://aka.ms/MinecraftEULA) for the test server. The finished JAR is in `build/libs/`.
 
-The build pins Minecraft 26.3. Snapshot builds are experimental: override `minecraft_version` and `fabric_api_version` with compatible versions, then run the tests.
+The build targets Minecraft 26.3. Later snapshots are not supported yet.
 
 ## Contributing
 
 Contributions are welcome, including work made with coding agents. See [CONTRIBUTING.md](CONTRIBUTING.md) for the build, testing and pull request guidelines.
+
+Making a server-side addon? Start with the [addon API guide](docs/addons.md).
 
 ## License
 
