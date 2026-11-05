@@ -1,12 +1,12 @@
 # Tumble native foundation implementation plan
 
-**Goal:** Adapt the proven loader-independent ProjectResonance physics core into Tumble, keeping Minecraft and Fabric out of the native simulation.
+**Goal:** Adapt the proven loader-independent earlier ModLabs physics core into Tumble, keeping Minecraft and Fabric out of the native simulation.
 
 **Architecture:** A `physics-core` JVM module owns native worlds, bodies and collision geometry. Fabric integration will communicate with it using immutable values. Port only code covered by the user's ownership confirmation; preserve provenance and test behavior while changing names.
 
 **Tech stack:** Java 25, Kotlin, Box3D4j, Fabric 26.3, Gradle, Minecraft GameTests and Jenkins.
 
-**Source:** Tumble architecture and roadmap in the ModLabs project Space; ProjectResonance commit e45e49e375dc552831ad72647747114ef8fc44ac.
+**Source:** Tumble architecture and roadmap in the ModLabs project Space; earlier ModLabs commit the existing physics prototype.
 
 ## Milestones
 

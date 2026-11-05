@@ -1,3 +1,14 @@
 # Contributing
 
-Run the build and GameTests in the README before opening a pull request. New source files use `SPDX-License-Identifier: MPL-2.0`. Keep third-party notices and document the origin of migrated code and assets.
+Thanks for helping with Tumble. Bug reports, tests, documentation and code are all welcome. For a large change, open an issue first so we can discuss the direction.
+
+## Make a change
+
+1. Fork the repository and create a branch.
+2. Use JDK 25 and run `./gradlew clean build -PacceptMinecraftEula=true`. The flag accepts the [Minecraft EULA](https://aka.ms/MinecraftEULA) for the test server.
+3. Add or update tests for the behavior you change. Keep gameplay and native code safe on dedicated servers, and don't pass Minecraft objects to the physics thread.
+4. Open a pull request describing the change and how you tested it. Include screenshots or a short recording when they help explain a visual change.
+
+You are welcome to use coding agents or other AI tools. Review and test their changes as you would any other contribution: the person submitting the pull request is responsible for its correctness, security and licensing.
+
+New source files should include `SPDX-License-Identifier: MPL-2.0`. Only contribute code and assets you have the right to share, and retain any required third-party notices.

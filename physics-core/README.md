@@ -1,5 +1,5 @@
 # Physics core
 
-The initial implementation and tests are adapted from ModLabs ProjectResonance commit `e45e49e375dc552831ad72647747114ef8fc44ac`. The project owner confirmed the rights to use that work in Tumble. The upstream architecture notes describe its prior migration from GarrysCraft.
+This module owns the native physics simulation and has no Minecraft or Fabric dependencies. It includes code adapted from earlier ModLabs work with permission.
 
-This module is independent of Minecraft and Fabric. Native precision at large world coordinates must be validated before integration.
+The current native build uses single-precision world positions. Large-world behavior needs a verified solution before the simulation is connected to gameplay.
