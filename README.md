@@ -16,9 +16,9 @@ Use JDK 25, then run:
 ./gradlew clean build -PacceptMinecraftEula=true
 ```
 
-This builds the mod and runs the physics tests and server GameTests. Run `./gradlew runClientGameTest -PacceptMinecraftEula=true` to test the client too. The flag accepts the [Minecraft EULA](https://aka.ms/MinecraftEULA) for the test server. The finished JAR is in `build/libs/`.
+This builds the mod and runs the physics tests and server GameTests. Run `./gradlew runClientGameTest -PacceptMinecraftEula=true` for the client tests, and `./gradlew runProductionGameTest -PacceptMinecraftEula=true` to test the packaged JAR with a Fabric server. The flag accepts the [Minecraft EULA](https://aka.ms/MinecraftEULA) for the test server. The finished JAR is in `build/libs/`.
 
-The build pins Minecraft 26.3. Snapshot builds are experimental: override `minecraft_version` and `fabric_api_version` with compatible versions, then run the tests.
+The build targets Minecraft 26.3. Later snapshots are not supported yet.
 
 ## Contributing
 

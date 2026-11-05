@@ -23,7 +23,8 @@ sealed interface PhysicsCommand {
     data class SpawnBody(
         val propId: UUID,
         val dimension: PhysicsDimensionId,
-        val definition: PhysicsBodyDefinition
+        val definition: PhysicsBodyDefinition,
+        val requestId: UUID = UUID.randomUUID()
     ) : PhysicsCommand
     data class DestroyBody(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId) : PhysicsCommand
     data class CreateWeld(
@@ -115,10 +116,11 @@ sealed interface PhysicsAcknowledgement {
     data class BodyCreated(
         override val propId: UUID,
         val dimension: PhysicsDimensionId,
-        val bodyId: PhysicsBodyId
+        val bodyId: PhysicsBodyId,
+        val requestId: UUID
     ) : PhysicsAcknowledgement
 
-    data class BodyCreationFailed(override val propId: UUID, val message: String) : PhysicsAcknowledgement
+    data class BodyCreationFailed(override val propId: UUID, val message: String, val requestId: UUID) : PhysicsAcknowledgement
 }
 
 data class PhysicsImpactNotification(

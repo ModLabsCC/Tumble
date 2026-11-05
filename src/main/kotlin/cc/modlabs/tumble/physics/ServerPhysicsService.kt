@@ -134,11 +134,12 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                     val world = worlds.getOrPut(command.dimension, ::createWorld)
                     val bodyId = world.createBody(command.definition)
                     bodies[command.propId] = RuntimeBody(command.dimension, bodyId)
-                    acknowledgements += PhysicsAcknowledgement.BodyCreated(command.propId, command.dimension, bodyId)
+                    acknowledgements += PhysicsAcknowledgement.BodyCreated(command.propId, command.dimension, bodyId, command.requestId)
                 } catch (error: Throwable) {
                     acknowledgements += PhysicsAcknowledgement.BodyCreationFailed(
                         command.propId,
-                        error.message ?: error::class.java.simpleName
+                        error.message ?: error::class.java.simpleName,
+                        command.requestId
                     )
                 }
                 is PhysicsCommand.DestroyBody -> {

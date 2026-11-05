@@ -37,6 +37,21 @@ class ServerPhysicsServiceTest {
     }
 
     @Test
+    fun `body creation acknowledgement keeps its request identity`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val request = UUID.randomUUID()
+        service.start()
+        try {
+            service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), PhysicsDimensionId("test:request"), bodyDefinition(), request))
+            var acknowledgement: PhysicsAcknowledgement? = null
+            waitUntil { service.pollAcknowledgement()?.let { acknowledgement = it }; acknowledgement != null }
+            assertEquals(request, (acknowledgement as PhysicsAcknowledgement.BodyCreated).requestId)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
     fun `service starts creates a dimension and stops its thread`() {
         val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
         service.start()

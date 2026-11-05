@@ -32,10 +32,23 @@ class PhysicsProtocolTest {
     fun `late body acknowledgement cannot attach after prop removal`() {
         val associations = PropBodyAssociations()
         val prop = UUID.randomUUID()
-        associations.register(prop)
-        assertTrue(associations.acknowledge(prop, PhysicsBodyId(1)))
+        val request = associations.register(prop)
+        assertTrue(associations.acknowledge(prop, request, PhysicsBodyId(1)))
         assertEquals(PhysicsBodyId(1), associations.remove(prop))
-        assertFalse(associations.acknowledge(prop, PhysicsBodyId(2)))
+        assertFalse(associations.acknowledge(prop, request, PhysicsBodyId(2)))
+    }
+
+    @Test
+    fun `an old acknowledgement cannot attach after a prop reloads`() {
+        val associations = PropBodyAssociations()
+        val prop = UUID.randomUUID()
+        val oldRequest = associations.register(prop)
+        associations.remove(prop)
+        val newRequest = associations.register(prop)
+
+        assertFalse(associations.acknowledge(prop, oldRequest, PhysicsBodyId(1)))
+        assertTrue(associations.acknowledge(prop, newRequest, PhysicsBodyId(2)))
+        assertEquals(PhysicsBodyId(2), associations.remove(prop))
     }
 
     @Test

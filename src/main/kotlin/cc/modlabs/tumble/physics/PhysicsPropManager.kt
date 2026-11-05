@@ -38,21 +38,23 @@ import net.minecraft.world.phys.Vec3
 import org.slf4j.Logger
 
 internal class PropBodyAssociations {
-    private val activeProps = mutableSetOf<UUID>()
+    private val activeProps = mutableMapOf<UUID, UUID>()
     private val bodies = mutableMapOf<UUID, PhysicsBodyId>()
 
-    fun register(propId: UUID) {
-        activeProps += propId
-    }
+    fun register(propId: UUID): UUID = UUID.randomUUID().also { activeProps[propId] = it }
 
-    fun acknowledge(propId: UUID, bodyId: PhysicsBodyId): Boolean {
-        if (propId !in activeProps) return false
+    fun requestId(propId: UUID): UUID = activeProps.getValue(propId)
+
+    fun isCurrent(propId: UUID, requestId: UUID): Boolean = activeProps[propId] == requestId
+
+    fun acknowledge(propId: UUID, requestId: UUID, bodyId: PhysicsBodyId): Boolean {
+        if (!isCurrent(propId, requestId)) return false
         bodies[propId] = bodyId
         return true
     }
 
     fun remove(propId: UUID): PhysicsBodyId? {
-        activeProps -= propId
+        activeProps.remove(propId)
         return bodies.remove(propId)
     }
 }
@@ -1260,7 +1262,8 @@ class PhysicsPropManager(
                     linearVelocity = PhysicsVector(velocity.x, velocity.y, velocity.z),
                     angularVelocity = entity.angularVelocity,
                     emitImpactEvents = entity.blockState.`is`(Blocks.TNT)
-                )
+                ),
+                requestId = associations.requestId(entity.uuid)
             )
         )
         if (!accepted) entity.physicsPending = false
@@ -1273,6 +1276,7 @@ class PhysicsPropManager(
                     val entity = props[acknowledgement.propId]
                     if (entity == null || entity.isRemoved || !associations.acknowledge(
                             acknowledgement.propId,
+                            acknowledgement.requestId,
                             acknowledgement.bodyId
                         )
                     ) {
@@ -1298,6 +1302,7 @@ class PhysicsPropManager(
                     }
                 }
                 is PhysicsAcknowledgement.BodyCreationFailed -> {
+                    if (!associations.isCurrent(acknowledgement.propId, acknowledgement.requestId)) continue
                     pendingPhysicsGunHolds.remove(acknowledgement.propId)
                     val entity = props[acknowledgement.propId]
                     entity?.physicsPending = false
