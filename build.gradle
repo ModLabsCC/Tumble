@@ -55,8 +55,8 @@ tasks.withType(JavaCompile).configureEach {
 
 processResources {
     inputs.property 'version', project.version
-    inputs.property 'minecraft_version', minecraft_version
-    filesMatching('fabric.mod.json') { expand version: project.version, minecraft_version: minecraft_version }
+    inputs.property 'minecraft_version', minecraft_dependency
+    filesMatching('fabric.mod.json') { expand version: project.version, minecraft_version: minecraft_dependency }
 }
 
 jar {

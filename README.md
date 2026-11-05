@@ -6,7 +6,7 @@ Tumble is in early development. You can turn blocks into props and move them wit
 
 ## Try a build
 
-Development JARs are available from [Jenkins](https://ci.flwc.cc/job/ModLabsPublic/job/Tumble/job/main/). Releases will be published on [GitHub Releases](https://github.com/ModLabsCC/Tumble/releases). You'll need Minecraft 26.3, Fabric Loader, Fabric API and Fabric Language Kotlin.
+Development JARs are available from [Jenkins](https://ci.flwc.cc/job/ModLabsPublic/job/Tumble/). Releases will be published on [GitHub Releases](https://github.com/ModLabsCC/Tumble/releases). This branch targets Minecraft 26.4 snapshot 7 and needs Fabric Loader, Fabric API and Fabric Language Kotlin.
 
 ## Build from source
 
@@ -18,7 +18,7 @@ Use JDK 25, then run:
 
 This builds the mod and runs the physics tests and server GameTests. Run `./gradlew runClientGameTest -PacceptMinecraftEula=true` for the client tests, and `./gradlew runProductionGameTest -PacceptMinecraftEula=true` to test the packaged JAR with a Fabric server. The flag accepts the [Minecraft EULA](https://aka.ms/MinecraftEULA) for the test server. The finished JAR is in `build/libs/`.
 
-The build targets Minecraft 26.3. Later snapshots are not supported yet.
+This branch follows a Minecraft snapshot and may break as Minecraft and Fabric change. The main branch targets Minecraft 26.3.
 
 ## Contributing
 

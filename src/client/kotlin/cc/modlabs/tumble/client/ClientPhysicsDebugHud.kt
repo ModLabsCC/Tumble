@@ -15,7 +15,7 @@ object ClientPhysicsDebugHud {
         HudElementRegistry.attachElementAfter(
             VanillaHudElements.HELD_ITEM_TOOLTIP,
             TumbleMod.id("physics_debug_hud")
-        ) { graphics, _ ->
+        ) { graphics ->
             val state = payload ?: return@attachElementAfter
             if (System.nanoTime() - receivedAt > STALE_NANOS) return@attachElementAfter
             val client = Minecraft.getInstance()

@@ -4,6 +4,7 @@ package cc.modlabs.tumble.client
 import cc.modlabs.tumble.client.network.ClientPhysicsNetworking
 import cc.modlabs.tumble.entity.TumbleEntities
 import net.fabricmc.api.ClientModInitializer
+import net.minecraft.client.core.registries.BuiltInClientRegistries
 import net.minecraft.client.renderer.entity.EntityRenderers
 import org.slf4j.LoggerFactory
 
@@ -16,7 +17,7 @@ object TumbleClient : ClientModInitializer {
         ClientToolGunControls.register()
         ClientToolGunState.registerHud()
         ClientPhysicsDebugHud.register()
-        EntityRenderers.register(TumbleEntities.PHYSICS_PROP, ::PhysicsPropRenderer)
+        EntityRenderers.register(BuiltInClientRegistries.ENTITY_RENDERER, TumbleEntities.PHYSICS_PROP, ::PhysicsPropRenderer)
         logger.info("Project Tumble physics prop renderer registered")
     }
 }

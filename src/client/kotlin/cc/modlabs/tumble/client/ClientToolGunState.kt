@@ -27,7 +27,7 @@ object ClientToolGunState {
         HudElementRegistry.attachElementAfter(
             VanillaHudElements.HELD_ITEM_TOOLTIP,
             TumbleMod.id("tool_gun_hud")
-        ) { graphics, _ ->
+        ) { graphics ->
             val client = Minecraft.getInstance()
             val player = client.player ?: return@attachElementAfter
             if (!player.isHolding { it.item === TumbleItems.TOOL_GUN } || client.gui.screen() != null) {
