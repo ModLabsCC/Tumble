@@ -7,6 +7,11 @@ import cc.modlabs.tumble.entity.TumbleEntities
 import cc.modlabs.tumble.physics.MinecraftTerrainAdapter
 import cc.modlabs.tumble.physics.PhysicsServices
 import cc.modlabs.tumble.physics.PhysicsVector
+import cc.modlabs.tumble.physics.PhysicsWorld
+import cc.modlabs.tumble.physics.PhysicsBodyDefinition
+import cc.modlabs.tumble.physics.PhysicsBuoyancy
+import cc.modlabs.tumble.physics.PhysicsSectionPosition
+import cc.modlabs.tumble.physics.PhysicsTransform
 import cc.modlabs.tumble.physics.ToolGunWeldResult
 import kotlin.math.abs
 import net.fabricmc.fabric.api.gametest.v1.GameTest
@@ -23,6 +28,29 @@ import net.minecraft.world.level.storage.TagValueInput
 import net.minecraft.world.level.storage.TagValueOutput
 
 class TumbleGameTests {
+    @GameTest
+    fun extractedTerrainAllowsSubmergedLogsToRise(helper: GameTestHelper) {
+        val baseX = 160
+        prepareChunk(helper, baseX / 16)
+        clearArena(helper, baseX)
+        for (x in 0..2) for (z in 0..2) {
+            helper.level.setBlock(BlockPos(baseX + x, 0, z), Blocks.STONE.defaultBlockState(), 3)
+            for (y in 1..3) helper.level.setBlock(BlockPos(baseX + x, y, z), Blocks.WATER.defaultBlockState(), 3)
+        }
+        PhysicsWorld().use { world ->
+            world.setBuoyancyForceScale(1.5f)
+            world.syncTerrain(MinecraftTerrainAdapter.extractSection(helper.level, PhysicsSectionPosition(baseX / 16, 0, 0)))
+            val body = world.createBody(PhysicsBodyDefinition(
+                PhysicsTransform(PhysicsVector(baseX + 1.5, 2.0, 1.5)),
+                buoyancy = PhysicsBuoyancy(true, 1.8f, 0.18f, 0.18f, 0.08f)
+            ))
+            world.setSubmersion(body, 1f)
+            repeat(180) { world.step() }
+            helper.assertTrue(world.snapshot(body)!!.transform.position.y > 3.0, "extracted terrain trapped the submerged log")
+        }
+        helper.succeed()
+    }
+
     @GameTest
     fun savedPropsKeepBlockStateProperties(helper: GameTestHelper) {
         val state = Blocks.OAK_STAIRS.defaultBlockState().setValue(StairBlock.FACING, Direction.SOUTH)
