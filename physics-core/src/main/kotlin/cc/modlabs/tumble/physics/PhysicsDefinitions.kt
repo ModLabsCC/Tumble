@@ -87,7 +87,7 @@ data class PhysicsBuoyancy(
     }
 }
 
-data class PhysicsBodyDefinition(
+data class PhysicsBodyDefinition @JvmOverloads constructor(
     val transform: PhysicsTransform,
     val shape: PhysicsShapeDefinition = PhysicsShapeDefinition.Box(PhysicsBox.UNIT),
     val material: PhysicsMaterial = PhysicsMaterial.DEFAULT,
@@ -99,7 +99,7 @@ data class PhysicsBodyDefinition(
 )
 
 data class PhysicsBodySnapshot(
-    val bodyId: PhysicsBodyId,
+    @get:JvmName("getBodyId") val bodyId: PhysicsBodyId,
     val transform: PhysicsTransform,
     val linearVelocity: PhysicsVector,
     val angularVelocity: PhysicsVector,
@@ -112,8 +112,8 @@ data class PhysicsBodySnapshot(
 }
 
 data class PhysicsImpactEvent(
-    val bodyA: PhysicsBodyId?,
-    val bodyB: PhysicsBodyId?,
+    @get:JvmName("getBodyA") val bodyA: PhysicsBodyId?,
+    @get:JvmName("getBodyB") val bodyB: PhysicsBodyId?,
     val point: PhysicsVector,
     val normal: PhysicsVector,
     val approachSpeed: Float
