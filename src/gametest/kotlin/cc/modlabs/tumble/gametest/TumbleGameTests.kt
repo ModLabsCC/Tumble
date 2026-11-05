@@ -2,6 +2,8 @@
 package cc.modlabs.tumble.gametest
 
 import cc.modlabs.tumble.item.TumbleItems
+import cc.modlabs.tumble.entity.PhysicsPropEntity
+import cc.modlabs.tumble.entity.TumbleEntities
 import cc.modlabs.tumble.physics.MinecraftTerrainAdapter
 import cc.modlabs.tumble.physics.PhysicsServices
 import cc.modlabs.tumble.physics.PhysicsVector
@@ -9,13 +11,37 @@ import cc.modlabs.tumble.physics.ToolGunWeldResult
 import kotlin.math.abs
 import net.fabricmc.fabric.api.gametest.v1.GameTest
 import net.minecraft.core.BlockPos
+import net.minecraft.core.Direction
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.world.entity.EquipmentSlot
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.level.GameType
 import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.block.StairBlock
+import net.minecraft.util.ProblemReporter
+import net.minecraft.world.level.storage.TagValueInput
+import net.minecraft.world.level.storage.TagValueOutput
 
 class TumbleGameTests {
+    @GameTest
+    fun savedPropsKeepBlockStateProperties(helper: GameTestHelper) {
+        val state = Blocks.OAK_STAIRS.defaultBlockState().setValue(StairBlock.FACING, Direction.SOUTH)
+        val prop = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        prop.initialize(state, PhysicsVector.ZERO)
+        val output = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
+        prop.saveWithoutId(output)
+        val restored = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), output.buildResult()))
+        helper.assertTrue(restored.blockState == state, "saved prop lost its block state properties")
+
+        val oldSave = output.buildResult().copy()
+        oldSave.remove("TumbleBlockState")
+        val legacy = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        legacy.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), oldSave))
+        helper.assertTrue(legacy.blockState == Blocks.OAK_STAIRS.stateDefinition.any(), "old prop saves no longer load")
+        helper.succeed()
+    }
+
     @GameTest(maxTicks = 600)
     fun physicsPropCreatesRuntimeBodyAndSnapshot(helper: GameTestHelper) {
         val baseX = 0

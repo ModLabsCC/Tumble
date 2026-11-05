@@ -199,13 +199,16 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
             angularVelocity,
             frozen
         ).write(output)
+        output.store(BLOCK_STATE, BlockState.CODEC, blockState)
         output.putFloat(MASS, mass)
         output.putInt(TOOL_PHYSICS_PRESET, toolPhysicsPreset.ordinal)
     }
 
     override fun readAdditionalSaveData(input: ValueInput) {
         val state = PhysicsPropPersistence.read(input)
-        blockState = BuiltInRegistries.BLOCK.getValue(Identifier.parse(state.blockId)).stateDefinition.any()
+        blockState = input.read(BLOCK_STATE, BlockState.CODEC).orElseGet {
+            BuiltInRegistries.BLOCK.getValue(Identifier.parse(state.blockId)).stateDefinition.any()
+        }
         refreshLocalBounds()
         entityData.set(
             DATA_ROTATION,
@@ -256,6 +259,7 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
             PhysicsPropEntity::class.java,
             EntityDataSerializers.INT
         )
+        private const val BLOCK_STATE = "TumbleBlockState"
         private const val MASS = "TumbleMass"
         private const val TOOL_PHYSICS_PRESET = "TumbleToolPhysicsPreset"
     }
