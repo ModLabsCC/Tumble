@@ -379,9 +379,15 @@ class PhysicsPropManager(
         queueBodyCreation(entity, level)
     }
 
-    fun entityUnloaded(entity: Entity, level: ServerLevel) {
+    fun entityUnloaded(entity: Entity, level: ServerLevel, visibilityEvent: Boolean = false) {
         if (entity !is PhysicsPropEntity || props.remove(entity.uuid) == null) return
-        rollbackPendingConversion(entity.uuid)
+        val reason = entity.removalReason
+        if (visibilityEvent && reason != Entity.RemovalReason.KILLED && reason != Entity.RemovalReason.DISCARDED) {
+            pendingConversions.remove(entity.uuid)?.let(::notifyConvertedBlock)
+            pendingItemConversions.remove(entity.uuid)
+        } else {
+            rollbackPendingConversion(entity.uuid)
+        }
         pendingPhysicsGunHolds.remove(entity.uuid)
         skipTerrainPrime.remove(entity.uuid)
         submersionByProp.remove(entity.uuid)
