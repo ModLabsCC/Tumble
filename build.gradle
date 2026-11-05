@@ -43,6 +43,10 @@ fabricApi {
     }
 }
 
+tasks.named('runGameTest') {
+    doFirst { project.delete(layout.buildDirectory.dir('run/gameTest/world')) }
+}
+
 java {
     toolchain.languageVersion = JavaLanguageVersion.of(25)
     withSourcesJar()
@@ -112,6 +116,7 @@ tasks.register('runProductionGameTest', net.fabricmc.loom.task.prod.ServerProduc
         }
         def directory = runDir.get().asFile
         directory.mkdirs()
+        project.delete(new File(directory, 'world'))
         new File(directory, 'eula.txt').text = 'eula=true\n'
     }
 }

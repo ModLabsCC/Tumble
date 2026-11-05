@@ -55,11 +55,12 @@ class TumbleGameTests {
             Blocks.OAK_LOG.defaultBlockState(),
             angularVelocity = PhysicsVector.ZERO
         ) ?: return helper.fail("physics prop did not spawn")
+        helper.runBeforeTestEnd { prop.discard() }
 
         helper.succeedWhen {
             Thread.sleep(5)
             val networkProp = runtime.manager.networkProps().firstOrNull { it.propId == prop.uuid }
-                ?: return@succeedWhen helper.assertTrue(false, "physics body is not ready")
+                ?: return@succeedWhen helper.assertTrue(false, "physics body is not ready: prop=${prop.uuid}, removed=${prop.isRemoved}, position=${prop.position()}")
             val snapshot = runtime.service.latestFrame(networkProp.dimension).bodies[networkProp.bodyId]
             helper.assertTrue(snapshot != null, "physics snapshot is not available")
             val position = snapshot!!.transform.position
@@ -85,6 +86,7 @@ class TumbleGameTests {
             Blocks.OAK_LOG.defaultBlockState(),
             angularVelocity = PhysicsVector.ZERO
         ) ?: return helper.fail("Tumble physics runtime is unavailable")
+        helper.runBeforeTestEnd { prop.discard() }
         val runtime = PhysicsServices.runtime(helper.level.server)
             ?: return helper.fail("Tumble physics runtime is unavailable")
         var bodyReadyAt: Long? = null
@@ -93,7 +95,7 @@ class TumbleGameTests {
         helper.succeedWhen {
             Thread.sleep(5)
             val networkProp = runtime.manager.networkProps().firstOrNull { it.propId == prop.uuid }
-                ?: return@succeedWhen helper.assertTrue(false, "physics body is not ready")
+                ?: return@succeedWhen helper.assertTrue(false, "physics body is not ready: prop=${prop.uuid}, removed=${prop.isRemoved}, position=${prop.position()}")
             val physicsStep = runtime.service.latestFrame(networkProp.dimension).physicsStep
             val readyAt = bodyReadyAt ?: physicsStep.also { bodyReadyAt = it }
             helper.assertTrue(physicsStep - readyAt >= 300, "waiting for 300 physics steps")
@@ -137,6 +139,7 @@ class TumbleGameTests {
             helper.level, PhysicsVector(baseX + 2.5, 1.5, 1.5), Blocks.OAK_LOG.defaultBlockState(),
             angularVelocity = PhysicsVector.ZERO
         ) ?: return helper.fail("second prop did not spawn")
+        helper.runBeforeTestEnd { first.discard(); second.discard() }
         val player = helper.makeMockServerPlayer(GameType.CREATIVE).apply {
             setPos(baseX + 1.5, 1.0, 4.0)
             setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
@@ -182,6 +185,7 @@ class TumbleGameTests {
         val manager = PhysicsServices.runtime(helper.level.server)!!.manager
         val prop = manager.convertBlock(helper.level, pos, creative as net.minecraft.server.level.ServerPlayer)
         helper.assertTrue(prop != null && helper.level.getBlockState(pos).isAir, "Creative control could not convert the block")
+        helper.runBeforeTestEnd { prop?.discard() }
         helper.assertTrue(manager.togglePhysicsGunHeld(creative, prop!!), "Conversion did not begin holding the prop")
         helper.succeed()
     }
@@ -221,6 +225,7 @@ class TumbleGameTests {
         val prop = manager.spawn(helper.level, PhysicsVector(baseX + 1.5, 3.0, 1.5),
             Blocks.STONE.defaultBlockState(), angularVelocity = PhysicsVector.ZERO)
             ?: return helper.fail("Could not create a test prop")
+        helper.runBeforeTestEnd { prop.discard() }
         val player = helper.makeMockServerPlayer(GameType.ADVENTURE).apply {
             setPos(baseX + 1.5, 3.0, 3.0)
             setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.PHYSICS_GUN))
