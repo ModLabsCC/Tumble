@@ -720,16 +720,17 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
             }
         }
         if (faces.isEmpty()) return null
-        val materials = faces.values.map(MeshFace::material).distinct()
+        val mergedFaces = mergeTerrainFaces(faces.values.toList())
+        val materials = mergedFaces.map(MeshFace::material).distinct()
         require(materials.size <= 256) { "Terrain section contains too many surface materials" }
 
-        val vertices = b3Vec3(faces.size * 4L)
-        val indices = IntPointer(faces.size * 6L)
-        val materialIndices = BytePointer(faces.size * 2L)
+        val vertices = b3Vec3(mergedFaces.size * 4L)
+        val indices = IntPointer(mergedFaces.size * 6L)
+        val materialIndices = BytePointer(mergedFaces.size * 2L)
         val nativeMaterials = b3SurfaceMaterial(materials.size.toLong())
         var mesh: b3MeshData? = null
         try {
-            faces.values.forEachIndexed { faceIndex, face ->
+            mergedFaces.forEachIndexed { faceIndex, face ->
                 face.vertices.forEachIndexed { vertexIndex, vertex ->
                     vertices.position(faceIndex * 4L + vertexIndex)
                         .x((vertex.x - origin.x).toFloat())
@@ -751,8 +752,8 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
                 meshDefinition.vertices(vertices.position(0))
                 meshDefinition.indices(indices.position(0))
                 meshDefinition.materialIndices(materialIndices.position(0))
-                meshDefinition.vertexCount(faces.size * 4)
-                meshDefinition.triangleCount(faces.size * 2)
+                meshDefinition.vertexCount(mergedFaces.size * 4)
+                meshDefinition.triangleCount(mergedFaces.size * 2)
                 meshDefinition.weldTolerance(0.0001f)
                 meshDefinition.weldVertices(true)
                 meshDefinition.useMedianSplit(true)
@@ -782,7 +783,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
                     scale.close()
                     shapeDefinition.close()
                 }
-                return StaticSectionBody(body, createdMesh, faces.size * 2)
+                return StaticSectionBody(body, createdMesh, mergedFaces.size * 2)
             } catch (error: Throwable) {
                 b3DestroyBody(body)
                 body.close()
@@ -1006,6 +1007,60 @@ private fun b3SurfaceMaterial.copyFrom(material: PhysicsMaterial): b3SurfaceMate
     } finally {
         tangent.close()
     }
+}
+
+private data class FaceMergeGroup(
+    val axis: Int, val plane: Double, val direction: Boolean, val material: PhysicsMaterial,
+    val fixedMin: Double, val fixedMax: Double
+)
+
+private fun mergeTerrainFaces(faces: List<PhysicsWorld.MeshFace>): List<PhysicsWorld.MeshFace> {
+    fun mergeAlong(input: List<PhysicsWorld.MeshFace>, alongA: Boolean): List<PhysicsWorld.MeshFace> {
+        val groups = input.groupBy { face ->
+            val key = face.key
+            val (a, b, c) = face.vertices
+            val ux = b.x - a.x
+            val uy = b.y - a.y
+            val uz = b.z - a.z
+            val vx = c.x - a.x
+            val vy = c.y - a.y
+            val vz = c.z - a.z
+            val normal = when (key.axis) {
+                0 -> uy * vz - uz * vy
+                1 -> uz * vx - ux * vz
+                else -> ux * vy - uy * vx
+            }
+            FaceMergeGroup(key.axis, key.plane, normal > 0, face.material,
+                if (alongA) key.minB else key.minA, if (alongA) key.maxB else key.maxA)
+        }
+        return groups.values.flatMap { group ->
+            val sorted = group.sortedBy { if (alongA) it.key.minA else it.key.minB }
+            val result = mutableListOf<PhysicsWorld.MeshFace>()
+            for (face in sorted) {
+                val previous = result.lastOrNull()
+                val touches = previous != null && if (alongA) previous.key.maxA == face.key.minA
+                    else previous.key.maxB == face.key.minB
+                if (!touches) {
+                    result += face
+                    continue
+                }
+                val old = previous
+                val oldKey = old.key
+                val key = if (alongA) oldKey.copy(maxA = face.key.maxA) else oldKey.copy(maxB = face.key.maxB)
+                val vertices = old.vertices.map { vertex ->
+                    fun extend(value: Double, oldMax: Double, newMax: Double) = if (value == oldMax) newMax else value
+                    when (key.axis) {
+                        0 -> vertex.copy(y = extend(vertex.y, oldKey.maxA, key.maxA), z = extend(vertex.z, oldKey.maxB, key.maxB))
+                        1 -> vertex.copy(x = extend(vertex.x, oldKey.maxA, key.maxA), z = extend(vertex.z, oldKey.maxB, key.maxB))
+                        else -> vertex.copy(x = extend(vertex.x, oldKey.maxA, key.maxA), y = extend(vertex.y, oldKey.maxB, key.maxB))
+                    }
+                }
+                result[result.lastIndex] = old.copy(key = key, vertices = vertices)
+            }
+            result
+        }
+    }
+    return mergeAlong(mergeAlong(faces, true), false)
 }
 
 private fun TerrainBox.faces(): List<PhysicsWorld.MeshFace> {

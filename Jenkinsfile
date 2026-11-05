@@ -11,7 +11,7 @@ pipeline {
         stage('Build and GameTests') {
             steps {
                 sh 'chmod +x gradlew'
-                sh './gradlew clean build -PacceptMinecraftEula=true --no-daemon --stacktrace'
+                sh './gradlew clean build runGameTest -PacceptMinecraftEula=true --no-daemon --stacktrace'
             }
         }
         stage('Client GameTests') {

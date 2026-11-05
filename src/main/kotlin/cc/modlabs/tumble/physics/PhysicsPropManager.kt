@@ -76,7 +76,7 @@ class PhysicsPropManager(
     private val submersionByProp = mutableMapOf<UUID, Float>()
     private val heldByPlayer = mutableMapOf<UUID, UUID>()
     private val heldByProp = mutableMapOf<UUID, UUID>()
-    private val heldLivingByPlayer = mutableMapOf<UUID, HeldLivingEntity>()
+    private val heldLivingByPlayer = mutableMapOf<UUID, LivingEntity>()
     private val heldLivingEntities = mutableSetOf<UUID>()
     private val physicsGunHoldDistance = mutableMapOf<UUID, Double>()
     private val weldSelectionByPlayer = mutableMapOf<UUID, SelectedWeld>()
@@ -273,9 +273,11 @@ class PhysicsPropManager(
         }
         val dimension = level.physicsDimensionId()
         val accepted = when (mode) {
-            ToolGunMode.ROPE -> service.submit(
-                PhysicsCommand.CreateRope(dimension, firstBody, bodyId, first.position().distanceTo(prop.position()).toFloat())
-            )
+            ToolGunMode.ROPE -> {
+                val length = first.position().distanceTo(prop.position()).toFloat()
+                length.isFinite() && length > 0f &&
+                    service.submit(PhysicsCommand.CreateRope(dimension, firstBody, bodyId, length))
+            }
             ToolGunMode.AXIS -> service.submit(PhysicsCommand.CreateAxis(dimension, firstBody, bodyId))
             ToolGunMode.NO_COLLIDE -> service.submit(PhysicsCommand.CreateNoCollide(dimension, firstBody, bodyId))
         }
@@ -312,6 +314,7 @@ class PhysicsPropManager(
         releaseProp(prop.uuid)
         val dimension = level.physicsDimensionId()
         if (!service.submit(PhysicsCommand.DestroyBody(dimension, bodyId))) return false
+        submersionByProp.remove(prop.uuid)
         associations.remove(prop.uuid)
         bodyOwners.remove(RuntimeBodyKey(dimension, bodyId))
         prop.runtimeBodyId = null
@@ -513,10 +516,14 @@ class PhysicsPropManager(
                 pendingItemConversions[prop.uuid] = ConvertedItem(
                     level,
                     PhysicsVector(drop.item.x, drop.item.y, drop.item.z),
-                    drop.stack,
+                    drop.stack.copyWithCount(1),
                     PhysicsVector(velocity.x, velocity.y, velocity.z)
                 )
-                drop.item.discard()
+                if (drop.stack.count == 1) {
+                    drop.item.discard()
+                } else {
+                    drop.item.item = drop.stack.copyWithCount(drop.stack.count - 1)
+                }
             }
         }
     }
@@ -856,6 +863,16 @@ class PhysicsPropManager(
         conversion.level.getBlockState(conversion.position).isAir &&
             conversion.level.setBlock(conversion.position, conversion.state, CONVERSION_FLAGS)
 
+    private fun notifyConvertedBlock(conversion: ConvertedBlock) {
+        val level = conversion.level
+        val position = conversion.position
+        val current = level.getBlockState(position)
+        level.updateNeighborsAt(position, conversion.state.block)
+        conversion.state.updateIndirectNeighbourShapes(level, position, Block.UPDATE_CLIENTS)
+        current.updateNeighbourShapes(level, position, Block.UPDATE_CLIENTS)
+        current.updateIndirectNeighbourShapes(level, position, Block.UPDATE_CLIENTS)
+    }
+
     private fun restoreItem(conversion: ConvertedItem): Boolean {
         val item = ItemEntity(
             conversion.level,
@@ -905,6 +922,7 @@ class PhysicsPropManager(
 
     private fun hold(player: Player, prop: PhysicsPropEntity, physicsGun: Boolean): Boolean {
         if (prop.uuid in heldByProp || prop.runtimeBodyId == null) return false
+        val holdDistance = if (physicsGun) clampPhysicsGunDistance(player.eyePosition.distanceTo(prop.position())) else null
         if (prop.frozen) {
             val level = prop.level() as? ServerLevel ?: return false
             if (!service.submit(
@@ -916,10 +934,7 @@ class PhysicsPropManager(
         launchedProps.remove(prop.uuid)
         heldByPlayer[player.uuid] = prop.uuid
         heldByProp[prop.uuid] = player.uuid
-        if (physicsGun) {
-            physicsGunHoldDistance[player.uuid] = player.eyePosition.distanceTo(prop.position())
-                .coerceIn(MIN_PHYSICS_GUN_HOLD_DISTANCE, tuning.get(TumbleTuningKey.GRAB_DISTANCE))
-        }
+        if (holdDistance != null) physicsGunHoldDistance[player.uuid] = holdDistance
         prop.actorCollidable = false
         prop.heldByEntityId = player.id
         return true
@@ -939,10 +954,8 @@ class PhysicsPropManager(
         ) return false
         lastPhysicsGunControlTick[player.uuid] = managerTick
         if (distanceDelta != 0f) {
-            val maximum = tuning.get(TumbleTuningKey.GRAB_DISTANCE)
             physicsGunHoldDistance[player.uuid] =
-                ((physicsGunHoldDistance[player.uuid] ?: MIN_PHYSICS_GUN_HOLD_DISTANCE) + distanceDelta * 0.5)
-                    .coerceIn(MIN_PHYSICS_GUN_HOLD_DISTANCE, maximum)
+                clampPhysicsGunDistance((physicsGunHoldDistance[player.uuid] ?: MIN_PHYSICS_GUN_HOLD_DISTANCE) + distanceDelta * 0.5)
         }
         if (yawDelta == 0f && pitchDelta == 0f) return true
         val bodyId = prop.runtimeBodyId ?: return false
@@ -956,10 +969,14 @@ class PhysicsPropManager(
         )
     }
 
+    private fun clampPhysicsGunDistance(distance: Double): Double {
+        val maximum = tuning.get(TumbleTuningKey.GRAB_DISTANCE)
+        return distance.coerceIn(minOf(MIN_PHYSICS_GUN_HOLD_DISTANCE, maximum), maximum)
+    }
+
     fun launchHeld(player: Player): Boolean {
         if (!player.isHolding { it.item === TumbleItems.GRAVITY_GUN }) return false
-        heldLivingByPlayer[player.uuid]?.let { held ->
-            val target = held.entity
+        heldLivingByPlayer[player.uuid]?.let { target ->
             releaseLiving(player.uuid)
             if (!target.isAlive || target.isRemoved) return false
             val look = player.lookAngle
@@ -1074,9 +1091,8 @@ class PhysicsPropManager(
             }
             service.submit(PhysicsCommand.SetLinearVelocity((prop.level() as ServerLevel).physicsDimensionId(), bodyId, velocity))
         }
-        heldLivingByPlayer.entries.toList().forEach { (playerId, held) ->
+        heldLivingByPlayer.entries.toList().forEach { (playerId, entity) ->
             val player = server.playerList.getPlayer(playerId)
-            val entity = held.entity
             if (player == null || !player.isAlive || player.isSpectator || !entity.isAlive || entity.isRemoved ||
                 player.level() !== entity.level() || !player.isHolding { it.item === TumbleItems.GRAVITY_GUN } ||
                 player.distanceToSqr(entity) > MAX_HELD_ENTITY_DISTANCE_SQUARED
@@ -1099,19 +1115,15 @@ class PhysicsPropManager(
 
     private fun holdLiving(player: Player, entity: LivingEntity): Boolean {
         if (entity === player || entity.uuid in heldLivingEntities || !entity.isAlive || entity.isSpectator) return false
-        heldLivingByPlayer[player.uuid] = HeldLivingEntity(entity, entity.isNoGravity)
+        heldLivingByPlayer[player.uuid] = entity
         heldLivingEntities += entity.uuid
-        entity.setNoGravity(true)
         entity.fallDistance = 0.0
         TumbleAdvancements.award(player, "living_grab")
         return true
     }
 
     private fun releaseLiving(playerId: UUID) {
-        heldLivingByPlayer.remove(playerId)?.let { held ->
-            heldLivingEntities -= held.entity.uuid
-            if (!held.entity.isRemoved) held.entity.setNoGravity(held.originalNoGravity)
-        }
+        heldLivingByPlayer.remove(playerId)?.let { heldLivingEntities -= it.uuid }
     }
 
     private fun targetedGravityGunEntity(player: Player): Entity? {
@@ -1284,13 +1296,14 @@ class PhysicsPropManager(
                             PhysicsCommand.DestroyBody(acknowledgement.dimension, acknowledgement.bodyId)
                         )
                     } else {
-                        pendingConversions.remove(acknowledgement.propId)
+                        val converted = pendingConversions.remove(acknowledgement.propId)
                         pendingItemConversions.remove(acknowledgement.propId)
                         entity.runtimeBodyId = acknowledgement.bodyId
                         entity.physicsPending = false
                         bodyOwners[RuntimeBodyKey(acknowledgement.dimension, acknowledgement.bodyId)] =
                             acknowledgement.propId
                         bodyGenerations.nextGeneration(acknowledgement.propId)
+                        converted?.let(::notifyConvertedBlock)
                         pendingPhysicsGunHolds.remove(acknowledgement.propId)?.let { playerId ->
                             val player = server.playerList.getPlayer(playerId)
                             if (player != null && player.isAlive && !player.isSpectator &&
@@ -1372,11 +1385,6 @@ private data class LaunchedProp(
     val expiresAt: Long,
     var lastPosition: PhysicsVector,
     val damage: Float
-)
-
-private data class HeldLivingEntity(
-    val entity: LivingEntity,
-    val originalNoGravity: Boolean
 )
 
 private data class ConvertedBlock(

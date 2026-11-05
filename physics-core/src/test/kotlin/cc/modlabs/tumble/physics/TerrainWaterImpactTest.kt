@@ -62,6 +62,23 @@ class TerrainWaterImpactTest {
     }
 
     @Test
+    fun `submerged body rises after falling onto adjacent terrain blocks`() = (0..20).forEach { delay -> PhysicsWorld(
+        PhysicsWorldConfig(gravity = PhysicsVector(0.0, -32.0, 0.0))
+    ).use { world ->
+        world.syncTerrain((0..2).flatMap { x -> (0..2).map { z ->
+            TerrainBlockGeometry(PhysicsBlockPosition(x, 0, z), listOf(TerrainBox(PhysicsBox(
+                PhysicsVector(x.toDouble(), 0.0, z.toDouble()), PhysicsVector(x + 1.0, 1.0, z + 1.0)
+            ))))
+        } })
+        val body = world.createBody(bodyAt(1.5, 2.0, 1.5, material = PhysicsMaterial(density = 0.65f), buoyancy = PhysicsBuoyancy(true, 1.8f, 0.18f, 0.18f, 0.08f)))
+        world.setBuoyancyForceScale(1.5f)
+        repeat(delay) { world.step() }
+        world.setSubmersion(body, 1f)
+        repeat(300) { world.step() }
+        assertTrue(assertNotNull(world.snapshot(body)).transform.position.y > 3.0, "failed after $delay dry steps")
+    } }
+
+    @Test
     fun `a sleeping buoyant body wakes when water disappears`() {
         PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
             val body = world.createBody(bodyAt(0.0, 0.0, 0.0, buoyancy = PhysicsBuoyancy(enabled = true)))
@@ -157,6 +174,9 @@ class TerrainWaterImpactTest {
 
         assertEquals(setOf(PhysicsSectionPosition(0, 0, 0)), world.syncTerrain(listOf(first, adjacent)))
         assertEquals(1, world.terrainSectionCount())
+        assertEquals(12, world.terrainTriangleCount(PhysicsSectionPosition(0, 0, 0)))
+        val differentMaterial = adjacent.copy(boxes = adjacent.boxes.map { it.copy(material = PhysicsMaterial.LOW_FRICTION) })
+        world.syncTerrain(listOf(differentMaterial))
         assertEquals(20, world.terrainTriangleCount(PhysicsSectionPosition(0, 0, 0)))
         assertEquals(setOf(PhysicsSectionPosition(1, 0, 0)), world.syncTerrain(listOf(distant)))
         assertEquals(2, world.terrainSectionCount())

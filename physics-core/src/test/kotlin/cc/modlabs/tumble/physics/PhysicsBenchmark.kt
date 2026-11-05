@@ -3,7 +3,7 @@ package cc.modlabs.tumble.physics
 
 /** A repeatable CPU baseline, not a substitute for profiling a running server. */
 fun main() {
-    for (count in listOf(100, 500, 1000)) {
+    for (count in listOf(100, 500, 1000, 5000)) {
         PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
             repeat(count) { index ->
                 world.createBody(
