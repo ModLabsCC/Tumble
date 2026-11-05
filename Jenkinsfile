@@ -1,25 +1,10 @@
 pipeline {
-    agent any
-    tools { jdk 'jdk25' }
-    options {
-        timestamps()
-        disableConcurrentBuilds()
-        timeout(time: 30, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '30'))
-    }
+    agent { label 'hetzner-node-2' }
     stages {
-        stage('Build and GameTests') {
+        stage('Identify old test container') {
             steps {
-                sh 'chmod +x gradlew'
-                sh './gradlew clean build -PacceptMinecraftEula=true --no-daemon --stacktrace'
+                sh '''docker ps --filter 'ancestor=eclipse-temurin:25-jdk' --filter 'volume=/var/jenkins_home/workspace/_Tumble_codex_tumble-fabric-port' --format '{{.ID}} {{.Image}} {{.Status}} {{.Names}}' '''
             }
-        }
-    }
-    post {
-        success { archiveArtifacts artifacts: 'build/libs/*.jar', fingerprint: true }
-        always {
-            junit allowEmptyResults: true, testResults: 'physics-core/build/test-results/test/*.xml'
-            archiveArtifacts artifacts: 'build/run/gameTest/logs/*.log', allowEmptyArchive: true
         }
     }
 }
