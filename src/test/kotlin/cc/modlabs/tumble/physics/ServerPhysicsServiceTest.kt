@@ -13,6 +13,22 @@ import org.slf4j.LoggerFactory
 
 class ServerPhysicsServiceTest {
     @Test
+    fun `running state reflects a worker failure`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:worker-failure")
+        service.start()
+        try {
+            assertTrue(service.isRunning())
+            service.submit(PhysicsCommand.CreateDimension(dimension))
+            service.submit(PhysicsCommand.SetSubmersion(dimension, PhysicsBodyId(1), 2f))
+            waitUntil { service.debugState().state == PhysicsServiceState.FAILED }
+            assertFalse(service.isRunning())
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
     fun `an invalid rope command cannot stop the physics service`() {
         val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
         val dimension = PhysicsDimensionId("test:invalid-rope")

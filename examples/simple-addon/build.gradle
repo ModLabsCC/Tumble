@@ -1,0 +1,24 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.19.3'
+}
+
+def tumbleProperties = new Properties()
+file('../../gradle.properties').withInputStream { tumbleProperties.load(it) }
+def minecraftVersion = tumbleProperties.minecraft_version
+def tumbleVersion = tumbleProperties.mod_version
+
+group = 'example.tumble'
+version = '1.0.0'
+
+repositories { mavenCentral() }
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraftVersion}"
+    implementation "net.fabricmc:fabric-loader:${tumbleProperties.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${tumbleProperties.fabric_api_version}"
+    implementation files("../../build/libs/tumble-${tumbleVersion}+${minecraftVersion}.jar")
+    implementation files("../../physics-core/build/libs/physics-core-${tumbleVersion}+${minecraftVersion}.jar")
+}
+
+java { toolchain.languageVersion = JavaLanguageVersion.of(25) }
+tasks.withType(JavaCompile).configureEach { options.release = 25; options.encoding = 'UTF-8' }
