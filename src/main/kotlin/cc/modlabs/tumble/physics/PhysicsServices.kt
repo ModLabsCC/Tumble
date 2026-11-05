@@ -65,7 +65,7 @@ object PhysicsServices {
     fun entityUnloaded(entity: Entity, level: ServerLevel) {
         runtimes[level.server]?.let {
             if (entity is cc.modlabs.tumble.entity.PhysicsPropEntity) it.publisher.propRemoved(entity.uuid)
-            it.manager.entityUnloaded(entity, level)
+            it.manager.entityUnloaded(entity, level, visibilityEvent = true)
         }
     }
 

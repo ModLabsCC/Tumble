@@ -23,12 +23,16 @@ import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.world.entity.EquipmentSlot
+import net.minecraft.world.entity.Entity
 import net.minecraft.world.entity.EntitySpawnReason
 import net.minecraft.world.entity.EntityTypes
 import net.minecraft.world.entity.item.ItemEntity
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.GameType
+import net.minecraft.world.level.ChunkPos
+import net.minecraft.world.level.entity.PersistentEntitySectionManager
+import net.minecraft.world.level.entity.Visibility
 import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.StairBlock
 import net.minecraft.util.ProblemReporter
@@ -36,6 +40,103 @@ import net.minecraft.world.level.storage.TagValueInput
 import net.minecraft.world.level.storage.TagValueOutput
 
 class TumbleGameTests {
+    @GameTest(maxTicks = 600)
+    fun pendingDroppedItemSurvivesChunkVisibilityChanges(helper: GameTestHelper) {
+        val baseX = 448
+        prepareChunk(helper, baseX / 16)
+        clearArena(helper, baseX)
+        val field = net.minecraft.server.level.ServerLevel::class.java.getDeclaredField("entityManager")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val entities = field.get(helper.level) as PersistentEntitySectionManager<Entity>
+        val chunk = ChunkPos(baseX / 16, 0)
+        entities.updateChunkStatus(chunk, Visibility.TICKING)
+        val manager = PhysicsServices.runtime(helper.level.server)!!.manager
+        val rule = TumbleGameRules.CONVERT_DROPPED_BLOCKS
+        val previous = helper.level.gameRules.get(rule)
+        helper.level.gameRules.set(rule, true, helper.level.server)
+        try {
+            val item = ItemEntity(helper.level, baseX + 1.5, 2.0, 1.5, ItemStack(Items.STONE))
+            helper.level.addFreshEntity(item)
+            manager.itemLoaded(item, helper.level)
+            manager.tick()
+        } finally {
+            helper.level.gameRules.set(rule, previous, helper.level.server)
+        }
+        val area = net.minecraft.world.phys.AABB(baseX.toDouble(), -16.0, 0.0, baseX + 4.0, 16.0, 4.0)
+        val prop = helper.level.getEntitiesOfClass(PhysicsPropEntity::class.java, area).singleOrNull()
+            ?: return helper.fail("dropped item did not become a prop")
+        val registeredBefore = manager.registeredPropCount()
+        entities.updateChunkStatus(chunk, Visibility.HIDDEN)
+        val registeredWhileHidden = manager.registeredPropCount()
+        entities.updateChunkStatus(chunk, Visibility.TICKING)
+        helper.assertTrue(registeredWhileHidden == registeredBefore - 1, "hiding the chunk did not unload the prop")
+        helper.assertTrue(helper.level.getEntitiesOfClass(ItemEntity::class.java, area).none { it.isAlive }, "unloading duplicated the item")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(manager.networkProps().any { it.propId == prop.uuid }, "visible prop has no physics body")
+        }
+    }
+
+    @GameTest(maxTicks = 600)
+    fun pendingConversionSurvivesChunkVisibilityChanges(helper: GameTestHelper) {
+        val baseX = 416
+        prepareChunk(helper, baseX / 16)
+        clearArena(helper, baseX)
+        val field = net.minecraft.server.level.ServerLevel::class.java.getDeclaredField("entityManager")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val entities = field.get(helper.level) as PersistentEntitySectionManager<Entity>
+        val chunk = ChunkPos(baseX / 16, 0)
+        entities.updateChunkStatus(chunk, Visibility.TICKING)
+        val position = BlockPos(baseX + 1, 1, 1)
+        helper.level.setBlock(position, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE).apply { setPos(baseX + 1.5, 1.0, 3.0) }
+        val manager = PhysicsServices.runtime(helper.level.server)!!.manager
+        val prop = manager.convertBlock(helper.level, position, player as net.minecraft.server.level.ServerPlayer)
+            ?: return helper.fail("could not convert block")
+        val registeredBefore = manager.registeredPropCount()
+        entities.updateChunkStatus(chunk, Visibility.HIDDEN)
+        val remainedAir = helper.level.getBlockState(position).isAir
+        val registeredWhileHidden = manager.registeredPropCount()
+        entities.updateChunkStatus(chunk, Visibility.TICKING)
+        helper.assertTrue(remainedAir, "hiding the chunk restored the block alongside the prop")
+        helper.assertTrue(registeredWhileHidden == registeredBefore - 1, "hiding the chunk did not unload the prop")
+        helper.assertTrue(manager.registeredPropCount() == registeredBefore, "showing the chunk did not reload the prop")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(manager.networkProps().any { it.propId == prop.uuid }, "visible prop has no physics body")
+            helper.assertTrue(helper.level.getBlockState(position).isAir, "visibility change duplicated the block")
+        }
+    }
+
+    @GameTest(maxTicks = 600)
+    fun pendingConversionSurvivesEntityUnloadWithoutDuplicatingBlock(helper: GameTestHelper) {
+        val baseX = 384
+        prepareChunk(helper, baseX / 16)
+        clearArena(helper, baseX)
+        val position = BlockPos(baseX + 1, 1, 1)
+        helper.level.setBlock(position, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE).apply { setPos(baseX + 1.5, 1.0, 3.0) }
+        val manager = PhysicsServices.runtime(helper.level.server)!!.manager
+        val prop = manager.convertBlock(helper.level, position, player as net.minecraft.server.level.ServerPlayer)
+            ?: return helper.fail("could not convert block")
+        val saved = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
+        prop.saveWithoutId(saved)
+        prop.remove(Entity.RemovalReason.UNLOADED_TO_CHUNK)
+        PhysicsServices.entityUnloaded(prop, helper.level)
+        helper.assertTrue(helper.level.getBlockState(position).isAir, "unloading restored the block alongside the saved prop")
+        val restored = TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)
+            ?: return helper.fail("could not recreate saved prop")
+        restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), saved.buildResult()))
+        helper.assertTrue(helper.level.addFreshEntity(restored), "could not reload saved prop")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(manager.networkProps().any { it.propId == restored.uuid }, "reloaded prop has no physics body")
+            helper.assertTrue(helper.level.getBlockState(position).isAir, "conversion left a duplicate block")
+        }
+    }
+
     @GameTest(maxTicks = 3000)
     fun recreatedSubmergedBodyReceivesWaterState(helper: GameTestHelper) {
         val baseX = 352
