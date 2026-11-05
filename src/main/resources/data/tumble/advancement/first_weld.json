@@ -1,0 +1,23 @@
+{
+  "parent": "tumble:root",
+  "display": {
+    "icon": {
+      "id": "minecraft:iron_ingot"
+    },
+    "title": {
+      "translate": "advancements.tumble.first_weld.title"
+    },
+    "description": {
+      "translate": "advancements.tumble.first_weld.description"
+    },
+    "frame": "task",
+    "show_toast": true,
+    "announce_to_chat": true,
+    "hidden": false
+  },
+  "criteria": {
+    "triggered": {
+      "trigger": "minecraft:impossible"
+    }
+  }
+}

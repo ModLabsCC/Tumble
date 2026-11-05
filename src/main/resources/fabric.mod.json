@@ -3,8 +3,38 @@
   "id": "tumble",
   "version": "${version}",
   "name": "Tumble",
-  "description": "A standalone physics foundation for Minecraft.",
-  "license": "MPL-2.0",
+  "description": "Standalone physics for Minecraft.",
+  "authors": [
+    "ModLabs"
+  ],
   "environment": "*",
-  "depends": { "fabricloader": ">=0.20.1", "minecraft": "${minecraft_version}", "java": ">=25", "fabric-api": "*", "fabric-language-kotlin": ">=1.13.12+kotlin.2.4.0" }
+  "entrypoints": {
+    "main": [
+      {
+        "adapter": "kotlin",
+        "value": "cc.modlabs.tumble.TumbleMod"
+      }
+    ],
+    "client": [
+      {
+        "adapter": "kotlin",
+        "value": "cc.modlabs.tumble.client.TumbleClient"
+      }
+    ]
+  },
+  "mixins": [
+    "tumble.mixins.json",
+    {
+      "config": "tumble.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=0.20.1",
+    "minecraft": "${minecraft_version}",
+    "java": ">=25",
+    "fabric-api": "*",
+    "fabric-language-kotlin": ">=1.13.12+kotlin.2.4.0"
+  },
+  "license": "MPL-2.0"
 }

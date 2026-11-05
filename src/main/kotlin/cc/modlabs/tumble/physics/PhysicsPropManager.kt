@@ -1,0 +1,1580 @@
+// SPDX-License-Identifier: MPL-2.0
+package cc.modlabs.tumble.physics
+
+import cc.modlabs.tumble.TumbleGameRules
+import cc.modlabs.tumble.TumbleAdvancements
+import cc.modlabs.tumble.entity.PhysicsPropEntity
+import cc.modlabs.tumble.entity.ToolPhysicsPreset
+import cc.modlabs.tumble.entity.TumbleEntities
+import cc.modlabs.tumble.item.TumbleItems
+import cc.modlabs.tumble.network.ToolGunStatePayload
+import cc.modlabs.tumble.physics.PhysicsBodyDefinition
+import cc.modlabs.tumble.physics.PhysicsBodyId
+import cc.modlabs.tumble.physics.PhysicsBox
+import cc.modlabs.tumble.physics.PhysicsShapeDefinition
+import cc.modlabs.tumble.physics.PhysicsTransform
+import cc.modlabs.tumble.physics.PhysicsVector
+import java.util.UUID
+import net.minecraft.core.BlockPos
+import net.minecraft.core.Direction
+import net.minecraft.server.MinecraftServer
+import net.minecraft.server.level.ServerLevel
+import net.minecraft.server.level.ServerPlayer
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking
+import net.minecraft.world.entity.Entity
+import net.minecraft.world.entity.LivingEntity
+import net.minecraft.world.entity.MoverType
+import net.minecraft.world.entity.item.ItemEntity
+import net.minecraft.world.entity.monster.Enemy
+import net.minecraft.world.entity.player.Player
+import net.minecraft.world.item.BlockItem
+import net.minecraft.world.item.ItemStack
+import net.minecraft.world.level.Level
+import net.minecraft.world.level.block.Block
+import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.phys.AABB
+import net.minecraft.world.phys.Vec3
+import org.slf4j.Logger
+
+internal class PropBodyAssociations {
+    private val activeProps = mutableSetOf<UUID>()
+    private val bodies = mutableMapOf<UUID, PhysicsBodyId>()
+
+    fun register(propId: UUID) {
+        activeProps += propId
+    }
+
+    fun acknowledge(propId: UUID, bodyId: PhysicsBodyId): Boolean {
+        if (propId !in activeProps) return false
+        bodies[propId] = bodyId
+        return true
+    }
+
+    fun remove(propId: UUID): PhysicsBodyId? {
+        activeProps -= propId
+        return bodies.remove(propId)
+    }
+}
+
+class PhysicsPropManager(
+    private val server: MinecraftServer,
+    private val service: ServerPhysicsService,
+    private val terrain: TerrainSectionTracker,
+    private val logger: Logger,
+    private val tuning: TumbleTuning
+) {
+    private val props = mutableMapOf<UUID, PhysicsPropEntity>()
+    private val associations = PropBodyAssociations()
+    private val bodyGenerations = mutableMapOf<UUID, Long>()
+    private val bodyOwners = mutableMapOf<RuntimeBodyKey, UUID>()
+    private val pendingActorImpulses = mutableMapOf<UUID, PhysicsVector>()
+    private val lastPushRequestTick = mutableMapOf<UUID, Long>()
+    private val pendingExplosionVelocity = mutableMapOf<UUID, PhysicsVector>()
+    private val submersionByProp = mutableMapOf<UUID, Float>()
+    private val heldByPlayer = mutableMapOf<UUID, UUID>()
+    private val heldByProp = mutableMapOf<UUID, UUID>()
+    private val heldLivingByPlayer = mutableMapOf<UUID, HeldLivingEntity>()
+    private val heldLivingEntities = mutableSetOf<UUID>()
+    private val physicsGunHoldDistance = mutableMapOf<UUID, Double>()
+    private val weldSelectionByPlayer = mutableMapOf<UUID, SelectedWeld>()
+    private val toolModeByPlayer = mutableMapOf<UUID, ToolGunMode>()
+    private val activeWelds = mutableSetOf<WeldKey>()
+    private val weldHistoryByPlayer = mutableMapOf<UUID, java.util.ArrayDeque<WeldKey>>()
+    private val lastPhysicsGunControlTick = mutableMapOf<UUID, Long>()
+    private val launchedProps = mutableMapOf<UUID, LaunchedProp>()
+    private val pendingPhysicsGunHolds = mutableMapOf<UUID, UUID>()
+    private val pendingConversions = mutableMapOf<UUID, ConvertedBlock>()
+    private val pendingItemConversions = mutableMapOf<UUID, ConvertedItem>()
+    private val pendingPlacedBlocks = linkedSetOf<PendingPlacedBlock>()
+    private val pendingDroppedItems = linkedMapOf<UUID, Pair<ServerLevel, ItemEntity>>()
+    private val ignoredDroppedItems = mutableSetOf<UUID>()
+    private val skipTerrainPrime = mutableSetOf<UUID>()
+    private var pendingActorContacts = 0
+    private var carryingActors = false
+    private var managerTick = 0L
+    var actorContactsLastTick = 0
+        private set
+    var actorImpulsesLastTick = 0
+        private set
+    var explosionPropsLastTick = 0
+        private set
+
+    init {
+        submitNativeTuning()
+    }
+
+    fun canSpawn() = props.size < tuning.get(TumbleTuningKey.MAX_PHYSICS_OBJECTS).toInt()
+
+    fun spawn(
+        level: ServerLevel,
+        position: PhysicsVector,
+        blockState: BlockState = Blocks.RAW_COPPER_BLOCK.defaultBlockState(),
+        linearVelocity: PhysicsVector = PhysicsVector.ZERO,
+        angularVelocity: PhysicsVector = PhysicsVector(1.8, 2.4, 1.2),
+        primeTerrain: Boolean = true
+    ): PhysicsPropEntity? {
+        if (!canSpawn()) return null
+        val entity = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
+            setPos(position.x, position.y, position.z)
+            setDeltaMovement(linearVelocity.x, linearVelocity.y, linearVelocity.z)
+            initialize(blockState, angularVelocity)
+        }
+        if (!primeTerrain) skipTerrainPrime += entity.uuid
+        if (!level.addFreshEntity(entity)) {
+            skipTerrainPrime.remove(entity.uuid)
+            return null
+        }
+        entityLoaded(entity, level)
+        return entity
+    }
+
+    fun convertBlock(
+        level: ServerLevel,
+        position: BlockPos,
+        player: ServerPlayer,
+        linearVelocity: PhysicsVector = PhysicsVector.ZERO
+    ): PhysicsPropEntity? {
+        if (player.level() !== level || !level.chunkSource.hasChunk(position.x shr 4, position.z shr 4) ||
+            !level.worldBorder.isWithinBounds(position) || !player.mayInteract(level, position) ||
+            player.blockActionRestricted(level, position, player.gameMode())
+        ) return null
+        val state = level.getBlockState(position)
+        if (!net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents.BEFORE.invoker()
+                .beforeBlockBreak(level, player, position, state, level.getBlockEntity(position))) return null
+        return convertBlocks(level, listOf(BlockConversion(position.immutable(), linearVelocity)))[position]
+    }
+
+    fun usePhysicsGunSecondary(player: Player, prop: PhysicsPropEntity, changeToBlock: Boolean): Boolean {
+        val level = player.level() as? ServerLevel ?: return false
+        if (prop.level() !== level || prop.runtimeBodyId == null || player.distanceToSqr(prop) > PHYSICS_GUN_REACH_SQUARED) {
+            return false
+        }
+        if (changeToBlock) {
+            val position = BlockPos.containing(prop.x, prop.y, prop.z)
+            val actor = player as? ServerPlayer ?: return false
+            if (!actor.mayBuild() || !actor.mayInteract(level, position) || !level.worldBorder.isWithinBounds(position) ||
+                !level.getBlockState(position).canBeReplaced() ||
+                !level.setBlock(position, prop.blockState, Block.UPDATE_ALL)
+            ) return false
+            entityUnloaded(prop, level)
+            prop.discard()
+            return true
+        }
+        if (prop.frozen) return true
+        releaseProp(prop.uuid)
+        val bodyId = prop.runtimeBodyId ?: return false
+        if (!service.submit(PhysicsCommand.SetMotionType(level.physicsDimensionId(), bodyId, PhysicsMotionType.STATIC))) return false
+        prop.frozen = true
+        prop.setDeltaMovement(Vec3.ZERO)
+        prop.angularVelocity = PhysicsVector.ZERO
+        return true
+    }
+
+    fun useToolGunWeld(player: Player, prop: PhysicsPropEntity): ToolGunWeldResult {
+        val level = player.level() as? ServerLevel ?: return ToolGunWeldResult.FAILED
+        val bodyId = prop.runtimeBodyId
+        if (prop.level() !== level || bodyId == null || player.distanceToSqr(prop) > TOOL_GUN_REACH_SQUARED ||
+            !player.isHolding { it.item === TumbleItems.TOOL_GUN }
+        ) return ToolGunWeldResult.FAILED
+        val selected = weldSelectionByPlayer[player.uuid]
+        if (selected == null) {
+            weldSelectionByPlayer[player.uuid] = SelectedWeld(prop.uuid, ToolGunFace.selectedFace(player, prop))
+            sendToolGunState(player)
+            return ToolGunWeldResult.SELECTED
+        }
+        weldSelectionByPlayer.remove(player.uuid)
+        if (selected.propId == prop.uuid) {
+            sendToolGunState(player)
+            return ToolGunWeldResult.CANCELLED
+        }
+        val first = props[selected.propId]
+        val firstBody = first?.runtimeBodyId
+        val key = WeldKey.of(selected.propId, prop.uuid)
+        if (first == null || firstBody == null || first.level() !== level || key in activeWelds) {
+            sendToolGunState(player)
+            return ToolGunWeldResult.FAILED
+        }
+        return if (service.submit(PhysicsCommand.CreateWeld(level.physicsDimensionId(), firstBody, bodyId))) {
+            activeWelds += key
+            weldHistoryByPlayer.getOrPut(player.uuid) { java.util.ArrayDeque() }.addLast(key)
+            sendToolGunState(player)
+            ToolGunWeldResult.WELDED
+        } else {
+            sendToolGunState(player)
+            ToolGunWeldResult.FAILED
+        }
+    }
+
+    fun cycleToolGunMode(player: Player, delta: Int) {
+        if (delta != -1 && delta != 1 || !player.isHolding { it.item === TumbleItems.TOOL_GUN }) return
+        toolModeByPlayer[player.uuid] = toolGunMode(player).cycle(delta)
+        weldSelectionByPlayer.remove(player.uuid)
+        sendToolGunState(player)
+        TumbleAdvancements.award(player, "tool_mode")
+        if (!TumbleAdvancements.completed(player, "first_weld")) {
+            player.sendOverlayMessage(net.minecraft.network.chat.Component.translatable("tutorial.tumble.tool_gun.use_mode"))
+        }
+    }
+
+    fun toolGunMode(player: Player) = toolModeByPlayer[player.uuid] ?: ToolGunMode.WELD
+
+    fun useToolGun(player: Player, prop: PhysicsPropEntity): ToolGunResult {
+        val mode = toolGunMode(player)
+        if (mode == ToolGunMode.WELD) {
+            return when (useToolGunWeld(player, prop)) {
+                ToolGunWeldResult.SELECTED -> ToolGunResult.SELECTED
+                ToolGunWeldResult.WELDED -> {
+                    TumbleAdvancements.award(player, "first_weld")
+                    ToolGunResult.APPLIED
+                }
+                ToolGunWeldResult.CANCELLED -> ToolGunResult.CANCELLED
+                ToolGunWeldResult.FAILED -> ToolGunResult.FAILED
+            }
+        }
+        val level = player.level() as? ServerLevel ?: return ToolGunResult.FAILED
+        val bodyId = prop.runtimeBodyId
+        if (prop.level() !== level || bodyId == null || player.distanceToSqr(prop) > TOOL_GUN_REACH_SQUARED ||
+            !player.isHolding { it.item === TumbleItems.TOOL_GUN }
+        ) return ToolGunResult.FAILED
+
+        if (mode == ToolGunMode.REMOVER) {
+            entityUnloaded(prop, level)
+            prop.discard()
+            TumbleAdvancements.award(player, "tool_action")
+            return ToolGunResult.APPLIED
+        }
+        if (mode == ToolGunMode.WEIGHT_BUOYANCY) {
+            prop.toolPhysicsPreset = prop.toolPhysicsPreset.next()
+            return if (recreateBody(prop, level)) {
+                TumbleAdvancements.award(player, "tool_action")
+                ToolGunResult.APPLIED
+            } else ToolGunResult.FAILED
+        }
+
+        val selected = weldSelectionByPlayer[player.uuid]
+        if (selected == null) {
+            weldSelectionByPlayer[player.uuid] = SelectedWeld(prop.uuid, ToolGunFace.selectedFace(player, prop))
+            sendToolGunState(player)
+            return ToolGunResult.SELECTED
+        }
+        weldSelectionByPlayer.remove(player.uuid)
+        if (selected.propId == prop.uuid) {
+            sendToolGunState(player)
+            return ToolGunResult.CANCELLED
+        }
+        val first = props[selected.propId]
+        val firstBody = first?.runtimeBodyId
+        if (first == null || firstBody == null || first.level() !== level) {
+            sendToolGunState(player)
+            return ToolGunResult.FAILED
+        }
+        val dimension = level.physicsDimensionId()
+        val accepted = when (mode) {
+            ToolGunMode.ROPE -> service.submit(
+                PhysicsCommand.CreateRope(dimension, firstBody, bodyId, first.position().distanceTo(prop.position()).toFloat())
+            )
+            ToolGunMode.AXIS -> service.submit(PhysicsCommand.CreateAxis(dimension, firstBody, bodyId))
+            ToolGunMode.NO_COLLIDE -> service.submit(PhysicsCommand.CreateNoCollide(dimension, firstBody, bodyId))
+        }
+        sendToolGunState(player)
+        if (accepted) TumbleAdvancements.award(player, "tool_action")
+        return if (accepted) ToolGunResult.APPLIED else ToolGunResult.FAILED
+    }
+
+    fun useToolGunPrimary(player: Player, prop: PhysicsPropEntity): Boolean {
+        val level = player.level() as? ServerLevel ?: return false
+        val bodyId = prop.runtimeBodyId ?: return false
+        if (prop.level() !== level || player.distanceToSqr(prop) > TOOL_GUN_REACH_SQUARED) return false
+        return when (toolGunMode(player)) {
+            ToolGunMode.WELD -> removeToolGunWelds(player, prop)
+            ToolGunMode.ROPE, ToolGunMode.AXIS, ToolGunMode.NO_COLLIDE -> {
+                weldSelectionByPlayer.remove(player.uuid)
+                service.submit(PhysicsCommand.DestroyToolConstraints(level.physicsDimensionId(), bodyId))
+                    .also { sendToolGunState(player) }
+            }
+            ToolGunMode.WEIGHT_BUOYANCY -> {
+                prop.toolPhysicsPreset = ToolPhysicsPreset.DEFAULT
+                recreateBody(prop, level)
+            }
+            ToolGunMode.REMOVER -> {
+                entityUnloaded(prop, level)
+                prop.discard()
+                true
+            }
+        }
+    }
+
+    private fun recreateBody(prop: PhysicsPropEntity, level: ServerLevel): Boolean {
+        val bodyId = prop.runtimeBodyId ?: return false
+        releaseProp(prop.uuid)
+        val dimension = level.physicsDimensionId()
+        if (!service.submit(PhysicsCommand.DestroyBody(dimension, bodyId))) return false
+        associations.remove(prop.uuid)
+        bodyOwners.remove(RuntimeBodyKey(dimension, bodyId))
+        prop.runtimeBodyId = null
+        prop.physicsPending = false
+        associations.register(prop.uuid)
+        queueBodyCreation(prop, level)
+        return prop.physicsPending
+    }
+
+    fun removeToolGunWelds(player: Player, prop: PhysicsPropEntity): Boolean {
+        val level = player.level() as? ServerLevel ?: return false
+        val bodyId = prop.runtimeBodyId ?: return false
+        if (prop.level() !== level || player.distanceToSqr(prop) > TOOL_GUN_REACH_SQUARED ||
+            !player.isHolding { it.item === TumbleItems.TOOL_GUN }
+        ) return false
+        weldSelectionByPlayer.remove(player.uuid)
+        val removed = activeWelds.filter { it.contains(prop.uuid) }
+        if (removed.isEmpty()) {
+            sendToolGunState(player)
+            return false
+        }
+        activeWelds.removeAll(removed.toSet())
+        weldHistoryByPlayer.values.forEach { history -> history.removeIf(removed::contains) }
+        val accepted = service.submit(PhysicsCommand.DestroyWelds(level.physicsDimensionId(), bodyId))
+        sendToolGunState(player)
+        return accepted
+    }
+
+    fun undoToolGunWeld(player: Player): Boolean {
+        val level = player.level() as? ServerLevel ?: return false
+        val history = weldHistoryByPlayer[player.uuid] ?: return false
+        while (history.isNotEmpty()) {
+            val key = history.removeLast()
+            if (!activeWelds.remove(key)) continue
+            val first = props[key.first]?.runtimeBodyId
+            val second = props[key.second]?.runtimeBodyId
+            val accepted = first != null && second != null &&
+                service.submit(PhysicsCommand.DestroyWeld(level.physicsDimensionId(), first, second))
+            sendToolGunState(player)
+            return accepted
+        }
+        sendToolGunState(player)
+        return false
+    }
+
+    private fun sendToolGunState(player: Player) {
+        val serverPlayer = player as? ServerPlayer ?: return
+        if (serverPlayer.connection == null) return
+        if (!ServerPlayNetworking.canSend(serverPlayer, ToolGunStatePayload.TYPE)) return
+        val selected = weldSelectionByPlayer[player.uuid]
+        val canUndo = weldHistoryByPlayer[player.uuid]?.any(activeWelds::contains) == true
+        ServerPlayNetworking.send(
+            serverPlayer,
+            ToolGunStatePayload(toolGunMode(player), selected?.propId, selected?.face, canUndo)
+        )
+    }
+
+    fun entityLoaded(entity: Entity, level: ServerLevel) {
+        if (entity !is PhysicsPropEntity || props.putIfAbsent(entity.uuid, entity) != null) return
+        associations.register(entity.uuid)
+        if (!skipTerrainPrime.remove(entity.uuid)) terrain.primeForProp(level, entity.blockPosition())
+        queueBodyCreation(entity, level)
+    }
+
+    fun entityUnloaded(entity: Entity, level: ServerLevel) {
+        if (entity !is PhysicsPropEntity || props.remove(entity.uuid) == null) return
+        rollbackPendingConversion(entity.uuid)
+        pendingPhysicsGunHolds.remove(entity.uuid)
+        skipTerrainPrime.remove(entity.uuid)
+        submersionByProp.remove(entity.uuid)
+        releaseProp(entity.uuid)
+        launchedProps.remove(entity.uuid)
+        weldSelectionByPlayer.entries.removeIf { it.value.propId == entity.uuid }
+        val removedWelds = activeWelds.filter { it.contains(entity.uuid) }
+        activeWelds.removeAll(removedWelds.toSet())
+        weldHistoryByPlayer.values.forEach { history -> history.removeIf(removedWelds::contains) }
+        val bodyId = associations.remove(entity.uuid) ?: entity.runtimeBodyId
+        if (bodyId != null) {
+            val dimension = level.physicsDimensionId()
+            bodyOwners.remove(RuntimeBodyKey(dimension, bodyId))
+            service.submit(PhysicsCommand.DestroyBody(dimension, bodyId))
+        }
+        entity.runtimeBodyId = null
+        entity.physicsPending = false
+    }
+
+    fun chunkLoaded(level: ServerLevel, chunkX: Int, chunkZ: Int) {
+        val needed = props.values.any { prop ->
+            prop.level() === level &&
+                kotlin.math.abs(Math.floorDiv(prop.blockX, 16) - chunkX) <= 1 &&
+                kotlin.math.abs(Math.floorDiv(prop.blockZ, 16) - chunkZ) <= 1
+        }
+        if (needed) terrain.chunkLoaded(level, chunkX, chunkZ)
+    }
+
+    fun blocksPlaced(level: ServerLevel, positions: Collection<BlockPos>) {
+        if (!level.gameRules.get(TumbleGameRules.CONVERT_PLACED_BLOCKS)) return
+        positions.take(maxOf(0, MAX_PENDING_CONVERSIONS - pendingPlacedBlocks.size)).forEach { position ->
+            pendingPlacedBlocks += PendingPlacedBlock(level, position.immutable())
+        }
+    }
+
+    fun itemLoaded(item: ItemEntity, level: ServerLevel) {
+        if (ignoredDroppedItems.remove(item.uuid) ||
+            !level.gameRules.get(TumbleGameRules.CONVERT_DROPPED_BLOCKS) ||
+            pendingDroppedItems.size >= MAX_PENDING_CONVERSIONS
+        ) return
+        pendingDroppedItems[item.uuid] = level to item
+    }
+
+    fun convertExplodedBlocks(
+        level: ServerLevel,
+        origin: PhysicsVector,
+        positions: List<BlockPos>
+    ): List<BlockPos> {
+        if (!level.gameRules.get(TumbleGameRules.CONVERT_EXPLODED_BLOCKS)) return positions
+        val converted = convertBlocks(level, positions.map { position ->
+            val center = PhysicsVector(position.x + 0.5, position.y + 0.5, position.z + 0.5)
+            BlockConversion(
+                position.immutable(),
+                ExplosionMotion.velocity(
+                    origin,
+                    center,
+                    tuning.get(TumbleTuningKey.EXPLOSION_RADIUS),
+                    tuning.get(TumbleTuningKey.EXPLOSION_SPEED)
+                ) ?: PhysicsVector.ZERO
+            )
+        }).keys
+        return if (converted.isEmpty()) positions else positions.filterNot(converted::contains)
+    }
+
+    fun pistonMoved(level: ServerLevel, boxes: List<PhysicsBox>, movement: PhysicsVector) {
+        if (boxes.isEmpty() || boxes.size > MAX_PISTON_BOXES) return
+        submitPistonMotion(PistonMotion(level, boxes.toList(), movement))
+    }
+
+    fun clear(level: ServerLevel): Int {
+        val removed = props.values.filter { it.level() === level }
+        removed.forEach { entity ->
+            entityUnloaded(entity, level)
+            entity.discard()
+        }
+        return removed.size
+    }
+
+    private fun convertPendingPlacedBlocks() {
+        val batch = ArrayList<PendingPlacedBlock>(MAX_CONVERSIONS_PER_TICK)
+        val iterator = pendingPlacedBlocks.iterator()
+        repeat(minOf(MAX_CONVERSIONS_PER_TICK, pendingPlacedBlocks.size)) {
+            batch += iterator.next()
+            iterator.remove()
+        }
+        batch.groupBy(PendingPlacedBlock::level).forEach { (level, blocks) ->
+            if (level.gameRules.get(TumbleGameRules.CONVERT_PLACED_BLOCKS)) {
+                convertBlocks(level, blocks.map { BlockConversion(it.position, PhysicsVector.ZERO) })
+            }
+        }
+    }
+
+    private fun convertPendingDroppedItems() {
+        val batch = ArrayList<Pair<ServerLevel, ItemEntity>>(MAX_CONVERSIONS_PER_TICK)
+        val iterator = pendingDroppedItems.iterator()
+        repeat(minOf(MAX_CONVERSIONS_PER_TICK, pendingDroppedItems.size)) {
+            batch += iterator.next().value
+            iterator.remove()
+        }
+        batch.groupBy { it.first }.forEach { (level, entries) ->
+            if (!level.gameRules.get(TumbleGameRules.CONVERT_DROPPED_BLOCKS)) return@forEach
+            val drops = entries.mapNotNull { (_, item) ->
+                if (!item.isAlive || !isRecentPhysicalDrop(item.age)) return@mapNotNull null
+                val stack = item.item
+                val block = (stack.item as? BlockItem)?.block ?: return@mapNotNull null
+                val state = block.defaultBlockState()
+                if (state.hasBlockEntity() || MinecraftTerrainAdapter.dynamicShape(
+                        state.getCollisionShape(level, item.blockPosition()).toAabbs()
+                    ) == null
+                ) return@mapNotNull null
+                DroppedBlock(item, stack.copy(), state)
+            }.take(maxOf(0, tuning.get(TumbleTuningKey.MAX_PHYSICS_OBJECTS).toInt() - props.size))
+            terrain.primeForPositions(level, drops.map { it.item.blockPosition() })
+            drops.forEach { drop ->
+                val velocity = drop.item.deltaMovement
+                val prop = try {
+                    spawn(
+                        level,
+                        PhysicsVector(drop.item.x, drop.item.y, drop.item.z),
+                        drop.state,
+                        PhysicsVector(velocity.x, velocity.y, velocity.z),
+                        primeTerrain = false
+                    )
+                } catch (error: Throwable) {
+                    logger.error("Failed to convert dropped block item {}", drop.item.uuid, error)
+                    null
+                } ?: return@forEach
+                if (!prop.physicsPending && prop.runtimeBodyId == null) {
+                    prop.discard()
+                    return@forEach
+                }
+                pendingItemConversions[prop.uuid] = ConvertedItem(
+                    level,
+                    PhysicsVector(drop.item.x, drop.item.y, drop.item.z),
+                    drop.stack,
+                    PhysicsVector(velocity.x, velocity.y, velocity.z)
+                )
+                drop.item.discard()
+            }
+        }
+    }
+
+    private fun convertBlocks(
+        level: ServerLevel,
+        requests: Collection<BlockConversion>
+    ): Map<BlockPos, PhysicsPropEntity> {
+        val candidates = linkedMapOf<BlockPos, Pair<BlockState, PhysicsVector>>()
+        requests.distinctBy(BlockConversion::position)
+            .take(maxOf(0, tuning.get(TumbleTuningKey.MAX_PHYSICS_OBJECTS).toInt() - props.size))
+            .forEach { request ->
+            val position = request.position
+            if (!level.chunkSource.hasChunk(position.x shr 4, position.z shr 4)) return@forEach
+            val state = level.getBlockState(position)
+            if (state.isAir || state.hasBlockEntity() || state.getDestroySpeed(level, position) < 0f ||
+                MinecraftTerrainAdapter.dynamicShape(state.getCollisionShape(level, position).toAabbs()) == null ||
+                !level.setBlock(position, Blocks.AIR.defaultBlockState(), CONVERSION_FLAGS)
+            ) return@forEach
+            candidates[position] = state to request.linearVelocity
+        }
+        if (candidates.isEmpty()) return emptyMap()
+
+        terrain.primeForPositions(level, candidates.keys)
+        val converted = linkedMapOf<BlockPos, PhysicsPropEntity>()
+        candidates.forEach { (position, captured) ->
+            val (state, velocity) = captured
+            val prop = try {
+                spawn(
+                    level,
+                    PhysicsVector(position.x + 0.5, position.y + 0.5, position.z + 0.5),
+                    state,
+                    velocity,
+                    angularVelocity = PhysicsVector.ZERO,
+                    primeTerrain = false
+                )
+            } catch (error: Throwable) {
+                logger.error("Failed to convert block at {}", position, error)
+                null
+            }
+            if (prop == null || !prop.physicsPending && prop.runtimeBodyId == null) {
+                prop?.discard()
+                restoreBlock(ConvertedBlock(level, position, state))
+                return@forEach
+            }
+            pendingConversions[prop.uuid] = ConvertedBlock(level, position, state)
+            converted[position] = prop
+        }
+        return converted
+    }
+
+    fun tick() {
+        managerTick++
+        drainAcknowledgements()
+        drainImpactEvents()
+        convertPendingPlacedBlocks()
+        convertPendingDroppedItems()
+        terrain.tick(server, props.values)
+        actorContactsLastTick = pendingActorContacts
+        actorImpulsesLastTick = 0
+        val platformMotions = ArrayList<PlatformMotion>()
+        props.values.toList().forEach { entity ->
+            val bodyId = entity.runtimeBodyId ?: return@forEach
+            val level = entity.level() as? ServerLevel ?: return@forEach
+            val frame = service.latestFrame(level.physicsDimensionId())
+            val snapshot = frame.bodies[bodyId] ?: return@forEach
+            val previousBox = entity.boundingBox
+            val previousPosition = PhysicsVector(entity.x, entity.y, entity.z)
+            entity.applySnapshot(frame.physicsStep, snapshot)
+            val platformDelta = snapshot.transform.position - previousPosition
+            if (MovingPlatformCarry.isSafeDelta(platformDelta)) {
+                platformMotions += PlatformMotion(entity, level, previousBox, entity.boundingBox, platformDelta)
+            }
+            updateSubmersion(entity, level, bodyId, snapshot.sleeping)
+            damageFromLaunch(entity, level, snapshot.transform.position)
+        }
+        val carriedActors = carryActors(platformMotions)
+        pushActorsFromMovingProps(platformMotions, carriedActors)
+        updateHeldProps()
+        flushActorImpulses()
+        flushExplosionVelocity()
+    }
+
+    fun registeredPropCount() = props.size
+
+    fun explosion(level: ServerLevel, origin: PhysicsVector) {
+        if (!level.gameRules.get(TumbleGameRules.REACT_TO_EXPLOSIONS)) return
+        props.values.forEach { prop ->
+            if (prop.level() !== level || prop.runtimeBodyId == null) return@forEach
+            val delta = ExplosionMotion.velocity(
+                origin,
+                PhysicsVector(prop.x, prop.y, prop.z),
+                tuning.get(TumbleTuningKey.EXPLOSION_RADIUS),
+                tuning.get(TumbleTuningKey.EXPLOSION_SPEED)
+            ) ?: return@forEach
+            pendingExplosionVelocity.merge(prop.uuid, delta, PhysicsVector::plus)
+        }
+    }
+
+    fun clipActorMovement(actor: LivingEntity, movement: Vec3): Vec3 {
+        if (carryingActors || !actor.isAlive || actor.isSpectator || movement.lengthSqr() <= 1e-12) return movement
+        val level = actor.level() as? ServerLevel ?: return movement
+        val actorBounds = PhysicsServices.actorCollisionBounds(actor)
+        val broadphase = actorBounds.expandTowards(movement).inflate(BROADPHASE_MARGIN)
+        val candidates = level.getEntitiesOfClass(PhysicsPropEntity::class.java, broadphase) { prop ->
+            prop.actorCollidable && prop.runtimeBodyId != null
+        }
+        if (candidates.isEmpty()) return movement
+        val shapes = candidates.flatMapIndexed { owner, prop ->
+            val transform = PhysicsTransform(PhysicsVector(prop.x, prop.y, prop.z), prop.bodyRotation)
+            prop.localCollisionBoxes.map { PropSweepShape(owner, transform, it) }
+        }
+        val requested = PhysicsVector(movement.x, movement.y, movement.z)
+        val clipped = PropActorCollision.clipMovement(actorBounds.toPhysicsAabb(), requested, shapes)
+        val mayRecordPlayerPush = actor !is ServerPlayer || lastPushRequestTick[actor.uuid] != managerTick
+        var recordedPlayerPush = false
+        clipped.contacts.groupBy(PropSweepContact::owner).forEach { (owner, contacts) ->
+            val contact = contacts.maxBy { -requested.dot(it.normal) }
+            if (mayRecordPlayerPush) {
+                recordActorImpulse(candidates[owner], contact.normal, requested)
+                recordedPlayerPush = true
+            }
+            constrainActorVelocity(actor, contact.normal)
+        }
+        if (recordedPlayerPush && actor is ServerPlayer) lastPushRequestTick[actor.uuid] = managerTick
+        return Vec3(clipped.displacement.x, clipped.displacement.y, clipped.displacement.z)
+    }
+
+    fun requestActorPush(player: ServerPlayer, propId: UUID, movement: PhysicsVector) {
+        if (!player.isAlive || player.isSpectator || movement.y != 0.0 ||
+            lastPushRequestTick[player.uuid] == managerTick
+        ) return
+        val prop = props[propId] ?: return
+        if (prop.level() !== player.level() || !prop.actorCollidable || prop.runtimeBodyId == null ||
+            !prop.boundingBox.inflate(PUSH_REQUEST_REACH).intersects(PhysicsServices.actorCollisionBounds(player))
+        ) return
+        val transform = PhysicsTransform(PhysicsVector(prop.x, prop.y, prop.z), prop.bodyRotation)
+        val shapes = prop.localCollisionBoxes.map { PropSweepShape(0, transform, it) }
+        val contact = PropActorCollision.clipMovement(
+            PhysicsServices.actorCollisionBounds(player).toPhysicsAabb(),
+            movement,
+            shapes
+        ).contacts.maxByOrNull { -movement.dot(it.normal) } ?: return
+        lastPushRequestTick[player.uuid] = managerTick
+        recordActorImpulse(prop, contact.normal, movement)
+    }
+
+    private fun recordActorImpulse(prop: PhysicsPropEntity, normal: PhysicsVector, movement: PhysicsVector) {
+        if (!transfersActorImpulse(normal)) return
+        val speedIntoProp = maxOf(0.0, -movement.dot(normal) * TICKS_PER_SECOND)
+        if (speedIntoProp <= 1e-4) return
+        val pushDirection = normal * -1.0
+        val currentPushSpeed = PhysicsVector(
+            prop.deltaMovement.x,
+            prop.deltaMovement.y,
+            prop.deltaMovement.z
+        ).dot(pushDirection)
+        val magnitude = actorPushImpulse(speedIntoProp, currentPushSpeed, prop.mass.toDouble())
+        if (magnitude <= 1e-6) return
+        pendingActorImpulses.merge(prop.uuid, normal * -magnitude, PhysicsVector::plus)
+        pendingActorContacts++
+    }
+
+    private fun constrainActorVelocity(actor: LivingEntity, normal: PhysicsVector) {
+        val velocity = actor.deltaMovement
+        val intoSurface = velocity.x * normal.x + velocity.y * normal.y + velocity.z * normal.z
+        if (intoSurface < 0.0) actor.setDeltaMovement(
+            velocity.x - normal.x * intoSurface,
+            velocity.y - normal.y * intoSurface,
+            velocity.z - normal.z * intoSurface
+        )
+        if (normal.y > 0.5) {
+            actor.fallDistance = 0.0
+            actor.setOnGround(true)
+        }
+    }
+
+    private fun resolveActorAgainstProp(
+        actor: LivingEntity,
+        prop: PhysicsPropEntity,
+        movement: Vec3
+    ): PropActorContact? {
+        val transform = PhysicsTransform(PhysicsVector(prop.x, prop.y, prop.z), prop.bodyRotation)
+        val skin = PhysicsVector(CONTACT_SKIN, CONTACT_SKIN, CONTACT_SKIN)
+        val boxes = prop.localCollisionBoxes.map { PhysicsBox(it.min - skin, it.max + skin) }
+        var impulseContact: PropActorContact? = null
+        repeat(MAX_SHAPE_CONTACT_PASSES) {
+            val actorBounds = PhysicsServices.actorCollisionBounds(actor).toPhysicsAabb()
+            val contact = boxes.asSequence().mapNotNull { PropActorCollision.contact(transform, it, actorBounds) }
+                .minByOrNull { it.translation.squaredLength() } ?: return impulseContact
+            val previous = impulseContact
+            val speed = -(movement.x * contact.normal.x + movement.y * contact.normal.y + movement.z * contact.normal.z)
+            val previousSpeed = previous?.let {
+                -(movement.x * it.normal.x + movement.y * it.normal.y + movement.z * it.normal.z)
+            } ?: Double.NEGATIVE_INFINITY
+            if (speed > previousSpeed) impulseContact = contact
+            resolveActorContact(actor, contact)
+        }
+        return impulseContact
+    }
+
+    private fun resolveActorContact(actor: LivingEntity, contact: PropActorContact) {
+        val correction = contact.translation
+        carryingActors = true
+        try {
+            actor.move(MoverType.SHULKER, Vec3(correction.x, correction.y, correction.z))
+        } finally {
+            carryingActors = false
+        }
+        constrainActorVelocity(actor, contact.normal)
+    }
+
+    private fun carryActors(motions: List<PlatformMotion>): Set<UUID> {
+        if (motions.isEmpty()) return emptySet()
+        val carried = mutableSetOf<UUID>()
+        var remaining = MAX_PLATFORM_ACTORS_PER_TICK
+        motions.forEach { motion ->
+            if (remaining <= 0) return@forEach
+            val search = motion.previous.minmax(motion.current).inflate(PLATFORM_SEARCH_MARGIN)
+            motion.level.getEntitiesOfClass(LivingEntity::class.java, search) { actor ->
+                actor.isAlive && !actor.isSpectator && !actor.isPassenger && actor.deltaMovement.y <= JUMP_VELOCITY &&
+                    (actor !is Player || !actor.abilities.flying)
+            }.asSequence().filter { it.uuid !in carried }
+                .take(minOf(MAX_ACTORS_PER_PLATFORM, remaining)).forEach { actor ->
+                val delta = MovingPlatformCarry.displacement(
+                    motion.previous.toPhysicsAabb(),
+                    actor.boundingBox.toPhysicsAabb(),
+                    motion.delta,
+                    tuning.get(TumbleTuningKey.PLATFORM_GRACE)
+                ) ?: return@forEach
+                carried += actor.uuid
+                remaining--
+                actor.fallDistance = 0.0
+                carryingActors = true
+                try {
+                    actor.move(MoverType.SHULKER, Vec3(delta.x, delta.y, delta.z))
+                } finally {
+                    carryingActors = false
+                }
+            }
+        }
+        return carried
+    }
+
+    private fun pushActorsFromMovingProps(motions: List<PlatformMotion>, carried: Set<UUID>) {
+        var remaining = MAX_PLATFORM_ACTORS_PER_TICK
+        motions.forEach { motion ->
+            if (remaining <= 0) return@forEach
+            motion.level.getEntitiesOfClass(LivingEntity::class.java, motion.current.inflate(CONTACT_SKIN)) { actor ->
+                actor.uuid !in carried && actor.isAlive && !actor.isSpectator
+            }.asSequence().take(minOf(MAX_ACTORS_PER_PLATFORM, remaining)).forEach { actor ->
+                val relativeMovement = Vec3(-motion.delta.x, -motion.delta.y, -motion.delta.z)
+                val contact = resolveActorAgainstProp(actor, motion.prop, relativeMovement) ?: return@forEach
+                recordActorImpulse(
+                    motion.prop,
+                    contact.normal,
+                    PhysicsVector(relativeMovement.x, relativeMovement.y, relativeMovement.z)
+                )
+                remaining--
+            }
+        }
+    }
+
+    private fun flushActorImpulses() {
+        pendingActorImpulses.forEach { (propId, impulse) ->
+            val prop = props[propId] ?: return@forEach
+            val bodyId = prop.runtimeBodyId ?: return@forEach
+            val level = prop.level() as? ServerLevel ?: return@forEach
+            val length = impulse.length()
+            if (length <= 1e-6) return@forEach
+            val capped = if (length > MAX_TOTAL_IMPULSE) impulse * (MAX_TOTAL_IMPULSE / length) else impulse
+            if (service.submit(PhysicsCommand.ApplyCentralImpulse(level.physicsDimensionId(), bodyId, capped))) {
+                actorImpulsesLastTick++
+            }
+        }
+        pendingActorImpulses.clear()
+        pendingActorContacts = 0
+    }
+
+    private fun flushExplosionVelocity() {
+        explosionPropsLastTick = 0
+        pendingExplosionVelocity.forEach { (propId, velocity) ->
+            val prop = props[propId] ?: return@forEach
+            val bodyId = prop.runtimeBodyId ?: return@forEach
+            val level = prop.level() as? ServerLevel ?: return@forEach
+            val speed = velocity.length()
+            val capped = if (speed > MAX_EXPLOSION_DELTA) velocity * (MAX_EXPLOSION_DELTA / speed) else velocity
+            if (service.submit(PhysicsCommand.AddLinearVelocity(level.physicsDimensionId(), bodyId, capped))) {
+                explosionPropsLastTick++
+            }
+        }
+        pendingExplosionVelocity.clear()
+    }
+
+    private fun submitPistonMotion(motion: PistonMotion) {
+        val origin = motion.boxes.first().center
+        val localBoxes = motion.boxes.map { box -> PhysicsBox(box.min - origin, box.max - origin) }
+        val shape = if (localBoxes.size == 1) PhysicsShapeDefinition.Box(localBoxes.single())
+            else PhysicsShapeDefinition.CompoundBoxes(localBoxes)
+        service.submit(
+            PhysicsCommand.CreateTemporaryKinematicBody(
+                motion.level.physicsDimensionId(),
+                PhysicsBodyDefinition(
+                    PhysicsTransform(origin - motion.movement),
+                    shape = shape
+                ),
+                PhysicsTransform(origin),
+                PISTON_TRAVEL_SECONDS,
+                PISTON_LIFETIME_STEPS
+            )
+        )
+    }
+
+    private fun updateSubmersion(
+        prop: PhysicsPropEntity,
+        level: ServerLevel,
+        bodyId: PhysicsBodyId,
+        sleeping: Boolean
+    ) {
+        if (!MinecraftTerrainAdapter.hasWaterResponse(prop.blockState) ||
+            sleeping && submersionByProp.containsKey(prop.uuid) && managerTick % WATER_IDLE_CHECK_TICKS != 0L
+        ) return
+        val fraction = MinecraftTerrainAdapter.submersion(level, prop.boundingBox)
+        if (submersionByProp[prop.uuid] == fraction) return
+        if (service.submit(PhysicsCommand.SetSubmersion(level.physicsDimensionId(), bodyId, fraction))) {
+            submersionByProp[prop.uuid] = fraction
+        }
+    }
+
+    private fun rollbackPendingConversion(propId: UUID): Boolean {
+        pendingConversions.remove(propId)?.let { return restoreBlock(it) }
+        pendingItemConversions.remove(propId)?.let { return restoreItem(it) }
+        return false
+    }
+
+    private fun restoreBlock(conversion: ConvertedBlock): Boolean =
+        conversion.level.getBlockState(conversion.position).isAir &&
+            conversion.level.setBlock(conversion.position, conversion.state, CONVERSION_FLAGS)
+
+    private fun restoreItem(conversion: ConvertedItem): Boolean {
+        val item = ItemEntity(
+            conversion.level,
+            conversion.position.x,
+            conversion.position.y,
+            conversion.position.z,
+            conversion.stack.copy(),
+            conversion.velocity.x,
+            conversion.velocity.y,
+            conversion.velocity.z
+        )
+        item.setDefaultPickUpDelay()
+        ignoredDroppedItems += item.uuid
+        if (conversion.level.addFreshEntity(item)) return true
+        ignoredDroppedItems.remove(item.uuid)
+        return false
+    }
+
+    fun toggleHeld(player: Player): Boolean {
+        if (player.uuid in heldByPlayer || player.uuid in heldLivingByPlayer) {
+            releasePlayer(player.uuid)
+            return true
+        }
+        return when (val target = targetedGravityGunEntity(player)) {
+            is PhysicsPropEntity -> hold(player, target, false)
+            is LivingEntity -> holdLiving(player, target)
+            else -> false
+        }
+    }
+
+    fun togglePhysicsGunHeld(player: Player, prop: PhysicsPropEntity): Boolean {
+        heldByPlayer[player.uuid]?.let {
+            releasePlayer(player.uuid)
+            return true
+        }
+        if (prop.physicsPending) {
+            if (prop.uuid in pendingPhysicsGunHolds || player.uuid in pendingPhysicsGunHolds.values ||
+                player.level() !== prop.level() || player.isSpectator ||
+                !player.isHolding { it.item === TumbleItems.PHYSICS_GUN } ||
+                player.distanceToSqr(prop) > PHYSICS_GUN_REACH_SQUARED
+            ) return false
+            pendingPhysicsGunHolds[prop.uuid] = player.uuid
+            return true
+        }
+        return hold(player, prop, true)
+    }
+
+    private fun hold(player: Player, prop: PhysicsPropEntity, physicsGun: Boolean): Boolean {
+        if (prop.uuid in heldByProp || prop.runtimeBodyId == null) return false
+        if (prop.frozen) {
+            val level = prop.level() as? ServerLevel ?: return false
+            if (!service.submit(
+                    PhysicsCommand.SetMotionType(level.physicsDimensionId(), prop.runtimeBodyId!!, PhysicsMotionType.DYNAMIC)
+                )
+            ) return false
+            prop.frozen = false
+        }
+        launchedProps.remove(prop.uuid)
+        heldByPlayer[player.uuid] = prop.uuid
+        heldByProp[prop.uuid] = player.uuid
+        if (physicsGun) {
+            physicsGunHoldDistance[player.uuid] = player.eyePosition.distanceTo(prop.position())
+                .coerceIn(MIN_PHYSICS_GUN_HOLD_DISTANCE, tuning.get(TumbleTuningKey.GRAB_DISTANCE))
+        }
+        prop.actorCollidable = false
+        prop.heldByEntityId = player.id
+        return true
+    }
+
+    fun controlPhysicsGun(
+        player: ServerPlayer,
+        propId: UUID,
+        distanceDelta: Float,
+        yawDelta: Float,
+        pitchDelta: Float
+    ): Boolean {
+        val prop = props[propId] ?: return false
+        if (heldByPlayer[player.uuid] != propId || player.uuid !in physicsGunHoldDistance ||
+            prop.level() !== player.level() || !player.isHolding { it.item === TumbleItems.PHYSICS_GUN } ||
+            lastPhysicsGunControlTick[player.uuid] == managerTick
+        ) return false
+        lastPhysicsGunControlTick[player.uuid] = managerTick
+        if (distanceDelta != 0f) {
+            val maximum = tuning.get(TumbleTuningKey.GRAB_DISTANCE)
+            physicsGunHoldDistance[player.uuid] =
+                ((physicsGunHoldDistance[player.uuid] ?: MIN_PHYSICS_GUN_HOLD_DISTANCE) + distanceDelta * 0.5)
+                    .coerceIn(MIN_PHYSICS_GUN_HOLD_DISTANCE, maximum)
+        }
+        if (yawDelta == 0f && pitchDelta == 0f) return true
+        val bodyId = prop.runtimeBodyId ?: return false
+        val rotation = PhysicsGunRotation.apply(prop.bodyRotation, yawDelta.toDouble(), pitchDelta.toDouble(), player.yRot.toDouble())
+        return service.submit(
+            PhysicsCommand.SetTransform(
+                (prop.level() as ServerLevel).physicsDimensionId(),
+                bodyId,
+                PhysicsTransform(PhysicsVector(prop.x, prop.y, prop.z), rotation)
+            )
+        )
+    }
+
+    fun launchHeld(player: Player): Boolean {
+        if (!player.isHolding { it.item === TumbleItems.GRAVITY_GUN }) return false
+        heldLivingByPlayer[player.uuid]?.let { held ->
+            val target = held.entity
+            releaseLiving(player.uuid)
+            if (!target.isAlive || target.isRemoved) return false
+            val look = player.lookAngle
+            target.setDeltaMovement(
+                look.x * LIVING_ENTITY_LAUNCH_SPEED,
+                look.y * LIVING_ENTITY_LAUNCH_SPEED,
+                look.z * LIVING_ENTITY_LAUNCH_SPEED
+            )
+            target.syncVelocity = true
+            return true
+        }
+        val propId = heldByPlayer[player.uuid] ?: return false
+        val prop = props[propId]
+        releasePlayer(player.uuid)
+        val bodyId = prop?.runtimeBodyId ?: return false
+        val level = prop.level() as? ServerLevel ?: return false
+        val look = player.lookAngle
+        val accepted = service.submit(
+            PhysicsCommand.SetLinearVelocity(
+                level.physicsDimensionId(),
+                bodyId,
+                PhysicsVector(
+                    look.x * tuning.get(TumbleTuningKey.LAUNCH_SPEED),
+                    look.y * tuning.get(TumbleTuningKey.LAUNCH_SPEED),
+                    look.z * tuning.get(TumbleTuningKey.LAUNCH_SPEED)
+                )
+            )
+        )
+        if (accepted) {
+            val hardness = prop.blockState.getDestroySpeed(level, prop.blockPosition())
+            launchedProps[propId] = LaunchedProp(
+                player.uuid,
+                managerTick + tuning.get(TumbleTuningKey.LAUNCH_DAMAGE_TICKS).toLong(),
+                PhysicsVector(prop.x, prop.y, prop.z),
+                GravityGunDamage.damage(hardness, prop.blockState.`is`(Blocks.BEDROCK))
+            )
+        }
+        return accepted
+    }
+
+    fun releasePlayer(playerId: UUID) {
+        pendingPhysicsGunHolds.entries.removeIf { it.value == playerId }
+        lastPushRequestTick.remove(playerId)
+        lastPhysicsGunControlTick.remove(playerId)
+        weldSelectionByPlayer.remove(playerId)
+        weldHistoryByPlayer.remove(playerId)
+        physicsGunHoldDistance.remove(playerId)
+        releaseLiving(playerId)
+        heldByPlayer.remove(playerId)?.let { propId ->
+            heldByProp.remove(propId)
+            props[propId]?.let { prop ->
+                prop.actorCollidable = true
+                prop.heldByEntityId = -1
+            }
+        }
+    }
+
+    fun releaseHeld(player: Player): Boolean {
+        if (player.uuid !in heldByPlayer && player.uuid !in heldLivingByPlayer &&
+            player.uuid !in pendingPhysicsGunHolds.values) return false
+        releasePlayer(player.uuid)
+        return true
+    }
+
+    fun heldPropCount() = heldByPlayer.size
+    fun launchedPropCount() = launchedProps.size
+
+    private fun releaseProp(propId: UUID) {
+        heldByProp.remove(propId)?.let { playerId ->
+            heldByPlayer.remove(playerId)
+            physicsGunHoldDistance.remove(playerId)
+            lastPhysicsGunControlTick.remove(playerId)
+        }
+        props[propId]?.let { prop ->
+            prop.actorCollidable = true
+            prop.heldByEntityId = -1
+        }
+    }
+
+    private fun updateHeldProps() {
+        heldByPlayer.entries.toList().forEach { (playerId, propId) ->
+            val player = server.playerList.getPlayer(playerId)
+            val prop = props[propId]
+            if (player == null || prop == null || !player.isAlive || player.isSpectator ||
+                player.level() !== prop.level() || !player.isHolding { TumbleItems.isGun(it.item) } ||
+                player.distanceToSqr(prop) > maxOf(
+                    16.0,
+                    tuning.get(TumbleTuningKey.HOLD_DISTANCE) * 4.0
+                ).let { it * it }) {
+                releasePlayer(playerId)
+                return@forEach
+            }
+            val bodyId = prop.runtimeBodyId ?: return@forEach
+            val physicsGun = playerId in physicsGunHoldDistance
+            val holdDistance = if (physicsGun) {
+                physicsGunHoldDistance[playerId] ?: tuning.get(TumbleTuningKey.HOLD_DISTANCE)
+            } else {
+                tuning.get(TumbleTuningKey.GRAVITY_GUN_HOLD_DISTANCE)
+            }
+            val target = player.eyePosition.add(player.lookAngle.scale(holdDistance))
+            val current = PhysicsVector(prop.x, prop.y, prop.z)
+            val desired = PhysicsVector(target.x, target.y, target.z)
+            val velocity = if (physicsGun) {
+                GravityGunMotion.holdVelocity(current, desired)
+            } else {
+                GravityGunMotion.holdVelocity(
+                    current,
+                    desired,
+                    prop.mass.toDouble(),
+                    tuning.get(TumbleTuningKey.GRAVITY_GUN_FORCE)
+                )
+            }
+            service.submit(PhysicsCommand.SetLinearVelocity((prop.level() as ServerLevel).physicsDimensionId(), bodyId, velocity))
+        }
+        heldLivingByPlayer.entries.toList().forEach { (playerId, held) ->
+            val player = server.playerList.getPlayer(playerId)
+            val entity = held.entity
+            if (player == null || !player.isAlive || player.isSpectator || !entity.isAlive || entity.isRemoved ||
+                player.level() !== entity.level() || !player.isHolding { it.item === TumbleItems.GRAVITY_GUN } ||
+                player.distanceToSqr(entity) > MAX_HELD_ENTITY_DISTANCE_SQUARED
+            ) {
+                releaseLiving(playerId)
+                return@forEach
+            }
+            val target = player.eyePosition.add(
+                player.lookAngle.scale(tuning.get(TumbleTuningKey.GRAVITY_GUN_HOLD_DISTANCE))
+            )
+            val velocity = GravityGunMotion.livingHoldVelocity(
+                PhysicsVector(entity.x, entity.y + entity.bbHeight * 0.5, entity.z),
+                PhysicsVector(target.x, target.y, target.z)
+            )
+            entity.setDeltaMovement(velocity.x, velocity.y, velocity.z)
+            entity.fallDistance = 0.0
+            entity.syncVelocity = true
+        }
+    }
+
+    private fun holdLiving(player: Player, entity: LivingEntity): Boolean {
+        if (entity === player || entity.uuid in heldLivingEntities || !entity.isAlive || entity.isSpectator) return false
+        heldLivingByPlayer[player.uuid] = HeldLivingEntity(entity, entity.isNoGravity)
+        heldLivingEntities += entity.uuid
+        entity.setNoGravity(true)
+        entity.fallDistance = 0.0
+        TumbleAdvancements.award(player, "living_grab")
+        return true
+    }
+
+    private fun releaseLiving(playerId: UUID) {
+        heldLivingByPlayer.remove(playerId)?.let { held ->
+            heldLivingEntities -= held.entity.uuid
+            if (!held.entity.isRemoved) held.entity.setNoGravity(held.originalNoGravity)
+        }
+    }
+
+    private fun targetedGravityGunEntity(player: Player): Entity? {
+        val start = player.eyePosition
+        val grabDistance = tuning.get(TumbleTuningKey.GRAVITY_GUN_GRAB_DISTANCE)
+        val end = start.add(player.lookAngle.scale(grabDistance))
+        val blockDistance = player.pick(grabDistance, 0f, false).location.distanceToSqr(start)
+        val search = AABB(
+            minOf(start.x, end.x), minOf(start.y, end.y), minOf(start.z, end.z),
+            maxOf(start.x, end.x), maxOf(start.y, end.y), maxOf(start.z, end.z)
+        ).inflate(1.0)
+        val candidates = ArrayList<Entity>()
+        candidates += player.level().getEntitiesOfClass(PhysicsPropEntity::class.java, search) {
+            it.runtimeBodyId != null && it.uuid !in heldByProp
+        }
+        candidates += player.level().getEntitiesOfClass(LivingEntity::class.java, search) {
+            it !== player && it.isAlive && !it.isSpectator && it.uuid !in heldLivingEntities
+        }
+        return candidates.asSequence()
+            .mapNotNull { entity ->
+                entity.boundingBox.inflate(0.15).clip(start, end).orElse(null)
+                    ?.let { entity to it.distanceToSqr(start) }
+            }
+            .filter { (_, distance) -> distance <= blockDistance + 1e-6 }
+            .minByOrNull { it.second }
+            ?.first
+    }
+
+    private fun damageFromLaunch(prop: PhysicsPropEntity, level: ServerLevel, current: PhysicsVector) {
+        val launch = launchedProps[prop.uuid] ?: return
+        if (managerTick > launch.expiresAt) {
+            launchedProps.remove(prop.uuid)
+            return
+        }
+        val previous = launch.lastPosition
+        launch.lastPosition = current
+        if ((current - previous).squaredLength() < 1e-6) return
+        val search = AABB(
+            minOf(previous.x, current.x) - 0.5,
+            minOf(previous.y, current.y) - 0.5,
+            minOf(previous.z, current.z) - 0.5,
+            maxOf(previous.x, current.x) + 0.5,
+            maxOf(previous.y, current.y) + 0.5,
+            maxOf(previous.z, current.z) + 0.5
+        )
+        val victim = level.getEntitiesOfClass(LivingEntity::class.java, search) { entity ->
+            entity.uuid != launch.shooter && entity.isAlive && !entity.isSpectator &&
+                (entity is Enemy || entity is Player) && GravityGunDamage.sweptCubeHits(
+                    previous,
+                    current,
+                    PhysicsAabb(
+                        PhysicsVector(entity.boundingBox.minX, entity.boundingBox.minY, entity.boundingBox.minZ),
+                        PhysicsVector(entity.boundingBox.maxX, entity.boundingBox.maxY, entity.boundingBox.maxZ)
+                    )
+                )
+        }.firstOrNull() ?: return
+
+        val shooter = server.playerList.getPlayer(launch.shooter)
+        val source = shooter?.let { level.damageSources().thrown(prop, it) } ?: level.damageSources().fallingBlock(prop)
+        victim.hurtServer(level, source, launch.damage)
+        launchedProps.remove(prop.uuid)
+    }
+
+    private fun drainImpactEvents() {
+        val detonations = linkedSetOf<UUID>()
+        var consumed = 0
+        while (consumed++ < MAX_IMPACTS_PER_TICK) {
+            val notification = service.pollImpact() ?: break
+            listOfNotNull(notification.event.bodyA, notification.event.bodyB).forEach { bodyId ->
+                bodyOwners[RuntimeBodyKey(notification.dimension, bodyId)]?.let(detonations::add)
+            }
+        }
+        detonations.forEach { propId ->
+            val prop = props[propId] ?: return@forEach
+            val level = prop.level() as? ServerLevel ?: return@forEach
+            if (!prop.blockState.`is`(Blocks.TNT) ||
+                !level.gameRules.get(TumbleGameRules.EXPLODE_TNT_ON_IMPACT)
+            ) return@forEach
+            val bodyId = prop.runtimeBodyId ?: return@forEach
+            val position = service.latestFrame(level.physicsDimensionId()).bodies[bodyId]?.transform?.position
+                ?: PhysicsVector(prop.x, prop.y, prop.z)
+            entityUnloaded(prop, level)
+            prop.discard()
+            level.explode(
+                null,
+                position.x,
+                position.y,
+                position.z,
+                tuning.get(TumbleTuningKey.TNT_EXPLOSION_POWER).toFloat(),
+                false,
+                Level.ExplosionInteraction.TNT
+            )
+        }
+    }
+
+    fun networkProps(): List<NetworkProp> = props.values.mapNotNull { entity ->
+        val bodyId = entity.runtimeBodyId ?: return@mapNotNull null
+        val level = entity.level() as? ServerLevel ?: return@mapNotNull null
+        NetworkProp(entity.uuid, level.physicsDimensionId(), bodyId, bodyGenerations[entity.uuid] ?: return@mapNotNull null)
+    }
+
+    fun tuningValue(key: TumbleTuningKey) = tuning.get(key)
+
+    fun setTuning(key: TumbleTuningKey, value: Double): Boolean {
+        val previous = tuning.get(key)
+        if (runCatching { tuning.set(key, value) }.isFailure) return false
+        if (key !in NATIVE_TUNING_KEYS) return true
+        val accepted = submitNativeTuning()
+        if (!accepted) runCatching { tuning.set(key, previous) }
+        return accepted
+    }
+
+    private fun submitNativeTuning() = service.submit(
+            PhysicsCommand.ConfigureWorlds(
+                tuning.get(TumbleTuningKey.GRAVITY),
+                tuning.get(TumbleTuningKey.BUOYANCY).toFloat(),
+                tuning.get(TumbleTuningKey.TNT_IMPACT_SPEED).toFloat()
+            )
+        )
+
+    private fun queueBodyCreation(entity: PhysicsPropEntity, level: ServerLevel) {
+        if (entity.physicsPending || entity.runtimeBodyId != null) return
+        entity.physicsPending = true
+        val velocity = entity.deltaMovement
+        val blockPhysics = MinecraftTerrainAdapter.physicsData(entity.blockState)
+        val accepted = service.submit(
+            PhysicsCommand.SpawnBody(
+                entity.uuid,
+                level.physicsDimensionId(),
+                PhysicsBodyDefinition(
+                    transform = PhysicsTransform(
+                        PhysicsVector(entity.x, entity.y, entity.z),
+                        entity.bodyRotation
+                    ),
+                    shape = MinecraftTerrainAdapter.dynamicShape(
+                        entity.blockState.getCollisionShape(level, entity.blockPosition()).toAabbs()
+                    ) ?: cc.modlabs.tumble.physics.PhysicsShapeDefinition.Box(
+                        cc.modlabs.tumble.physics.PhysicsBox.UNIT
+                    ),
+                    material = blockPhysics.material.copy(
+                        density = blockPhysics.material.density * entity.toolPhysicsPreset.densityScale
+                    ),
+                    motionType = if (entity.frozen) PhysicsMotionType.STATIC else PhysicsMotionType.DYNAMIC,
+                    buoyancy = blockPhysics.buoyancy.copy(
+                        enabled = blockPhysics.buoyancy.enabled || entity.toolPhysicsPreset.buoyancyScale > 1f,
+                        forceScale = blockPhysics.buoyancy.forceScale * entity.toolPhysicsPreset.buoyancyScale
+                    ),
+                    linearVelocity = PhysicsVector(velocity.x, velocity.y, velocity.z),
+                    angularVelocity = entity.angularVelocity,
+                    emitImpactEvents = entity.blockState.`is`(Blocks.TNT)
+                )
+            )
+        )
+        if (!accepted) entity.physicsPending = false
+    }
+
+    private fun drainAcknowledgements() {
+        while (true) {
+            when (val acknowledgement = service.pollAcknowledgement() ?: return) {
+                is PhysicsAcknowledgement.BodyCreated -> {
+                    val entity = props[acknowledgement.propId]
+                    if (entity == null || entity.isRemoved || !associations.acknowledge(
+                            acknowledgement.propId,
+                            acknowledgement.bodyId
+                        )
+                    ) {
+                        service.submit(
+                            PhysicsCommand.DestroyBody(acknowledgement.dimension, acknowledgement.bodyId)
+                        )
+                    } else {
+                        pendingConversions.remove(acknowledgement.propId)
+                        pendingItemConversions.remove(acknowledgement.propId)
+                        entity.runtimeBodyId = acknowledgement.bodyId
+                        entity.physicsPending = false
+                        bodyOwners[RuntimeBodyKey(acknowledgement.dimension, acknowledgement.bodyId)] =
+                            acknowledgement.propId
+                        bodyGenerations.nextGeneration(acknowledgement.propId)
+                        pendingPhysicsGunHolds.remove(acknowledgement.propId)?.let { playerId ->
+                            val player = server.playerList.getPlayer(playerId)
+                            if (player != null && player.isAlive && !player.isSpectator &&
+                                player.level() === entity.level() && player.isHolding { it.item === TumbleItems.PHYSICS_GUN } &&
+                                player.distanceToSqr(entity) <= PHYSICS_GUN_REACH_SQUARED &&
+                                playerId !in heldByPlayer && playerId !in heldLivingByPlayer && hold(player, entity, true)
+                            ) TumbleAdvancements.award(player, "first_prop")
+                        }
+                    }
+                }
+                is PhysicsAcknowledgement.BodyCreationFailed -> {
+                    pendingPhysicsGunHolds.remove(acknowledgement.propId)
+                    val entity = props[acknowledgement.propId]
+                    entity?.physicsPending = false
+                    if (rollbackPendingConversion(acknowledgement.propId)) entity?.discard()
+                    logger.error(
+                        "Failed to create physics body for prop {}: {}",
+                        acknowledgement.propId,
+                        acknowledgement.message
+                    )
+                }
+            }
+        }
+    }
+
+    private companion object {
+        const val MAX_PENDING_CONVERSIONS = 4096
+        const val MAX_CONVERSIONS_PER_TICK = 64
+        const val MAX_PISTON_BOXES = 128
+        const val MAX_IMPACTS_PER_TICK = 256
+        const val MAX_SHAPE_CONTACT_PASSES = 4
+        const val BROADPHASE_MARGIN = 0.05
+        const val CONTACT_SKIN = 0.025
+        const val TICKS_PER_SECOND = 20.0
+        const val MAX_TOTAL_IMPULSE = 0.8
+        const val PUSH_REQUEST_REACH = 0.2
+        const val PHYSICS_GUN_REACH_SQUARED = 100.0
+        const val TOOL_GUN_REACH_SQUARED = 100.0
+        const val MIN_PHYSICS_GUN_HOLD_DISTANCE = 1.0
+        const val LIVING_ENTITY_LAUNCH_SPEED = 2.5
+        const val MAX_HELD_ENTITY_DISTANCE_SQUARED = 256.0
+        const val CONVERSION_FLAGS = Block.UPDATE_CLIENTS or Block.UPDATE_KNOWN_SHAPE or Block.UPDATE_SUPPRESS_DROPS
+        const val MAX_EXPLOSION_DELTA = 40.0
+        const val WATER_IDLE_CHECK_TICKS = 10L
+        const val PISTON_TRAVEL_SECONDS = 0.1f
+        const val PISTON_LIFETIME_STEPS = 6
+        const val MAX_PLATFORM_ACTORS_PER_TICK = 128
+        const val MAX_ACTORS_PER_PLATFORM = 16
+        const val PLATFORM_SEARCH_MARGIN = 0.5
+        const val JUMP_VELOCITY = 0.1
+        val NATIVE_TUNING_KEYS = setOf(
+            TumbleTuningKey.GRAVITY,
+            TumbleTuningKey.BUOYANCY,
+            TumbleTuningKey.TNT_IMPACT_SPEED
+        )
+    }
+}
+
+object ExplosionMotion {
+    fun velocity(
+        origin: PhysicsVector,
+        target: PhysicsVector,
+        radius: Double = 8.0,
+        maximumSpeed: Double = 20.0
+    ): PhysicsVector? {
+        require(radius.isFinite() && radius > 0.0) { "Explosion radius must be positive" }
+        require(maximumSpeed.isFinite() && maximumSpeed >= 0.0) { "Explosion speed must be non-negative" }
+        val offset = target - origin
+        val distance = offset.length()
+        if (distance >= radius) return null
+        if (distance <= 1e-12) return PhysicsVector(0.0, maximumSpeed, 0.0)
+        return offset * (maximumSpeed * (1.0 - distance / radius) / distance)
+    }
+}
+
+private data class LaunchedProp(
+    val shooter: UUID,
+    val expiresAt: Long,
+    var lastPosition: PhysicsVector,
+    val damage: Float
+)
+
+private data class HeldLivingEntity(
+    val entity: LivingEntity,
+    val originalNoGravity: Boolean
+)
+
+private data class ConvertedBlock(
+    val level: ServerLevel,
+    val position: BlockPos,
+    val state: BlockState
+)
+
+private data class ConvertedItem(
+    val level: ServerLevel,
+    val position: PhysicsVector,
+    val stack: ItemStack,
+    val velocity: PhysicsVector
+)
+
+private data class BlockConversion(val position: BlockPos, val linearVelocity: PhysicsVector)
+
+private data class PendingPlacedBlock(val level: ServerLevel, val position: BlockPos)
+
+private data class DroppedBlock(val item: ItemEntity, val stack: ItemStack, val state: BlockState)
+
+private data class PistonMotion(
+    val level: ServerLevel,
+    val boxes: List<PhysicsBox>,
+    val movement: PhysicsVector
+)
+
+private data class RuntimeBodyKey(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId)
+
+private data class PlatformMotion(
+    val prop: PhysicsPropEntity,
+    val level: ServerLevel,
+    val previous: AABB,
+    val current: AABB,
+    val delta: PhysicsVector
+)
+
+private data class SelectedWeld(val propId: UUID, val face: Direction)
+
+private data class WeldKey(val first: UUID, val second: UUID) {
+    fun contains(propId: UUID) = first == propId || second == propId
+
+    companion object {
+        fun of(first: UUID, second: UUID) =
+            if (first.compareTo(second) <= 0) WeldKey(first, second) else WeldKey(second, first)
+    }
+}
+
+object ToolGunFace {
+    fun selectedFace(player: Player, prop: PhysicsPropEntity): Direction {
+        val start = player.eyePosition.subtract(prop.position()).toPhysicsVector()
+        val end = player.eyePosition.add(player.lookAngle.scale(10.0)).subtract(prop.position()).toPhysicsVector()
+        return fromRay(prop.bodyRotation, start, end)
+    }
+
+    fun fromRay(rotation: PhysicsRotation, start: PhysicsVector, end: PhysicsVector): Direction {
+        val inverse = rotation.normalized().let { PhysicsRotation(-it.x, -it.y, -it.z, it.w) }
+        val localStart = inverse.rotateVector(start)
+        val localEnd = inverse.rotateVector(end)
+        val hit = AABB(-0.501, -0.501, -0.501, 0.501, 0.501, 0.501)
+            .clip(localStart.toVec3(), localEnd.toVec3()).orElse(null)
+            ?: return dominantFace(localEnd - localStart)
+        val distances = listOf(
+            Direction.WEST to kotlin.math.abs(hit.x + 0.501),
+            Direction.EAST to kotlin.math.abs(hit.x - 0.501),
+            Direction.DOWN to kotlin.math.abs(hit.y + 0.501),
+            Direction.UP to kotlin.math.abs(hit.y - 0.501),
+            Direction.NORTH to kotlin.math.abs(hit.z + 0.501),
+            Direction.SOUTH to kotlin.math.abs(hit.z - 0.501)
+        )
+        return distances.minBy { it.second }.first
+    }
+
+    private fun dominantFace(vector: PhysicsVector): Direction = when {
+        kotlin.math.abs(vector.x) >= kotlin.math.abs(vector.y) && kotlin.math.abs(vector.x) >= kotlin.math.abs(vector.z) ->
+            if (vector.x < 0.0) Direction.EAST else Direction.WEST
+        kotlin.math.abs(vector.y) >= kotlin.math.abs(vector.z) ->
+            if (vector.y < 0.0) Direction.UP else Direction.DOWN
+        else -> if (vector.z < 0.0) Direction.SOUTH else Direction.NORTH
+    }
+
+    private fun PhysicsRotation.rotateVector(vector: PhysicsVector): PhysicsVector {
+        val tx = 2.0 * (y * vector.z - z * vector.y)
+        val ty = 2.0 * (z * vector.x - x * vector.z)
+        val tz = 2.0 * (x * vector.y - y * vector.x)
+        return PhysicsVector(
+            vector.x + w * tx + y * tz - z * ty,
+            vector.y + w * ty + z * tx - x * tz,
+            vector.z + w * tz + x * ty - y * tx
+        )
+    }
+
+    private fun Vec3.toPhysicsVector() = PhysicsVector(x, y, z)
+    private fun PhysicsVector.toVec3() = Vec3(x, y, z)
+}
+
+private fun PhysicsVector.dot(other: PhysicsVector) = x * other.x + y * other.y + z * other.z
+
+internal fun transfersActorImpulse(normal: PhysicsVector) = normal.y <= 0.5
+
+internal fun actorPushImpulse(speedIntoProp: Double, currentPushSpeed: Double, propMass: Double): Double {
+    val targetSpeed = minOf(1.25, 0.35 + speedIntoProp * 0.4)
+    return minOf(0.4, speedIntoProp * 0.6, maxOf(0.0, targetSpeed - currentPushSpeed) * propMass)
+}
+
+private fun AABB.toPhysicsAabb() = PhysicsAabb(
+    PhysicsVector(minX, minY, minZ),
+    PhysicsVector(maxX, maxY, maxZ)
+)
+
+object GravityGunMotion {
+    fun holdVelocity(current: PhysicsVector, target: PhysicsVector): PhysicsVector {
+        val velocity = (target - current) * 10.0
+        val speed = velocity.length()
+        return if (speed > 30.0) velocity * (30.0 / speed) else velocity
+    }
+
+    fun holdVelocity(
+        current: PhysicsVector,
+        target: PhysicsVector,
+        mass: Double,
+        strength: Double
+    ): PhysicsVector {
+        require(mass.isFinite() && mass > 0.0) { "Mass must be positive" }
+        require(strength.isFinite() && strength > 0.0) { "Strength must be positive" }
+        val effectiveMass = maxOf(1.0, mass / 4.0)
+        val velocity = (target - current) * (strength / effectiveMass)
+        val speed = velocity.length()
+        return if (speed > 30.0) velocity * (30.0 / speed) else velocity
+    }
+
+    fun livingHoldVelocity(current: PhysicsVector, target: PhysicsVector): PhysicsVector {
+        val velocity = (target - current) * 0.5
+        val speed = velocity.length()
+        return if (speed > 1.5) velocity * (1.5 / speed) else velocity
+    }
+}
+
+object PhysicsGunRotation {
+    fun apply(current: PhysicsRotation, yawDegrees: Double, pitchDegrees: Double, playerYawDegrees: Double): PhysicsRotation {
+        val yaw = axisAngle(0.0, 1.0, 0.0, Math.toRadians(-yawDegrees))
+        val playerYaw = Math.toRadians(playerYawDegrees)
+        val pitch = axisAngle(kotlin.math.cos(playerYaw), 0.0, kotlin.math.sin(playerYaw), Math.toRadians(pitchDegrees))
+        return multiply(multiply(yaw, pitch), current.normalized()).normalized()
+    }
+
+    private fun axisAngle(x: Double, y: Double, z: Double, angle: Double): PhysicsRotation {
+        val half = angle * 0.5
+        val sine = kotlin.math.sin(half)
+        return PhysicsRotation(x * sine, y * sine, z * sine, kotlin.math.cos(half))
+    }
+
+    private fun multiply(a: PhysicsRotation, b: PhysicsRotation) = PhysicsRotation(
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    )
+}
+
+object GravityGunDamage {
+    fun damage(hardness: Float, bedrock: Boolean = false) = when {
+        bedrock -> 20f
+        hardness < 0f -> 20f
+        else -> (4f + hardness * 2f).coerceAtMost(20f)
+    }
+
+    fun sweptCubeHits(from: PhysicsVector, to: PhysicsVector, bounds: PhysicsAabb): Boolean {
+        val target = bounds.expanded(0.5)
+        val movement = to - from
+        var near = 0.0
+        var far = 1.0
+        for ((start, delta, minimum, maximum) in listOf(
+            Axis(from.x, movement.x, target.min.x, target.max.x),
+            Axis(from.y, movement.y, target.min.y, target.max.y),
+            Axis(from.z, movement.z, target.min.z, target.max.z)
+        )) {
+            if (kotlin.math.abs(delta) < 1e-12) {
+                if (start < minimum || start > maximum) return false
+                continue
+            }
+            val first = (minimum - start) / delta
+            val second = (maximum - start) / delta
+            near = maxOf(near, minOf(first, second))
+            far = minOf(far, maxOf(first, second))
+            if (near > far) return false
+        }
+        return true
+    }
+
+    private data class Axis(val start: Double, val delta: Double, val minimum: Double, val maximum: Double)
+}
+
+data class NetworkProp(
+    val propId: UUID,
+    val dimension: PhysicsDimensionId,
+    val bodyId: PhysicsBodyId,
+    val bodyGeneration: Long
+)
+
+internal fun MutableMap<UUID, Long>.nextGeneration(propId: UUID): Long =
+    ((this[propId] ?: 0L) + 1L).also { this[propId] = it }
+
+internal fun isRecentPhysicalDrop(age: Int) = age in 0..2
+
+enum class ToolGunWeldResult { SELECTED, WELDED, CANCELLED, FAILED }

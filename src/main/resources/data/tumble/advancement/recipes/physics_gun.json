@@ -1,0 +1,19 @@
+{
+  "criteria": {
+    "has_gravity_gun": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": "tumble:gravity_gun"
+          }
+        ]
+      }
+    }
+  },
+  "rewards": {
+    "recipes": [
+      "tumble:physics_gun"
+    ]
+  }
+}

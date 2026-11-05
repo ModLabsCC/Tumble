@@ -3,5 +3,16 @@
   "id": "tumble_test",
   "version": "1.0.0",
   "environment": "*",
-  "entrypoints": { "fabric-gametest": [ "cc.modlabs.tumble.PhysicsWorldGameTest" ] }
+  "entrypoints": {
+    "fabric-gametest": [
+      "cc.modlabs.tumble.PhysicsWorldGameTest",
+      {
+        "adapter": "kotlin",
+        "value": "cc.modlabs.tumble.gametest.TumbleGameTests"
+      }
+    ],
+    "fabric-client-gametest": [
+      "cc.modlabs.tumble.TumbleClientGameTest"
+    ]
+  }
 }

@@ -1,0 +1,16 @@
+{
+  "required": true,
+  "package": "cc.modlabs.tumble.mixin.client",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "ClientEntityCollisionMixin",
+    "ClientInputAccess",
+    "KeyboardInputMixin",
+    "MinecraftMixin",
+    "MouseHandlerAccess",
+    "MouseHandlerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
