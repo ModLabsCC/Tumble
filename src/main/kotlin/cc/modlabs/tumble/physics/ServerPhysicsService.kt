@@ -162,8 +162,7 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                 is PhysicsCommand.DestroyToolConstraints -> worlds[command.dimension]
                     ?.destroyToolConstraints(command.bodyId)
                 is PhysicsCommand.ReplaceTerrainSection -> worlds.getOrPut(command.dimension, ::createWorld).let { world ->
-                    world.removeTerrainSection(command.section)
-                    if (command.geometry.isNotEmpty()) world.syncTerrain(command.geometry)
+                    world.replaceTerrainSection(command.section, command.geometry)
                     terrain.getOrPut(command.dimension, ::mutableSetOf).apply {
                         if (command.geometry.isEmpty()) remove(command.section) else add(command.section)
                     }

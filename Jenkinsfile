@@ -19,12 +19,17 @@ pipeline {
                 sh 'xvfb-run -a ./gradlew runClientGameTest -PacceptMinecraftEula=true --no-daemon --stacktrace'
             }
         }
+        stage('Packaged server GameTests') {
+            steps {
+                sh './gradlew runProductionGameTest -PacceptMinecraftEula=true --no-daemon --stacktrace'
+            }
+        }
     }
     post {
-        success { archiveArtifacts artifacts: 'build/libs/*.jar', fingerprint: true }
+        success { archiveArtifacts artifacts: 'build/libs/*.jar', excludes: 'build/libs/*-gametest.jar', fingerprint: true }
         always {
             junit allowEmptyResults: true, testResults: '**/build/test-results/test/*.xml'
-            archiveArtifacts artifacts: 'build/run/gameTest/logs/*.log,build/run/clientGameTest/logs/*.log', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'build/run/gameTest/logs/*.log,build/run/clientGameTest/logs/*.log,build/run/productionGameTest/logs/*.log', allowEmptyArchive: true
         }
     }
 }

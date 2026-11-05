@@ -64,3 +64,54 @@ jar {
 }
 
 tasks.named("test") { useJUnitPlatform() }
+
+// Verify the downloadable mod, including the native platforms, rather than only the dev classpath.
+tasks.register('verifyModJar') {
+    dependsOn tasks.jar
+    doLast {
+        def jarFile = tasks.jar.archiveFile.get().asFile
+        new java.util.zip.ZipFile(jarFile).withCloseable { zip ->
+            def names = zip.entries().collect { it.name }
+            def core = names.find { it.startsWith('META-INF/jars/physics-core-') && it.endsWith('.jar') }
+            def nativeJar = names.find { it.startsWith('META-INF/jars/box3d4j-') && it.endsWith('.jar') }
+            assert core && nativeJar && names.contains('LICENSE-tumble') : 'Mod JAR is missing its core, native library or license'
+            def expected = [
+                'cc/modlabs/box3d/global/Box3D.class',
+                'cc/modlabs/box3d/linux-x86_64/libjniBox3D.so',
+                'cc/modlabs/box3d/windows-x86_64/jniBox3D.dll',
+                'cc/modlabs/box3d/macosx-x86_64/libjniBox3D.dylib',
+                'cc/modlabs/box3d/macosx-arm64/libjniBox3D.dylib'
+            ] as Set
+            new java.util.zip.ZipInputStream(zip.getInputStream(zip.getEntry(nativeJar))).withCloseable { nested ->
+                for (def entry = nested.nextEntry; entry != null; entry = nested.nextEntry) expected.remove(entry.name)
+            }
+            assert expected.isEmpty() : "Native JAR is missing: ${expected}"
+        }
+    }
+}
+tasks.named('check') { dependsOn tasks.named('verifyModJar') }
+
+// Run the built mod and separate test mod with the normal Fabric server launcher.
+def gametestJar = tasks.register('gametestJar', Jar) {
+    archiveClassifier = 'gametest'
+    from sourceSets.gametest.output
+}
+dependencies {
+    productionRuntimeMods "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
+    productionRuntimeMods "net.fabricmc:fabric-language-kotlin:${fabric_kotlin_version}"
+    productionRuntimeMods files(tasks.jar)
+    productionRuntimeMods files(gametestJar)
+}
+tasks.register('runProductionGameTest', net.fabricmc.loom.task.prod.ServerProductionRunTask) {
+    installerVersion = '1.1.2'
+    runDir = layout.buildDirectory.dir('run/productionGameTest').get().asFile
+    jvmArgs.add('-Dfabric-api.gametest')
+    doFirst {
+        if (!providers.gradleProperty('acceptMinecraftEula').map { it.toBoolean() }.getOrElse(false)) {
+            throw new GradleException('Pass -PacceptMinecraftEula=true to accept the Minecraft EULA for tests')
+        }
+        def directory = runDir.get().asFile
+        directory.mkdirs()
+        new File(directory, 'eula.txt').text = 'eula=true\n'
+    }
+}
