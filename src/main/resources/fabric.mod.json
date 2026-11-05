@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "tumble",
+  "version": "${version}",
+  "name": "Tumble",
+  "description": "A standalone physics foundation for Minecraft.",
+  "license": "MPL-2.0",
+  "environment": "*",
+  "depends": { "fabricloader": ">=0.20.1", "minecraft": "${minecraft_version}", "java": ">=25", "fabric-api": "*" }
+}
