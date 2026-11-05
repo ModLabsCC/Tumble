@@ -13,6 +13,27 @@ import org.slf4j.LoggerFactory
 
 class ServerPhysicsServiceTest {
     @Test
+    fun `an invalid rope command cannot stop the physics service`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:invalid-rope")
+        service.start()
+        try {
+            repeat(2) { service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, bodyDefinition())) }
+            val bodies = mutableListOf<PhysicsBodyId>()
+            waitUntil {
+                (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { bodies += it.bodyId }
+                bodies.size == 2
+            }
+            service.submit(PhysicsCommand.CreateRope(dimension, bodies[0], bodies[1], 0f))
+            service.submit(PhysicsCommand.ApplyCentralImpulse(dimension, bodies[0], PhysicsVector(2.0, 0.0, 0.0)))
+            waitUntil { service.latestFrame(dimension).bodies[bodies[0]]?.linearVelocity?.x?.let { it > 0 } == true }
+            assertEquals(PhysicsServiceState.RUNNING, service.debugState().state)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
     fun `submersion submitted after body creation makes a log rise`() {
         val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
         val dimension = PhysicsDimensionId("test:water")

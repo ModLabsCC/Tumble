@@ -153,8 +153,11 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                     ?.destroyWelds(command.bodyId)
                 is PhysicsCommand.DestroyWeld -> worlds[command.dimension]
                     ?.destroyWeld(command.bodyA, command.bodyB)
-                is PhysicsCommand.CreateRope -> worlds[command.dimension]
-                    ?.createRope(command.bodyA, command.bodyB, command.length)
+                is PhysicsCommand.CreateRope -> {
+                    if (command.length.isFinite() && command.length > 0f) {
+                        worlds[command.dimension]?.createRope(command.bodyA, command.bodyB, command.length)
+                    } else logger.warn("Ignoring rope with invalid length {}", command.length)
+                }
                 is PhysicsCommand.CreateAxis -> worlds[command.dimension]
                     ?.createAxis(command.bodyA, command.bodyB)
                 is PhysicsCommand.CreateNoCollide -> worlds[command.dimension]

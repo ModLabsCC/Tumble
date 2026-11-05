@@ -107,6 +107,7 @@ dependencies {
     productionRuntimeMods files(gametestJar)
 }
 tasks.register('runProductionGameTest', net.fabricmc.loom.task.prod.ServerProductionRunTask) {
+    outputs.upToDateWhen { false }
     installerVersion = '1.1.2'
     runDir = layout.buildDirectory.dir('run/productionGameTest').get().asFile
     jvmArgs.add('-Dfabric-api.gametest')
