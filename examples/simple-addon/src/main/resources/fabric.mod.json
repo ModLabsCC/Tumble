@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "id": "tumble_simple_addon",
+  "version": "1.0.0",
+  "name": "Tumble Simple Addon",
+  "environment": "*",
+  "entrypoints": { "main": ["example.tumble.SimpleAddon"] },
+  "depends": { "fabricloader": "*", "fabric-api": "*", "tumble": "*", "java": ">=25" }
+}

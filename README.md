@@ -24,6 +24,8 @@ The build targets Minecraft 26.3. Later snapshots are not supported yet.
 
 Contributions are welcome, including work made with coding agents. See [CONTRIBUTING.md](CONTRIBUTING.md) for the build, testing and pull request guidelines.
 
+Making a server-side addon? Start with the [addon API guide](docs/addons.md).
+
 ## License
 
 Tumble is licensed under [MPL 2.0](LICENSE). Box3D4j and the libraries it bundles keep their own licenses.

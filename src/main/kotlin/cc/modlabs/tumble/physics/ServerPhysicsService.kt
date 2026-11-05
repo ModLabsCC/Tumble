@@ -39,6 +39,8 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
         thread.start()
     }
 
+    fun isRunning() = state.get() == PhysicsServiceState.RUNNING
+
     fun submit(command: PhysicsCommand): Boolean {
         if (state.get() != PhysicsServiceState.RUNNING) return false
         commands += command

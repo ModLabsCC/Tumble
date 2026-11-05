@@ -25,6 +25,11 @@ pipeline {
                 ' '''
             }
         }
+        stage('Example addon') {
+            steps {
+                sh './gradlew -p examples/simple-addon build --no-daemon --stacktrace'
+            }
+        }
         stage('Packaged server GameTests') {
             steps {
                 sh './gradlew runProductionGameTest -PacceptMinecraftEula=true --no-daemon --stacktrace'

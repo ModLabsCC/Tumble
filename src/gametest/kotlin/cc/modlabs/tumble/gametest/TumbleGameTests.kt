@@ -2,6 +2,7 @@
 package cc.modlabs.tumble.gametest
 
 import cc.modlabs.tumble.item.TumbleItems
+import cc.modlabs.tumble.api.TumbleApi
 import cc.modlabs.tumble.TumbleGameRules
 import cc.modlabs.tumble.entity.PhysicsPropEntity
 import cc.modlabs.tumble.entity.TumbleEntities
@@ -16,8 +17,11 @@ import cc.modlabs.tumble.physics.PhysicsTransform
 import cc.modlabs.tumble.physics.ToolGunWeldResult
 import cc.modlabs.tumble.physics.ToolGunResult
 import cc.modlabs.tumble.physics.PhysicsServiceState
+import cc.modlabs.tumble.physics.PhysicsAcknowledgement
+import cc.modlabs.tumble.physics.PhysicsCommand
 import cc.modlabs.tumble.physics.TumbleTuningKey
 import kotlin.math.abs
+import java.util.concurrent.ConcurrentLinkedQueue
 import net.fabricmc.fabric.api.gametest.v1.GameTest
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
@@ -40,6 +44,35 @@ import net.minecraft.world.level.storage.TagValueInput
 import net.minecraft.world.level.storage.TagValueOutput
 
 class TumbleGameTests {
+    @GameTest(maxTicks = 600)
+    fun addonCanObserveBodyCreationFailure(helper: GameTestHelper) {
+        val baseX = 512
+        prepareChunk(helper, baseX / 16)
+        clearArena(helper, baseX)
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        val id = TumbleApi.spawn(helper.level, net.minecraft.world.phys.Vec3(baseX + 1.5, 3.0, 1.5), Blocks.STONE.defaultBlockState())
+            ?: return helper.fail("could not spawn prop")
+        val field = runtime.service.javaClass.getDeclaredField("acknowledgements")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val acknowledgements = field.get(runtime.service) as ConcurrentLinkedQueue<PhysicsAcknowledgement>
+        val deadline = System.nanoTime() + 5_000_000_000L
+        var created: PhysicsAcknowledgement.BodyCreated? = null
+        while (created == null && System.nanoTime() < deadline) {
+            created = acknowledgements.filterIsInstance<PhysicsAcknowledgement.BodyCreated>().firstOrNull { it.propId == id }
+            if (created == null) Thread.sleep(1)
+        }
+        val body = created ?: return helper.fail("physics worker did not create the test body")
+        helper.assertTrue(acknowledgements.remove(body), "could not intercept the acknowledgement")
+        runtime.service.submit(PhysicsCommand.DestroyBody(body.dimension, body.bodyId))
+        acknowledgements.add(PhysicsAcknowledgement.BodyCreationFailed(id, "injected test failure", body.requestId))
+        runtime.manager.tick()
+        helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.FAILED, "addon could not observe failure")
+        helper.assertTrue(TumbleApi.remove(helper.level, id), "failed prop could not be removed")
+        helper.assertTrue(runtime.service.debugState().state == PhysicsServiceState.RUNNING, "physics service stopped")
+        helper.succeed()
+    }
+
     @GameTest(maxTicks = 600)
     fun pendingDroppedItemSurvivesChunkVisibilityChanges(helper: GameTestHelper) {
         val baseX = 448

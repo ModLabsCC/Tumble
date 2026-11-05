@@ -614,6 +614,7 @@ class PhysicsPropManager(
     }
 
     fun registeredPropCount() = props.size
+    internal fun findProp(id: UUID) = props[id]
 
     fun explosion(level: ServerLevel, origin: PhysicsVector) {
         if (!level.gameRules.get(TumbleGameRules.REACT_TO_EXPLOSIONS)) return
