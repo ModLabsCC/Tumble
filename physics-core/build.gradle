@@ -1,0 +1,23 @@
+plugins {
+    id 'java-library'
+    id 'org.jetbrains.kotlin.jvm'
+}
+
+group = 'cc.modlabs'
+version = rootProject.version
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://repo-api.modlabs.cc/repo/maven/maven-public/' }
+}
+
+dependencies {
+    implementation "cc.modlabs:box3d4j:${rootProject.box3d4j_version}"
+    testImplementation 'org.jetbrains.kotlin:kotlin-test-junit5:2.4.0'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.13.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+java { toolchain.languageVersion = JavaLanguageVersion.of(25) }
+kotlin { jvmToolchain(25) }
+test { useJUnitPlatform() }

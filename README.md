@@ -1,10 +1,10 @@
 # Tumble
 
-Tumble is an early-stage, standalone Fabric physics mod. This repository currently contains the build and a tested Box3D world lifecycle, not playable physics yet.
+Tumble is an early-stage, standalone Fabric physics mod. This repository currently contains the build and a tested loader-independent Box3D simulation core, not playable physics yet.
 
 ## Build and test
 
-Use JDK 25. The pinned target is Minecraft 26.3; Fabric API and Box3D4j are fetched from Fabric and the public ModLabs Maven repository.
+Use JDK 25. The pinned target is Minecraft 26.3; Fabric API, Fabric Language Kotlin and Box3D4j are fetched from Fabric and the public ModLabs Maven repository. Fabric Language Kotlin is required when installing the mod.
 
 ```sh
 ./gradlew clean build -PacceptMinecraftEula=true
@@ -20,6 +20,6 @@ Jenkins artifacts are for development builds. Publish tested release JARs throug
 
 ## Development
 
-ProjectResonance is an existing ModLabs prototype and a source for future audited migration. Tumble does not depend on it. The public physics API, terrain, props, networking, rendering, and performance targets are not implemented yet.
+The physics core was adapted from the ModLabs ProjectResonance prototype; see `physics-core/README.md` for provenance. Tumble does not depend on it. The migrated core includes bodies, terrain geometry and simulation tests; it is not connected to Minecraft gameplay yet. The public Java API, Minecraft terrain adapter, props, networking, rendering, and performance targets are not implemented yet. The pinned native library uses single-precision world positions, so large-world correctness remains an open gate.
 
 Original Tumble source is licensed under MPL-2.0. Box3D4j and bundled components retain their own licenses in the nested dependency.
