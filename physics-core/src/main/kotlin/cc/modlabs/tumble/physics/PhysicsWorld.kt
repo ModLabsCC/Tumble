@@ -430,6 +430,16 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         syncTerrain(removals + geometry)
     }
 
+    /** Owning physics thread only. Atomically replaces the contents of one section. */
+    fun replaceTerrainSection(section: PhysicsSectionPosition, geometry: Collection<TerrainBlockGeometry>) {
+        checkUsable()
+        require(geometry.all { it.position.section() == section }) { "Geometry must belong to the requested section" }
+        val incoming = geometry.mapTo(hashSetOf()) { it.position }
+        val removals = terrainBlocks[section].orEmpty().keys.filterNot(incoming::contains)
+            .map { TerrainBlockGeometry(it, emptyList()) }
+        syncTerrain(removals + geometry)
+    }
+
     /** Owning physics thread only. */
     fun removeTerrainSection(position: PhysicsSectionPosition): Boolean {
         checkUsable()

@@ -14,6 +14,23 @@ import kotlin.test.assertTrue
 
 class TerrainWaterImpactTest {
     @Test
+    fun `replacing a section removes omitted blocks without touching other sections`() = PhysicsWorld().use { world ->
+        fun block(x: Int) = TerrainBlockGeometry(PhysicsBlockPosition(x, 0, 0), listOf(TerrainBox(
+            PhysicsBox(PhysicsVector(x.toDouble(), 0.0, 0.0), PhysicsVector(x + 1.0, 1.0, 1.0))
+        )))
+        val first = block(0)
+        val omitted = block(1)
+        val otherSection = block(16)
+        world.syncTerrain(listOf(first, omitted, otherSection))
+        world.replaceTerrainSection(first.position.section(), listOf(first))
+        assertTrue(world.syncTerrain(listOf(otherSection)).isEmpty())
+        assertEquals(setOf(first.position.section()), world.syncTerrain(listOf(omitted)))
+        assertFailsWith<IllegalArgumentException> {
+            world.replaceTerrainSection(first.position.section(), listOf(otherSection))
+        }
+    }
+
+    @Test
     fun `failed terrain rebuild retains the previous collider and geometry`() = PhysicsWorld().use { world ->
         val position = PhysicsBlockPosition(0, 0, 0)
         val original = TerrainBlockGeometry(position, listOf(TerrainBox(PhysicsBox.UNIT)))
