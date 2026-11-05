@@ -14,6 +14,23 @@ import kotlin.test.assertTrue
 
 class TerrainWaterImpactTest {
     @Test
+    fun `failed terrain rebuild retains the previous collider and geometry`() = PhysicsWorld().use { world ->
+        val position = PhysicsBlockPosition(0, 0, 0)
+        val original = TerrainBlockGeometry(position, listOf(TerrainBox(PhysicsBox.UNIT)))
+        world.syncTerrain(listOf(original))
+        val invalid = (0 until 257).map { i ->
+            val x = (i % 8) * 0.125
+            val y = (i / 64) * 0.125
+            val z = (i / 8 % 8) * 0.125
+            TerrainBox(PhysicsBox(PhysicsVector(x, y, z), PhysicsVector(x + 0.05, y + 0.05, z + 0.05)),
+                PhysicsMaterial(friction = i.toFloat() / 100f))
+        }
+        assertFailsWith<IllegalArgumentException> { world.syncTerrain(listOf(TerrainBlockGeometry(position, invalid))) }
+        assertEquals(1, world.terrainSectionCount())
+        assertTrue(world.syncTerrain(listOf(original)).isEmpty())
+    }
+
+    @Test
     fun `a sleeping buoyant body wakes when water disappears`() {
         PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
             val body = world.createBody(bodyAt(0.0, 0.0, 0.0, buoyancy = PhysicsBuoyancy(enabled = true)))

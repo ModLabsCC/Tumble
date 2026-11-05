@@ -392,26 +392,42 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     /** Owning physics thread only. Rebuilds only sections touched by changed block geometry. */
     fun syncTerrain(updates: Collection<TerrainBlockGeometry>): Set<PhysicsSectionPosition> {
         checkUsable()
-        val dirtySections = linkedSetOf<PhysicsSectionPosition>()
+        val staged = linkedMapOf<PhysicsSectionPosition, MutableMap<PhysicsBlockPosition, List<TerrainBox>>>()
         updates.forEach { update ->
             val section = update.position.section()
-            val blocks = terrainBlocks.getOrPut(section, ::linkedMapOf)
-            val previous = blocks[update.position].orEmpty()
-            if (previous == update.boxes) return@forEach
+            val blocks = staged.getOrPut(section) { terrainBlocks[section]?.toMutableMap() ?: linkedMapOf() }
             if (update.boxes.isEmpty()) blocks.remove(update.position) else blocks[update.position] = update.boxes
-            if (blocks.isEmpty()) terrainBlocks.remove(section)
-            dirtySections += section
         }
-        dirtySections.forEach(::rebuildTerrainSection)
-        if (dirtySections.isNotEmpty()) wakeDynamicBodies()
-        return dirtySections
+        val dirty = staged.filter { (section, blocks) -> blocks != terrainBlocks[section].orEmpty() }
+        if (dirty.isEmpty()) return emptySet()
+        val replacements = linkedMapOf<PhysicsSectionPosition, StaticSectionBody?>()
+        try {
+            dirty.forEach { (section, blocks) ->
+                val boxes = blocks.values.flatten()
+                replacements[section] = if (boxes.isEmpty()) null else createTerrainSection(section, boxes)
+            }
+        } catch (error: Throwable) {
+            replacements.values.filterNotNull().forEach(StaticSectionBody::destroy)
+            throw error
+        }
+        dirty.forEach { (section, blocks) ->
+            if (blocks.isEmpty()) terrainBlocks.remove(section) else terrainBlocks[section] = blocks
+            val replacement = replacements[section]
+            val previous = if (replacement == null) terrainSections.remove(section)
+                else terrainSections.put(section, replacement)
+            previous?.destroy()
+        }
+        wakeDynamicBodies()
+        return dirty.keys
     }
 
-    /** Owning physics thread only. Clears stale sections before installing the supplied geometry. */
+    /** Owning physics thread only. Replaces all geometry without dropping valid colliders on failure. */
     fun replaceTerrain(geometry: Collection<TerrainBlockGeometry>) {
         checkUsable()
-        clearTerrainInternal()
-        syncTerrain(geometry)
+        val incoming = geometry.mapTo(hashSetOf()) { it.position }
+        val removals = terrainBlocks.values.flatMap { it.keys }
+            .filterNot(incoming::contains).map { TerrainBlockGeometry(it, emptyList()) }
+        syncTerrain(removals + geometry)
     }
 
     /** Owning physics thread only. */
@@ -653,12 +669,6 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
             linearVelocity.close()
             transform.close()
         }
-    }
-
-    private fun rebuildTerrainSection(position: PhysicsSectionPosition) {
-        terrainSections.remove(position)?.destroy()
-        val boxes = terrainBlocks[position]?.values?.flatten().orEmpty()
-        if (boxes.isNotEmpty()) createTerrainSection(position, boxes)?.let { terrainSections[position] = it }
     }
 
     private fun createTerrainSection(section: PhysicsSectionPosition, boxes: List<TerrainBox>): StaticSectionBody? {
