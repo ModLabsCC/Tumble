@@ -43,6 +43,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     private var buoyancyForceScale: Float? = null
 
     /** Owning physics thread only. */
+    @JvmName("createBody")
     fun createBody(definition: PhysicsBodyDefinition): PhysicsBodyId {
         checkUsable()
         val nativeBody = createNativeBody(definition)
@@ -55,6 +56,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. Returns false when the body is already absent. */
+    @JvmName("destroyBody")
     fun destroyBody(bodyId: PhysicsBodyId): Boolean {
         checkUsable()
         val body = bodies.remove(bodyId) ?: return false
@@ -70,6 +72,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. Welds two bodies without changing their current relative transform. */
+    @JvmName("createWeld")
     fun createWeld(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
         checkUsable()
         if (bodyA == bodyB || welds.any { it.connects(bodyA, bodyB) }) return false
@@ -104,6 +107,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("destroyWelds")
     fun destroyWelds(bodyId: PhysicsBodyId): Int {
         checkUsable()
         val matches = welds.filter { it.bodyA == bodyId || it.bodyB == bodyId }
@@ -116,6 +120,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("destroyWeld")
     fun destroyWeld(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
         checkUsable()
         val weld = welds.firstOrNull { it.connects(bodyA, bodyB) } ?: return false
@@ -130,6 +135,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         return welds.size
     }
 
+    @JvmName("createRope")
     fun createRope(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, length: Float): Boolean {
         checkUsable()
         require(length.isFinite() && length > 0f) { "Rope length must be positive" }
@@ -152,6 +158,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         }
     }
 
+    @JvmName("createAxis")
     fun createAxis(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
         checkUsable()
         val first = bodies[bodyA] ?: return false
@@ -173,6 +180,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         }
     }
 
+    @JvmName("createNoCollide")
     fun createNoCollide(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
         checkUsable()
         val first = bodies[bodyA] ?: return false
@@ -186,6 +194,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         }
     }
 
+    @JvmName("destroyToolConstraints")
     fun destroyToolConstraints(bodyId: PhysicsBodyId): Int {
         checkUsable()
         val matches = toolJoints.filter { it.bodyA == bodyId || it.bodyB == bodyId }
@@ -206,11 +215,13 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         return true
     }
 
+    @JvmName("containsBody")
     fun containsBody(bodyId: PhysicsBodyId): Boolean {
         checkUsable()
         return bodyId in bodies
     }
 
+    @JvmName("snapshot")
     fun snapshot(bodyId: PhysicsBodyId): PhysicsBodySnapshot? {
         checkUsable()
         return bodies[bodyId]?.let { snapshotOf(bodyId, it) }
@@ -247,12 +258,14 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("setLinearVelocity")
     fun setLinearVelocity(bodyId: PhysicsBodyId, velocity: PhysicsVector): Boolean = withBody(bodyId) { body ->
         velocity.toNativeVector().use { nativeVelocity -> b3Body_SetLinearVelocity(body.nativeId, nativeVelocity) }
         b3Body_SetAwake(body.nativeId, true)
     }
 
     /** Owning physics thread only. */
+    @JvmName("setTransform")
     fun setTransform(bodyId: PhysicsBodyId, transform: PhysicsTransform): Boolean = withBody(bodyId) { body ->
         transform.position.toNativePosition().use { position ->
             transform.rotation.normalized().toNativeRotation().use { rotation ->
@@ -263,6 +276,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("addLinearVelocity")
     fun addLinearVelocity(bodyId: PhysicsBodyId, delta: PhysicsVector): Boolean = withBody(bodyId) { body ->
         b3Body_GetLinearVelocity(body.nativeId).let { current ->
             try {
@@ -278,17 +292,20 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("setAngularVelocity")
     fun setAngularVelocity(bodyId: PhysicsBodyId, velocity: PhysicsVector): Boolean = withBody(bodyId) { body ->
         velocity.toNativeVector().use { nativeVelocity -> b3Body_SetAngularVelocity(body.nativeId, nativeVelocity) }
         b3Body_SetAwake(body.nativeId, true)
     }
 
     /** Owning physics thread only. */
+    @JvmName("applyCentralForce")
     fun applyCentralForce(bodyId: PhysicsBodyId, force: PhysicsVector): Boolean = withBody(bodyId) { body ->
         force.toNativeVector().use { nativeForce -> b3Body_ApplyForceToCenter(body.nativeId, nativeForce, true) }
     }
 
     /** Owning physics thread only. */
+    @JvmName("applyForceAtPosition")
     fun applyForceAtPosition(
         bodyId: PhysicsBodyId,
         force: PhysicsVector,
@@ -302,6 +319,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("applyCentralImpulse")
     fun applyCentralImpulse(bodyId: PhysicsBodyId, impulse: PhysicsVector): Boolean = withBody(bodyId) { body ->
         impulse.toNativeVector().use { nativeImpulse ->
             b3Body_ApplyLinearImpulseToCenter(body.nativeId, nativeImpulse, true)
@@ -309,16 +327,19 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. */
+    @JvmName("wake")
     fun wake(bodyId: PhysicsBodyId): Boolean = withBody(bodyId) {
         b3Body_SetAwake(it.nativeId, true)
     }
 
+    @JvmName("isSleeping")
     fun isSleeping(bodyId: PhysicsBodyId): Boolean? {
         checkUsable()
         return bodies[bodyId]?.let { !b3Body_IsAwake(it.nativeId) }
     }
 
     /** Owning physics thread only. */
+    @JvmName("setMotionType")
     fun setMotionType(bodyId: PhysicsBodyId, motionType: PhysicsMotionType): Boolean = withBody(bodyId) {
         b3Body_SetType(it.nativeId, motionType.nativeValue)
         it.motionType = motionType
@@ -326,6 +347,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. The body must be kinematic. */
+    @JvmName("setKinematicTarget")
     fun setKinematicTarget(
         bodyId: PhysicsBodyId,
         target: PhysicsTransform,
@@ -339,6 +361,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. Creates a kinematic body that destroys itself after lifetimeSteps. */
+    @JvmName("createTemporaryKinematicBody")
     fun createTemporaryKinematicBody(
         definition: PhysicsBodyDefinition,
         targetTransform: PhysicsTransform,
@@ -358,6 +381,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. Returns false for an unknown body. */
+    @JvmName("setSubmersion")
     fun setSubmersion(bodyId: PhysicsBodyId, fraction: Float): Boolean {
         require(fraction.isFinite() && fraction in 0f..1f) { "Submersion must be between 0 and 1" }
         return withBody(bodyId) {
