@@ -16,7 +16,7 @@ pipeline {
         }
         stage('Repeat server GameTests') {
             steps {
-                sh 'for run in 1 2 3 4 5; do ./gradlew runGameTest -PacceptMinecraftEula=true --no-daemon || exit 1; done'
+                sh 'for run in 1 2 3 4 5; do rm -rf build/run/gameTest/world; ./gradlew runGameTest -PacceptMinecraftEula=true --no-daemon || exit 1; done'
             }
         }
         stage('Client GameTests') {
