@@ -5,12 +5,16 @@ import cc.modlabs.tumble.physics.PhysicsServices
 import cc.modlabs.tumble.physics.PhysicsVector
 import cc.modlabs.tumble.physics.TumbleTuningKey
 import cc.modlabs.tumble.item.TumbleItems
+import cc.modlabs.tumble.api.TumbleApi
+import cc.modlabs.tumble.assembly.AssemblyDefinition
 import com.mojang.brigadier.CommandDispatcher
 import com.mojang.brigadier.arguments.DoubleArgumentType
 import com.mojang.brigadier.arguments.IntegerArgumentType
 import com.mojang.brigadier.builder.LiteralArgumentBuilder
 import net.minecraft.commands.CommandSourceStack
 import net.minecraft.commands.Commands
+import net.minecraft.commands.arguments.coordinates.BlockPosArgument
+import net.minecraft.core.BlockPos
 import net.minecraft.network.chat.Component
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.phys.BlockHitResult
@@ -43,11 +47,64 @@ object TumbleCommands {
                         .then(Commands.literal("clear").executes { clear(it.source) })
                         .then(Commands.literal("debug").executes { debug(it.source) })
                 )
+                .then(assemblyNode())
                 .then(Commands.literal("gravitygun").executes { gravityGun(it.source) })
                 .then(Commands.literal("physicsgun").executes { physicsGun(it.source) })
                 .then(tuningNode())
         )
     }
+
+    private fun assemblyNode(): LiteralArgumentBuilder<CommandSourceStack> = Commands.literal("assembly")
+        .then(Commands.argument("from", BlockPosArgument.blockPos())
+            .then(Commands.argument("to", BlockPosArgument.blockPos()).executes { context ->
+                assemble(context.source, BlockPosArgument.getBlockPos(context, "from"), BlockPosArgument.getBlockPos(context, "to"))
+            }))
+
+    private fun assemble(source: CommandSourceStack, first: BlockPos, second: BlockPos): Int {
+        val player = source.player ?: run {
+            source.sendFailure(Component.literal("A player must select the assembly."))
+            return 0
+        }
+        val width = kotlin.math.abs(first.x.toLong() - second.x.toLong()) + 1
+        val height = kotlin.math.abs(first.y.toLong() - second.y.toLong()) + 1
+        val depth = kotlin.math.abs(first.z.toLong() - second.z.toLong()) + 1
+        if (width > MAX_ASSEMBLY_SELECTION_VOLUME || height > MAX_ASSEMBLY_SELECTION_VOLUME ||
+            depth > MAX_ASSEMBLY_SELECTION_VOLUME || width * height * depth > MAX_ASSEMBLY_SELECTION_VOLUME
+        ) {
+            source.sendFailure(Component.literal("The selection is too large."))
+            return 0
+        }
+        val positions = ArrayList<BlockPos>()
+        for (position in BlockPos.betweenClosed(first, second)) {
+            if (!source.level.isInWorldBounds(position) || !source.level.chunkSource.hasChunk(position.x shr 4, position.z shr 4)) {
+                source.sendFailure(Component.literal("The selection includes an unloaded or invalid position."))
+                return 0
+            }
+            if (!source.level.getBlockState(position).isAir) {
+                positions += position.immutable()
+                if (positions.size > AssemblyDefinition.MAX_BLOCKS) {
+                    source.sendFailure(Component.literal("The selection contains too many blocks."))
+                    return 0
+                }
+            }
+        }
+        if (positions.isEmpty()) {
+            source.sendFailure(Component.literal("The selection contains no blocks."))
+            return 0
+        }
+        val closest = positions.minBy { player.distanceToSqr(it.x + 0.5, it.y + 0.5, it.z + 0.5) }
+        positions.remove(closest)
+        positions.add(0, closest)
+        val id = TumbleApi.convertAssemblyAsOperator(source.level, positions, player)
+        if (id == null) {
+            source.sendFailure(Component.literal("Could not convert that selection into an assembly."))
+            return 0
+        }
+        source.sendSuccess({ Component.literal("Created an assembly of ${positions.size} blocks.") }, false)
+        return 1
+    }
+
+    private const val MAX_ASSEMBLY_SELECTION_VOLUME = 32768L
 
     private fun tuningNode(): LiteralArgumentBuilder<CommandSourceStack> = Commands.literal("tuning").also { root ->
         TumbleTuningKey.entries.forEach { key ->

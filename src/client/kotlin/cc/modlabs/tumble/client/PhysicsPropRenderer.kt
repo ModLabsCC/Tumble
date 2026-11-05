@@ -23,10 +23,15 @@ import net.minecraft.world.entity.player.Player
 import net.minecraft.world.phys.Vec3
 import net.minecraft.world.phys.shapes.Shapes
 import org.joml.Quaternionf
+import org.joml.Vector3f
 import cc.modlabs.tumble.physics.PhysicsRotation
+import cc.modlabs.tumble.assembly.AssemblyStructure
 
 class PhysicsPropRenderState : EntityRenderState() {
     val movingBlock = MovingBlockRenderState()
+    val assemblyBlocks = mutableListOf<MovingBlockRenderState>()
+    var assemblyOffsets: List<BlockPos> = emptyList()
+    var assemblySource: AssemblyStructure? = null
     val rotation = Quaternionf()
     var beamStart: Vec3? = null
     var highlightFace: Direction? = null
@@ -70,8 +75,20 @@ class PhysicsPropRenderer(context: EntityRendererProvider.Context) :
         ).normalize()
         state.movingBlock.randomSeedPos = BlockPos.ZERO
         state.movingBlock.blockState = entity.blockState
+        val assembly = entity.assembly
+        if (state.assemblySource !== assembly) {
+            state.assemblySource = assembly
+            state.assemblyBlocks.clear()
+            state.assemblyOffsets = assembly?.definition?.blocks?.map { it.offset } ?: emptyList()
+            assembly?.definition?.blocks?.forEach { block ->
+                state.assemblyBlocks += MovingBlockRenderState().apply {
+                    blockState = block.state
+                    randomSeedPos = block.offset
+                }
+            }
+        }
         state.highlightFace = ClientToolGunState.selectedFace.takeIf {
-            ClientToolGunState.selectedPropId == entity.uuid
+            assembly == null && ClientToolGunState.selectedPropId == entity.uuid
         }
         state.beamStart = entity.level().getEntity(entity.heldByEntityId)
             ?.takeIf { it is Player && it.isHolding { stack -> stack.item === TumbleItems.PHYSICS_GUN } }
@@ -98,6 +115,21 @@ class PhysicsPropRenderer(context: EntityRendererProvider.Context) :
             } else state.rotatedLighting ?: PhysicsPropLighting.rotate(baseLighting, rotation)
             state.movingBlock.cardinalLighting = rotatedLighting
             state.movingBlock.lightEngine = level.lightEngine
+            val offset = Vector3f()
+            state.assemblyBlocks.forEachIndexed { index, block ->
+                val position = state.assemblyOffsets[index]
+                offset.set(position.x.toFloat(), position.y.toFloat(), position.z.toFloat())
+                state.rotation.transform(offset)
+                val lightPosition = BlockPos(
+                    Mth.floor(state.x + offset.x), Mth.floor(state.y + offset.y + 0.5), Mth.floor(state.z + offset.z)
+                )
+                if (block.blockPos != lightPosition || block.biome == null) {
+                    block.blockPos = lightPosition
+                    block.biome = level.getBiome(lightPosition)
+                }
+                block.cardinalLighting = rotatedLighting
+                block.lightEngine = level.lightEngine
+            }
         }
     }
 
@@ -107,7 +139,20 @@ class PhysicsPropRenderer(context: EntityRendererProvider.Context) :
         collector: SubmitNodeCollector,
         cameraState: CameraRenderState
     ) {
-        if (state.movingBlock.blockState.renderShape == RenderShape.MODEL) {
+        if (state.assemblyBlocks.isNotEmpty()) {
+            poseStack.pushPose()
+            poseStack.rotate(state.rotation)
+            state.assemblyBlocks.forEachIndexed { index, block ->
+                if (block.blockState.renderShape == RenderShape.MODEL) {
+                    val offset = state.assemblyOffsets[index]
+                    poseStack.pushPose()
+                    poseStack.translate(offset.x - 0.5, offset.y - 0.5, offset.z - 0.5)
+                    collector.submitMovingBlock(poseStack, block, state.outlineColor)
+                    poseStack.popPose()
+                }
+            }
+            poseStack.popPose()
+        } else if (state.movingBlock.blockState.renderShape == RenderShape.MODEL) {
             poseStack.pushPose()
             poseStack.rotate(state.rotation)
             poseStack.translate(-0.5, -0.5, -0.5)

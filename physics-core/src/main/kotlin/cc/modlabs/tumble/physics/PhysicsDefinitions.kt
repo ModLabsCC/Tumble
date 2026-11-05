@@ -56,12 +56,20 @@ data class PhysicsBox(val min: PhysicsVector, val max: PhysicsVector) {
     }
 }
 
+data class PhysicsMaterialBox(val box: PhysicsBox, val material: PhysicsMaterial)
+
 sealed interface PhysicsShapeDefinition {
     data class Box(val box: PhysicsBox) : PhysicsShapeDefinition
 
     data class CompoundBoxes(val boxes: List<PhysicsBox>) : PhysicsShapeDefinition {
         init {
             require(boxes.isNotEmpty()) { "Compound box shape must contain at least one box" }
+        }
+    }
+
+    data class MaterialBoxes(val boxes: List<PhysicsMaterialBox>) : PhysicsShapeDefinition {
+        init {
+            require(boxes.isNotEmpty()) { "Material box shape must contain at least one box" }
         }
     }
 }
@@ -104,7 +112,8 @@ data class PhysicsBodySnapshot(
     val linearVelocity: PhysicsVector,
     val angularVelocity: PhysicsVector,
     val sleeping: Boolean,
-    val mass: Float = 0f
+    val mass: Float = 0f,
+    val suspended: Boolean = false
 ) {
     init {
         require(mass.isFinite() && mass >= 0f) { "Body mass must be finite and non-negative" }

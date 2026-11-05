@@ -19,7 +19,9 @@ import net.minecraft.tags.BlockTags
 import net.minecraft.tags.FluidTags
 import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.phys.AABB
+import cc.modlabs.tumble.entity.PhysicsPropBounds
 import kotlin.math.floor
 
 data class TerrainSectionKey(
@@ -219,21 +221,11 @@ class TerrainSectionTracker(private val service: ServerPhysicsService) {
         props.forEach { prop ->
             val level = prop.level() as? ServerLevel ?: return@forEach
             val dimension = level.physicsDimensionId()
-            val section = PhysicsBlockPosition(prop.blockX, prop.blockY, prop.blockZ).section()
-            val velocity = prop.deltaMovement
-            val projected = PhysicsBlockPosition(
-                floor(prop.x + velocity.x * TERRAIN_LOOKAHEAD_SECONDS).toInt(),
-                floor(prop.y + velocity.y * TERRAIN_LOOKAHEAD_SECONDS).toInt(),
-                floor(prop.z + velocity.z * TERRAIN_LOOKAHEAD_SECONDS).toInt()
-            ).section()
-            linkedSetOf(
-                PhysicsSectionPosition(section.x, section.y - 1, section.z),
-                section,
-                PhysicsSectionPosition(projected.x, projected.y - 1, projected.z),
-                projected
-            ).forEach { position ->
-                val key = TerrainSectionKey(dimension, position)
-                if (key in synced) dirty.promote(key) else dirty.prioritize(key)
+            forEachCoveredSection(prop, horizontalPadding = 0, verticalPadding = 0, below = 1) { position ->
+                if (position.y in level.minSectionY..<level.maxSectionY && level.chunkSource.hasChunk(position.x, position.z)) {
+                    val key = TerrainSectionKey(dimension, position)
+                    if (key in synced) dirty.promote(key) else dirty.prioritize(key)
+                }
             }
         }
         dirty.take(MAX_DIRTY_SECTIONS_PER_TICK).forEach { key ->
@@ -253,8 +245,35 @@ class TerrainSectionTracker(private val service: ServerPhysicsService) {
     fun syncedSectionCount() = synced.size
     fun dirtySectionCount() = dirty.size()
 
+    fun coveredChunks(prop: PhysicsPropEntity): Set<Long> {
+        val chunks = mutableSetOf<Long>()
+        forEachCoveredSection(prop, horizontalPadding = 0, verticalPadding = 0, below = 1) {
+            chunks += ChunkPos.pack(it.x, it.z)
+        }
+        return chunks
+    }
+
     fun primeForProp(level: ServerLevel, position: BlockPos) {
         primeForPositions(level, listOf(position))
+    }
+
+    fun primeForAssembly(level: ServerLevel, prop: PhysicsPropEntity): Boolean {
+        val positions = linkedSetOf<PhysicsSectionPosition>()
+        forEachCoveredSection(prop, horizontalPadding = 0, verticalPadding = 0, below = 1) { position ->
+            if (position.y in level.minSectionY..<level.maxSectionY) positions += position
+        }
+        if (positions.any { !level.chunkSource.hasChunk(it.x, it.z) }) return false
+        val dimension = level.physicsDimensionId()
+        positions.forEach { position ->
+            val key = TerrainSectionKey(dimension, position)
+            val geometry = MinecraftTerrainAdapter.extractSection(level, position)
+            if (key in synced && geometryCache[key] == geometry) return@forEach
+            if (!service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, position, geometry.toList()))) return false
+            geometryCache[key] = geometry
+            synced += key
+            dirty.remove(key)
+        }
+        return true
     }
 
     fun primeForPositions(level: ServerLevel, positions: Collection<BlockPos>) {
@@ -280,17 +299,9 @@ class TerrainSectionTracker(private val service: ServerPhysicsService) {
     ) {
         val desired = mutableSetOf<TerrainSectionKey>()
         props.forEach { prop ->
-            val centerChunkX = Math.floorDiv(prop.blockX, 16)
-            val centerChunkZ = Math.floorDiv(prop.blockZ, 16)
-            val centerSectionY = Math.floorDiv(prop.blockY, 16)
-            val minimumSectionY = maxOf(level.minSectionY, centerSectionY - TERRAIN_SECTION_RADIUS)
-            val maximumSectionY = minOf(level.maxSectionY - 1, centerSectionY + TERRAIN_SECTION_RADIUS)
-            for (chunkX in centerChunkX - TERRAIN_CHUNK_RADIUS..centerChunkX + TERRAIN_CHUNK_RADIUS) {
-                for (chunkZ in centerChunkZ - TERRAIN_CHUNK_RADIUS..centerChunkZ + TERRAIN_CHUNK_RADIUS) {
-                    if (!level.chunkSource.hasChunk(chunkX, chunkZ)) continue
-                    for (sectionY in minimumSectionY..maximumSectionY) {
-                        desired += TerrainSectionKey(dimension, PhysicsSectionPosition(chunkX, sectionY, chunkZ))
-                    }
+            forEachCoveredSection(prop, TERRAIN_CHUNK_RADIUS, TERRAIN_SECTION_RADIUS, below = 0) { position ->
+                if (position.y in level.minSectionY..<level.maxSectionY && level.chunkSource.hasChunk(position.x, position.z)) {
+                    desired += TerrainSectionKey(dimension, position)
                 }
             }
         }
@@ -304,10 +315,63 @@ class TerrainSectionTracker(private val service: ServerPhysicsService) {
         desired.filter { it !in synced }.forEach(dirty::add)
     }
 
+    private inline fun forEachCoveredSection(
+        prop: PhysicsPropEntity,
+        horizontalPadding: Int,
+        verticalPadding: Int,
+        below: Int,
+        action: (PhysicsSectionPosition) -> Unit
+    ) {
+        val structure = prop.assembly
+        if (structure == null) {
+            forEachSectionInBounds(prop.boundingBox, prop, horizontalPadding, verticalPadding, below, action)
+            return
+        }
+        val rotation = prop.bodyRotation
+        structure.coverageBounds.forEach { local ->
+            val rotated = PhysicsPropBounds.rotatedAabb(rotation, local)
+            val bounds = AABB(
+                prop.x + rotated.min.x, prop.y + rotated.min.y, prop.z + rotated.min.z,
+                prop.x + rotated.max.x, prop.y + rotated.max.y, prop.z + rotated.max.z
+            )
+            forEachSectionInBounds(bounds, prop, horizontalPadding, verticalPadding, below, action)
+        }
+    }
+
+    private inline fun forEachSectionInBounds(
+        initialBounds: AABB,
+        prop: PhysicsPropEntity,
+        horizontalPadding: Int,
+        verticalPadding: Int,
+        below: Int,
+        action: (PhysicsSectionPosition) -> Unit
+    ) {
+        val velocity = prop.deltaMovement
+        val bounds = initialBounds.expandTowards(
+            (velocity.x * TERRAIN_LOOKAHEAD_SECONDS).coerceIn(-MAX_TERRAIN_LOOKAHEAD, MAX_TERRAIN_LOOKAHEAD),
+            (velocity.y * TERRAIN_LOOKAHEAD_SECONDS).coerceIn(-MAX_TERRAIN_LOOKAHEAD, MAX_TERRAIN_LOOKAHEAD),
+            (velocity.z * TERRAIN_LOOKAHEAD_SECONDS).coerceIn(-MAX_TERRAIN_LOOKAHEAD, MAX_TERRAIN_LOOKAHEAD)
+        )
+        val minX = floor(bounds.minX / 16.0).toInt() - horizontalPadding
+        val maxX = floor(bounds.maxX / 16.0).toInt() + horizontalPadding
+        val minY = floor(bounds.minY / 16.0).toInt() - verticalPadding - below
+        val maxY = floor(bounds.maxY / 16.0).toInt() + verticalPadding
+        val minZ = floor(bounds.minZ / 16.0).toInt() - horizontalPadding
+        val maxZ = floor(bounds.maxZ / 16.0).toInt() + horizontalPadding
+        for (x in minX..maxX) {
+            for (z in minZ..maxZ) {
+                for (y in minY..maxY) {
+                    action(PhysicsSectionPosition(x, y, z))
+                }
+            }
+        }
+    }
+
     private companion object {
         const val TERRAIN_CHUNK_RADIUS = 1
         const val TERRAIN_SECTION_RADIUS = 1
         const val TERRAIN_LOOKAHEAD_SECONDS = 0.1
+        const val MAX_TERRAIN_LOOKAHEAD = 64.0
         const val MAX_DIRTY_SECTIONS_PER_TICK = 2
     }
 }

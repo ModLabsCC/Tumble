@@ -65,6 +65,8 @@ sealed interface PhysicsCommand {
         val section: PhysicsSectionPosition
     ) : PhysicsCommand
     data class WakeBody(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId) : PhysicsCommand
+    data class SuspendBody(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId) : PhysicsCommand
+    data class ResumeBody(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId) : PhysicsCommand
     data class SetMotionType(
         val dimension: PhysicsDimensionId,
         val bodyId: PhysicsBodyId,

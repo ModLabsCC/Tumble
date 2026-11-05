@@ -23,7 +23,12 @@ object ClientActorCollision {
         val level = actor.level() as? ClientLevel ?: return movement
         val actorBounds = PhysicsServices.actorCollisionBounds(actor)
         val search = actorBounds.expandTowards(movement).inflate(MAX_TRACKING_DRIFT)
-        val candidates = level.getEntitiesOfClass(PhysicsPropEntity::class.java, search) { it.actorCollidable }
+        val candidates = level.getEntitiesOfClass(PhysicsPropEntity::class.java, search) { it.actorCollidable }.toMutableList()
+        ClientAssemblyState.assemblies().forEach { prop ->
+            if (prop.level() === level && prop.actorCollidable && prop.boundingBox.intersects(search) && prop !in candidates) {
+                candidates += prop
+            }
+        }
         if (candidates.isEmpty()) return movement
         val now = System.nanoTime()
         val shapes = candidates.flatMapIndexed { owner, prop ->

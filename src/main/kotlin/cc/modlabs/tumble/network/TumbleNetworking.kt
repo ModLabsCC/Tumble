@@ -7,6 +7,7 @@ import cc.modlabs.tumble.physics.PhysicsServices
 
 object TumbleNetworking {
     fun register() {
+        PayloadTypeRegistry.clientboundPlay().register(AssemblyPayload.TYPE, AssemblyPayload.CODEC)
         PayloadTypeRegistry.clientboundPlay().register(PhysicsSnapshotPayload.TYPE, PhysicsSnapshotPayload.CODEC)
         PayloadTypeRegistry.clientboundPlay().register(PhysicsDespawnPayload.TYPE, PhysicsDespawnPayload.CODEC)
         PayloadTypeRegistry.clientboundPlay().register(ToolGunStatePayload.TYPE, ToolGunStatePayload.CODEC)
@@ -15,6 +16,10 @@ object TumbleNetworking {
         PayloadTypeRegistry.serverboundPlay().register(PhysicsGunControlPayload.TYPE, PhysicsGunControlPayload.CODEC)
         PayloadTypeRegistry.serverboundPlay().register(GravityGunLaunchPayload.TYPE, GravityGunLaunchPayload.CODEC)
         PayloadTypeRegistry.serverboundPlay().register(ToolGunModePayload.TYPE, ToolGunModePayload.CODEC)
+        PayloadTypeRegistry.serverboundPlay().register(AssemblyRequestPayload.TYPE, AssemblyRequestPayload.CODEC)
+        ServerPlayNetworking.registerGlobalReceiver(AssemblyRequestPayload.TYPE) { payload, context ->
+            context.server().execute { PhysicsServices.requestAssembly(context.player(), payload.propId) }
+        }
         ServerPlayNetworking.registerGlobalReceiver(PhysicsPushPayload.TYPE) { payload, context ->
             context.server().execute {
                 PhysicsServices.requestPush(context.player(), payload.propId, payload.movement)

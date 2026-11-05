@@ -2,6 +2,8 @@
 package cc.modlabs.tumble.client.network
 
 import cc.modlabs.tumble.client.physics.ClientPhysicsState
+import cc.modlabs.tumble.client.physics.ClientAssemblyState
+import cc.modlabs.tumble.network.AssemblyPayload
 import cc.modlabs.tumble.entity.PhysicsPropEntity
 import cc.modlabs.tumble.network.PhysicsDespawnPayload
 import cc.modlabs.tumble.network.PhysicsSnapshotPayload
@@ -18,6 +20,7 @@ import cc.modlabs.tumble.physics.PhysicsVector
 import java.util.UUID
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientEntityEvents
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLevelEvents
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking
 
@@ -47,6 +50,12 @@ object ClientPhysicsNetworking {
     }
 
     fun register() {
+        ClientTickEvents.END_CLIENT_TICK.register { client ->
+            if (client.player?.tickCount?.rem(20) == 0) ClientAssemblyState.requestMissing()
+        }
+        ClientPlayNetworking.registerGlobalReceiver(AssemblyPayload.TYPE) { payload, context ->
+            context.client().execute { ClientAssemblyState.receive(payload) }
+        }
         ClientPlayNetworking.registerGlobalReceiver(PhysicsSnapshotPayload.TYPE) { payload, context ->
             context.client().execute { ClientPhysicsState.receive(payload) }
         }
@@ -60,19 +69,31 @@ object ClientPhysicsNetworking {
             context.client().execute { ClientPhysicsDebugHud.receive(payload) }
         }
         ClientEntityEvents.ENTITY_LOAD.register { entity, _ ->
-            if (entity is PhysicsPropEntity) ClientPhysicsState.track(entity.uuid)
+            if (entity is PhysicsPropEntity) {
+                ClientPhysicsState.track(entity.uuid)
+                ClientAssemblyState.track(entity)
+            }
         }
         ClientEntityEvents.ENTITY_UNLOAD.register { entity, _ ->
-            if (entity is PhysicsPropEntity) ClientPhysicsState.untrack(entity.uuid)
+            if (entity is PhysicsPropEntity) {
+                ClientPhysicsState.untrack(entity.uuid)
+                ClientAssemblyState.untrack(entity.uuid)
+            }
         }
         ClientLevelEvents.AFTER_CLIENT_LEVEL_CHANGE.register { _, level ->
             ClientPhysicsState.changeDimension(PhysicsDimensionId(level.dimension().identifier().toString()))
+            ClientAssemblyState.changeDimension(PhysicsDimensionId(level.dimension().identifier().toString()))
         }
         ClientPlayConnectionEvents.JOIN.register { _, _, client ->
-            client.level?.let { ClientPhysicsState.changeDimension(PhysicsDimensionId(it.dimension().identifier().toString())) }
+            client.level?.let {
+                val dimension = PhysicsDimensionId(it.dimension().identifier().toString())
+                ClientPhysicsState.changeDimension(dimension)
+                ClientAssemblyState.changeDimension(dimension)
+            }
         }
         ClientPlayConnectionEvents.DISCONNECT.register { _, _ ->
             ClientPhysicsState.disconnect()
+            ClientAssemblyState.changeDimension(null)
             ClientToolGunState.clear()
             ClientPhysicsDebugHud.clear()
         }

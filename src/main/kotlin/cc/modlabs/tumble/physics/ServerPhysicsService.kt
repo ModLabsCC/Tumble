@@ -177,6 +177,8 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                     terrain[command.dimension]?.remove(command.section)
                 }
                 is PhysicsCommand.WakeBody -> worlds[command.dimension]?.wake(command.bodyId)
+                is PhysicsCommand.SuspendBody -> worlds[command.dimension]?.suspend(command.bodyId)
+                is PhysicsCommand.ResumeBody -> worlds[command.dimension]?.resume(command.bodyId)
                 is PhysicsCommand.SetMotionType -> worlds[command.dimension]
                     ?.setMotionType(command.bodyId, command.motionType)
                 is PhysicsCommand.ApplyCentralImpulse -> worlds[command.dimension]

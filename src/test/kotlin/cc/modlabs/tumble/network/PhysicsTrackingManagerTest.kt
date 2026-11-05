@@ -47,6 +47,9 @@ class PhysicsTrackingManagerTest {
         tracking.startTracking(firstProp, firstPlayer)
         tracking.startTracking(secondProp, secondPlayer)
 
+        assertTrue(tracking.isTracking(firstProp, firstPlayer))
+        assertFalse(tracking.isTracking(firstProp, secondPlayer))
+
         assertEquals(setOf(firstProp), tracking.propsTrackedBy(firstPlayer))
         assertEquals(setOf(secondPlayer), tracking.removeProp(secondProp))
         assertFalse(secondProp in tracking.propsTrackedBy(secondPlayer))

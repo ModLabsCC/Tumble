@@ -35,6 +35,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     private val temporaryBodies = mutableMapOf<PhysicsBodyId, Int>()
     private val welds = mutableListOf<NativeWeld>()
     private val toolJoints = mutableListOf<NativeToolJoint>()
+    private val suspensionRoots = mutableSetOf<PhysicsBodyId>()
     private val pendingImpactEvents = mutableListOf<PhysicsImpactEvent>()
     private var latestMovedSnapshots = emptyList<PhysicsBodySnapshot>()
     private var nextBodyId = 1L
@@ -60,12 +61,14 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     fun destroyBody(bodyId: PhysicsBodyId): Boolean {
         checkUsable()
         val body = bodies.remove(bodyId) ?: return false
+        suspensionRoots.remove(bodyId)
         temporaryBodies.remove(bodyId)
         bodyIdsByNativeKey.remove(body.nativeId.key())
         pendingImpactEvents.removeIf { it.bodyA == bodyId || it.bodyB == bodyId }
         latestMovedSnapshots = latestMovedSnapshots.filterNot { it.bodyId == bodyId }
         destroyWelds(bodyId)
         destroyToolConstraints(bodyId)
+        refreshSuspensions()
         b3DestroyBody(body.nativeId)
         body.nativeId.close()
         return true
@@ -78,6 +81,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         if (bodyA == bodyB || welds.any { it.connects(bodyA, bodyB) }) return false
         val first = bodies[bodyA] ?: return false
         val second = bodies[bodyB] ?: return false
+        if (first.suspended != null || second.suspended != null) return false
         val transformA = snapshotOf(bodyA, first).transform
         val transformB = snapshotOf(bodyB, second).transform
         val anchor = (transformA.position + transformB.position) * 0.5
@@ -116,6 +120,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
             weld.nativeId.close()
         }
         welds.removeAll(matches.toSet())
+        if (matches.isNotEmpty()) refreshSuspensions()
         return matches.size
     }
 
@@ -127,6 +132,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         b3DestroyJoint(weld.nativeId, true)
         weld.nativeId.close()
         welds.remove(weld)
+        refreshSuspensions()
         return true
     }
 
@@ -141,6 +147,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         require(length.isFinite() && length > 0f) { "Rope length must be positive" }
         val first = bodies[bodyA] ?: return false
         val second = bodies[bodyB] ?: return false
+        if (first.suspended != null || second.suspended != null) return false
         val transformA = snapshotOf(bodyA, first).transform
         val transformB = snapshotOf(bodyB, second).transform
         val frameA = localJointFrame(transformA, transformA.position, transformA.rotation)
@@ -163,6 +170,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         checkUsable()
         val first = bodies[bodyA] ?: return false
         val second = bodies[bodyB] ?: return false
+        if (first.suspended != null || second.suspended != null) return false
         val transformA = snapshotOf(bodyA, first).transform
         val transformB = snapshotOf(bodyB, second).transform
         val anchor = (transformA.position + transformB.position) * 0.5
@@ -185,6 +193,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         checkUsable()
         val first = bodies[bodyA] ?: return false
         val second = bodies[bodyB] ?: return false
+        if (first.suspended != null || second.suspended != null) return false
         val definition = b3DefaultFilterJointDef()
         return try {
             definition.base().bodyIdA(first.nativeId).bodyIdB(second.nativeId).collideConnected(false)
@@ -203,6 +212,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
             it.nativeId.close()
         }
         toolJoints.removeAll(matches.toSet())
+        if (matches.isNotEmpty()) refreshSuspensions()
         return matches.size
     }
 
@@ -259,14 +269,14 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
 
     /** Owning physics thread only. */
     @JvmName("setLinearVelocity")
-    fun setLinearVelocity(bodyId: PhysicsBodyId, velocity: PhysicsVector): Boolean = withBody(bodyId) { body ->
+    fun setLinearVelocity(bodyId: PhysicsBodyId, velocity: PhysicsVector): Boolean = withActiveBody(bodyId) { body ->
         velocity.toNativeVector().use { nativeVelocity -> b3Body_SetLinearVelocity(body.nativeId, nativeVelocity) }
         b3Body_SetAwake(body.nativeId, true)
     }
 
     /** Owning physics thread only. */
     @JvmName("setTransform")
-    fun setTransform(bodyId: PhysicsBodyId, transform: PhysicsTransform): Boolean = withBody(bodyId) { body ->
+    fun setTransform(bodyId: PhysicsBodyId, transform: PhysicsTransform): Boolean = withActiveBody(bodyId) { body ->
         transform.position.toNativePosition().use { position ->
             transform.rotation.normalized().toNativeRotation().use { rotation ->
                 b3Body_SetTransform(body.nativeId, position, rotation)
@@ -277,7 +287,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
 
     /** Owning physics thread only. */
     @JvmName("addLinearVelocity")
-    fun addLinearVelocity(bodyId: PhysicsBodyId, delta: PhysicsVector): Boolean = withBody(bodyId) { body ->
+    fun addLinearVelocity(bodyId: PhysicsBodyId, delta: PhysicsVector): Boolean = withActiveBody(bodyId) { body ->
         b3Body_GetLinearVelocity(body.nativeId).let { current ->
             try {
                 b3Vec3().x(current.x() + delta.x.toFloat())
@@ -293,14 +303,14 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
 
     /** Owning physics thread only. */
     @JvmName("setAngularVelocity")
-    fun setAngularVelocity(bodyId: PhysicsBodyId, velocity: PhysicsVector): Boolean = withBody(bodyId) { body ->
+    fun setAngularVelocity(bodyId: PhysicsBodyId, velocity: PhysicsVector): Boolean = withActiveBody(bodyId) { body ->
         velocity.toNativeVector().use { nativeVelocity -> b3Body_SetAngularVelocity(body.nativeId, nativeVelocity) }
         b3Body_SetAwake(body.nativeId, true)
     }
 
     /** Owning physics thread only. */
     @JvmName("applyCentralForce")
-    fun applyCentralForce(bodyId: PhysicsBodyId, force: PhysicsVector): Boolean = withBody(bodyId) { body ->
+    fun applyCentralForce(bodyId: PhysicsBodyId, force: PhysicsVector): Boolean = withActiveBody(bodyId) { body ->
         force.toNativeVector().use { nativeForce -> b3Body_ApplyForceToCenter(body.nativeId, nativeForce, true) }
     }
 
@@ -310,7 +320,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         bodyId: PhysicsBodyId,
         force: PhysicsVector,
         worldPosition: PhysicsVector
-    ): Boolean = withBody(bodyId) { body ->
+    ): Boolean = withActiveBody(bodyId) { body ->
         force.toNativeVector().use { nativeForce ->
             worldPosition.toNativePosition().use { nativePosition ->
                 b3Body_ApplyForce(body.nativeId, nativeForce, nativePosition, true)
@@ -320,7 +330,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
 
     /** Owning physics thread only. */
     @JvmName("applyCentralImpulse")
-    fun applyCentralImpulse(bodyId: PhysicsBodyId, impulse: PhysicsVector): Boolean = withBody(bodyId) { body ->
+    fun applyCentralImpulse(bodyId: PhysicsBodyId, impulse: PhysicsVector): Boolean = withActiveBody(bodyId) { body ->
         impulse.toNativeVector().use { nativeImpulse ->
             b3Body_ApplyLinearImpulseToCenter(body.nativeId, nativeImpulse, true)
         }
@@ -341,9 +351,67 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     /** Owning physics thread only. */
     @JvmName("setMotionType")
     fun setMotionType(bodyId: PhysicsBodyId, motionType: PhysicsMotionType): Boolean = withBody(bodyId) {
+        if (it.suspended != null) {
+            it.suspended = it.suspended!!.copy(motionType = motionType)
+            it.motionType = motionType
+            return@withBody
+        }
         b3Body_SetType(it.nativeId, motionType.nativeValue)
         it.motionType = motionType
         if (motionType == PhysicsMotionType.DYNAMIC) b3Body_SetAwake(it.nativeId, true)
+    }
+
+    /** Temporarily holds a connected component in place while preserving its motion. */
+    @JvmName("suspend")
+    fun suspend(bodyId: PhysicsBodyId): Boolean {
+        checkUsable()
+        if (bodyId !in bodies) return false
+        suspensionRoots.add(bodyId)
+        refreshSuspensions()
+        return true
+    }
+
+    /** Removes a suspension reason; linked bodies resume when no reason remains. */
+    @JvmName("resume")
+    fun resume(bodyId: PhysicsBodyId): Boolean {
+        checkUsable()
+        if (bodyId !in bodies) return false
+        suspensionRoots.remove(bodyId)
+        refreshSuspensions()
+        return true
+    }
+
+    private fun refreshSuspensions() {
+        val paused = suspensionRoots.toMutableSet()
+        val queue = ArrayDeque(suspensionRoots)
+        while (queue.isNotEmpty()) {
+            val id = queue.removeFirst()
+            welds.forEach { joint ->
+                val other = if (joint.bodyA == id) joint.bodyB else if (joint.bodyB == id) joint.bodyA else null
+                if (other != null && paused.add(other)) queue.addLast(other)
+            }
+            toolJoints.forEach { joint ->
+                val other = if (joint.bodyA == id) joint.bodyB else if (joint.bodyB == id) joint.bodyA else null
+                if (other != null && paused.add(other)) queue.addLast(other)
+            }
+        }
+        bodies.forEach { (id, body) ->
+            val suspended = body.suspended
+            if (id in paused && suspended == null) {
+                val snapshot = snapshotOf(id, body)
+                body.suspended = SuspendedMotion(body.motionType, snapshot.linearVelocity, snapshot.angularVelocity)
+                b3Body_SetType(body.nativeId, PhysicsMotionType.STATIC.nativeValue)
+            } else if (id !in paused && suspended != null) {
+                b3Body_SetType(body.nativeId, suspended.motionType.nativeValue)
+                if (suspended.motionType != PhysicsMotionType.STATIC) {
+                    suspended.linearVelocity.toNativeVector().use { b3Body_SetLinearVelocity(body.nativeId, it) }
+                    suspended.angularVelocity.toNativeVector().use { b3Body_SetAngularVelocity(body.nativeId, it) }
+                    b3Body_SetAwake(body.nativeId, true)
+                }
+                body.motionType = suspended.motionType
+                body.suspended = null
+            }
+        }
     }
 
     /** Owning physics thread only. The body must be kinematic. */
@@ -354,7 +422,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         travelSeconds: Float
     ): Boolean {
         require(travelSeconds.isFinite() && travelSeconds > 0f) { "Kinematic travel time must be positive" }
-        return withBody(bodyId) { body ->
+        return withActiveBody(bodyId) { body ->
             require(body.motionType == PhysicsMotionType.KINEMATIC) { "Body $bodyId is not kinematic" }
             target.toNativeTransform().use { b3Body_SetTargetTransform(body.nativeId, it, travelSeconds, true) }
         }
@@ -584,13 +652,20 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         val material = definition.material.toNativeMaterial()
         val shapeDefinition = b3DefaultShapeDef()
         try {
+            shapeDefinition.updateBodyMass(false)
             shapeDefinition.baseMaterial(material)
             shapeDefinition.density(definition.material.density)
-            val boxes = when (val shape = definition.shape) {
-                is PhysicsShapeDefinition.Box -> listOf(shape.box)
-                is PhysicsShapeDefinition.CompoundBoxes -> shape.boxes
+            when (val shape = definition.shape) {
+                is PhysicsShapeDefinition.Box -> createExactBoxShape(nativeBody, shapeDefinition, shape.box)
+                is PhysicsShapeDefinition.CompoundBoxes -> shape.boxes.forEach { createExactBoxShape(nativeBody, shapeDefinition, it) }
+                is PhysicsShapeDefinition.MaterialBoxes -> shape.boxes.forEach { part ->
+                    material.copyFrom(part.material)
+                    shapeDefinition.baseMaterial(material)
+                    shapeDefinition.density(part.material.density)
+                    createExactBoxShape(nativeBody, shapeDefinition, part.box)
+                }
             }
-            boxes.forEach { box -> createExactBoxShape(nativeBody, shapeDefinition, box) }
+            b3Body_ApplyMassFromShapes(nativeBody)
         } finally {
             shapeDefinition.close()
             material.close()
@@ -699,10 +774,11 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
             PhysicsBodySnapshot(
                 bodyId,
                 transform.toPhysicsTransform(),
-                linearVelocity.toPhysicsVector(),
-                angularVelocity.toPhysicsVector(),
+                body.suspended?.linearVelocity ?: linearVelocity.toPhysicsVector(),
+                body.suspended?.angularVelocity ?: angularVelocity.toPhysicsVector(),
                 !b3Body_IsAwake(nativeId),
-                body.mass
+                body.mass,
+                body.suspended != null
             )
         } finally {
             angularVelocity.close()
@@ -821,6 +897,14 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         return true
     }
 
+    private inline fun withActiveBody(bodyId: PhysicsBodyId, action: (NativePhysicsBody) -> Unit): Boolean {
+        checkUsable()
+        val body = bodies[bodyId] ?: return false
+        if (body.suspended != null) return false
+        action(body)
+        return true
+    }
+
     private fun checkUsable() {
         checkOwnerThread()
         check(!closed) { "Physics world is closed" }
@@ -848,7 +932,14 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         var motionType: PhysicsMotionType,
         val buoyancy: PhysicsBuoyancy,
         val mass: Float,
-        var submersion: Float = 0f
+        var submersion: Float = 0f,
+        var suspended: SuspendedMotion? = null
+    )
+
+    private data class SuspendedMotion(
+        val motionType: PhysicsMotionType,
+        val linearVelocity: PhysicsVector,
+        val angularVelocity: PhysicsVector
     )
 
     private data class NativeWeld(
@@ -888,11 +979,12 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
 private fun PhysicsBodyDefinition.estimatedMass(): Float {
     fun volume(box: PhysicsBox) =
         (box.max.x - box.min.x) * (box.max.y - box.min.y) * (box.max.z - box.min.z)
-    val volume = when (val value = shape) {
-        is PhysicsShapeDefinition.Box -> volume(value.box)
-        is PhysicsShapeDefinition.CompoundBoxes -> value.boxes.sumOf(::volume)
+    val mass = when (val value = shape) {
+        is PhysicsShapeDefinition.Box -> volume(value.box) * material.density
+        is PhysicsShapeDefinition.CompoundBoxes -> value.boxes.sumOf(::volume) * material.density
+        is PhysicsShapeDefinition.MaterialBoxes -> value.boxes.sumOf { volume(it.box) * it.material.density }
     }
-    return (volume * material.density).toFloat()
+    return mass.toFloat()
 }
 
 private val PhysicsMotionType.nativeValue: Int

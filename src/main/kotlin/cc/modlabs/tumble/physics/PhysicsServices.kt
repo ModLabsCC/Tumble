@@ -69,8 +69,12 @@ object PhysicsServices {
         }
     }
 
+    fun requestAssembly(player: ServerPlayer, propId: UUID) {
+        runtimes[player.level().server]?.publisher?.requestAssembly(player, propId)
+    }
+
     fun chunkUnloaded(level: ServerLevel, chunkX: Int, chunkZ: Int) {
-        runtimes[level.server]?.terrain?.chunkUnloaded(level, chunkX, chunkZ)
+        runtimes[level.server]?.manager?.chunkUnloaded(level, chunkX, chunkZ)
     }
 
     fun chunkLoaded(level: ServerLevel, chunkX: Int, chunkZ: Int) {

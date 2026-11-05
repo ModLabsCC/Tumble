@@ -2,6 +2,9 @@
 package cc.modlabs.tumble;
 
 import cc.modlabs.tumble.entity.PhysicsPropEntity;
+import cc.modlabs.tumble.api.TumbleApi;
+import cc.modlabs.tumble.client.PhysicsPropRenderer;
+import cc.modlabs.tumble.client.physics.ClientAssemblyState;
 import cc.modlabs.tumble.item.TumbleItems;
 import cc.modlabs.tumble.physics.PhysicsServices;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
@@ -22,6 +25,7 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class TumbleClientGameTest implements FabricClientGameTest {
     @Override
@@ -82,6 +86,56 @@ public final class TumbleClientGameTest implements FabricClientGameTest {
                 if (pig == null || !pig.isAlive() || pig.getY() < 100.3) {
                     throw new AssertionError("Held pig fell after its support was removed");
                 }
+            });
+            var assemblyId = new AtomicReference<UUID>();
+            world.getServer().runOnServer(server -> {
+                var level = server.overworld();
+                var player = server.getPlayerList().getPlayers().getFirst();
+                player.setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY);
+                player.setPos(0.5, 100, 0.5);
+                var first = new BlockPos(1, 100, 1);
+                var second = new BlockPos(2, 100, 1);
+                level.setBlock(first, Blocks.STONE.defaultBlockState(), 3);
+                level.setBlock(second, Blocks.OAK_STAIRS.defaultBlockState(), 3);
+                var id = TumbleApi.convertAssembly(level, java.util.List.of(first, second), player);
+                if (id == null) throw new AssertionError("Could not convert the test assembly");
+                assemblyId.set(id);
+            });
+            context.waitFor(client -> {
+                if (client.level == null) return false;
+                for (var entity : client.level.entitiesForRendering()) {
+                    if (entity instanceof PhysicsPropEntity prop && prop.getUUID().equals(assemblyId.get()) && prop.getAssembly() != null) {
+                        var renderer = (PhysicsPropRenderer) client.getEntityRenderDispatcher().getRenderer(prop);
+                        var renderState = renderer.createRenderState();
+                        renderer.extractRenderState(prop, renderState, 0);
+                        return prop.getAssembly().getDefinition().getBlocks().size() == 2 &&
+                            prop.getBoundingBox().getXsize() > 1.9 && renderState.getAssemblyBlocks().size() == 2;
+                    }
+                }
+                return false;
+            });
+            var droppedAssembly = new AtomicBoolean();
+            context.waitFor(client -> {
+                if (client.level == null) return false;
+                for (var entity : client.level.entitiesForRendering()) {
+                    if (entity instanceof PhysicsPropEntity prop && prop.getUUID().equals(assemblyId.get())) {
+                        if (!droppedAssembly.get()) {
+                            try {
+                                var field = PhysicsPropEntity.class.getDeclaredField("assembly");
+                                field.setAccessible(true);
+                                field.set(prop, null);
+                            } catch (ReflectiveOperationException error) {
+                                throw new RuntimeException(error);
+                            }
+                            ClientAssemblyState.INSTANCE.untrack(prop.getUUID());
+                            ClientAssemblyState.INSTANCE.track(prop);
+                            droppedAssembly.set(true);
+                            return false;
+                        }
+                        return prop.getAssembly() != null && prop.getAssembly().getDefinition().getBlocks().size() == 2;
+                    }
+                }
+                return false;
             });
         }
     }

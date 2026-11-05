@@ -38,6 +38,7 @@ class PhysicsTrackingManager {
     }
 
     fun playersTracking(propId: UUID): Set<UUID> = tracking[propId]?.toSet().orEmpty()
+    fun isTracking(propId: UUID, playerId: UUID) = playerId in tracking[propId].orEmpty()
 
     fun propsTrackedBy(playerId: UUID): Set<UUID> = tracking.asSequence()
         .filter { playerId in it.value }

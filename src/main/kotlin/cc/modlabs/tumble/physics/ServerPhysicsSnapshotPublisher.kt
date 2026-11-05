@@ -9,6 +9,8 @@ import cc.modlabs.tumble.network.PhysicsTrackingManager
 import cc.modlabs.tumble.network.PhysicsDebugPayload
 import java.util.UUID
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking
+import cc.modlabs.tumble.network.AssemblyPayload
+import cc.modlabs.tumble.network.AssemblyRequestBudget
 import net.minecraft.server.MinecraftServer
 import net.minecraft.server.level.ServerPlayer
 
@@ -40,9 +42,15 @@ class ServerPhysicsSnapshotPublisher(
     private var totalStatesSent = 0L
     private var totalPayloadsSent = 0L
     private val debugPlayers = mutableSetOf<UUID>()
+    private val assemblyRequests = mutableMapOf<UUID, AssemblyRequestBudget>()
 
     fun startTracking(entity: PhysicsPropEntity, player: ServerPlayer) {
         tracking.startTracking(entity.uuid, player.uuid)
+        entity.assembly?.let { structure ->
+            if (ServerPlayNetworking.canSend(player, AssemblyPayload.TYPE)) {
+                ServerPlayNetworking.send(player, AssemblyPayload(entity.uuid, (entity.level() as net.minecraft.server.level.ServerLevel).physicsDimensionId(), structure))
+            }
+        }
         publish(player, setOf(entity.uuid), server.tickCount.toLong())
     }
 
@@ -62,6 +70,17 @@ class ServerPhysicsSnapshotPublisher(
     fun playerDisconnected(playerId: UUID) {
         tracking.clearPlayer(playerId)
         debugPlayers.remove(playerId)
+        assemblyRequests.remove(playerId)
+    }
+
+    fun requestAssembly(player: ServerPlayer, propId: UUID) {
+        if (!tracking.isTracking(propId, player.uuid) || !ServerPlayNetworking.canSend(player, AssemblyPayload.TYPE)) return
+        val entity = manager.findProp(propId)?.takeIf { it.level() === player.level() } ?: return
+        val structure = entity.assembly ?: return
+        val estimatedBytes = 512 + structure.definition.palette.size * 5 + structure.definition.blocks.size * 13 + structure.parts.size * 53
+        val budget = assemblyRequests.getOrPut(player.uuid, ::AssemblyRequestBudget)
+        if (!budget.allow(propId, server.tickCount, estimatedBytes)) return
+        ServerPlayNetworking.send(player, AssemblyPayload(propId, (entity.level() as net.minecraft.server.level.ServerLevel).physicsDimensionId(), structure))
     }
 
     fun toggleDebug(player: ServerPlayer): Boolean {
@@ -97,6 +116,7 @@ class ServerPhysicsSnapshotPublisher(
     fun close() {
         tracking.clear()
         debugPlayers.clear()
+        assemblyRequests.clear()
     }
 
     fun debugState() = PhysicsNetworkDebugState(
@@ -137,9 +157,9 @@ class ServerPhysicsSnapshotPublisher(
                     prop.bodyGeneration,
                     snapshot.transform.position,
                     snapshot.transform.rotation,
-                    snapshot.linearVelocity,
-                    snapshot.angularVelocity,
-                    snapshot.sleeping,
+                    if (snapshot.suspended) PhysicsVector.ZERO else snapshot.linearVelocity,
+                    if (snapshot.suspended) PhysicsVector.ZERO else snapshot.angularVelocity,
+                    snapshot.sleeping || snapshot.suspended,
                     flags
                 )
             }

@@ -10,6 +10,7 @@ import cc.modlabs.tumble.physics.PhysicsVector
 import cc.modlabs.tumble.physics.MinecraftTerrainAdapter
 import cc.modlabs.tumble.physics.PhysicsServices
 import cc.modlabs.tumble.physics.ToolGunResult
+import cc.modlabs.tumble.assembly.AssemblyStructure
 import cc.modlabs.tumble.item.TumbleItems
 import net.minecraft.core.registries.BuiltInRegistries
 import net.minecraft.network.syncher.EntityDataAccessor
@@ -35,6 +36,9 @@ import org.joml.Quaternionf
 import org.joml.Quaternionfc
 
 class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) : Entity(type, level) {
+    var assembly: AssemblyStructure? = null
+        private set
+    val hasAssembly: Boolean get() = entityData.get(DATA_HAS_ASSEMBLY)
     internal var runtimeBodyId: PhysicsBodyId? = null
     internal var physicsPending = false
     internal var angularVelocity = PhysicsVector.ZERO
@@ -82,6 +86,7 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
         builder.define(DATA_MASS, 1f)
         builder.define(DATA_FROZEN, false)
         builder.define(DATA_HELD_BY, -1)
+        builder.define(DATA_HAS_ASSEMBLY, false)
     }
 
     fun initialize(block: BlockState, angularVelocity: PhysicsVector) {
@@ -89,6 +94,16 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
         refreshLocalBounds()
         mass = calculatedMass()
         this.angularVelocity = angularVelocity
+    }
+
+    fun initializeAssembly(structure: AssemblyStructure) {
+        assembly = structure
+        entityData.set(DATA_HAS_ASSEMBLY, true)
+        blockState = structure.definition.blocks.first().state
+        refreshLocalBounds()
+        refreshDimensions()
+        mass = calculatedMass()
+        angularVelocity = PhysicsVector.ZERO
     }
 
     internal fun applySnapshot(step: Long, snapshot: PhysicsBodySnapshot) {
@@ -200,6 +215,10 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
             frozen
         ).write(output)
         output.store(BLOCK_STATE, BlockState.CODEC, blockState)
+        assembly?.let {
+            output.putBoolean(HAS_ASSEMBLY, true)
+            output.store(ASSEMBLY, AssemblyStructure.CODEC, it)
+        }
         output.putFloat(MASS, mass)
         output.putInt(TOOL_PHYSICS_PRESET, toolPhysicsPreset.ordinal)
     }
@@ -209,7 +228,12 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
         blockState = input.read(BLOCK_STATE, BlockState.CODEC).orElseGet {
             BuiltInRegistries.BLOCK.getValue(Identifier.parse(state.blockId)).stateDefinition.any()
         }
+        assembly = if (input.getBooleanOr(HAS_ASSEMBLY, false)) {
+            input.read(ASSEMBLY, AssemblyStructure.CODEC).orElseThrow { IllegalStateException("Invalid saved assembly") }
+        } else null
+        entityData.set(DATA_HAS_ASSEMBLY, assembly != null)
         refreshLocalBounds()
+        refreshDimensions()
         entityData.set(
             DATA_ROTATION,
             Quaternionf(
@@ -259,12 +283,26 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
             PhysicsPropEntity::class.java,
             EntityDataSerializers.INT
         )
+        private val DATA_HAS_ASSEMBLY: EntityDataAccessor<Boolean> = SynchedEntityData.defineId(
+            PhysicsPropEntity::class.java,
+            EntityDataSerializers.BOOLEAN
+        )
         private const val BLOCK_STATE = "TumbleBlockState"
+        private const val HAS_ASSEMBLY = "TumbleHasAssembly"
+        private const val ASSEMBLY = "TumbleAssembly"
         private const val MASS = "TumbleMass"
         private const val TOOL_PHYSICS_PRESET = "TumbleToolPhysicsPreset"
     }
 
     private fun refreshLocalBounds() {
+        assembly?.let { structure ->
+            localCollisionBoxes = structure.shape.boxes.map { it.box }
+            localBounds = PhysicsAabb(
+                PhysicsVector(localCollisionBoxes.minOf { it.min.x }, localCollisionBoxes.minOf { it.min.y }, localCollisionBoxes.minOf { it.min.z }),
+                PhysicsVector(localCollisionBoxes.maxOf { it.max.x }, localCollisionBoxes.maxOf { it.max.y }, localCollisionBoxes.maxOf { it.max.z })
+            )
+            return
+        }
         val boxes = runCatching { blockState.getCollisionShape(level(), blockPosition()).toAabbs() }.getOrDefault(emptyList())
         if (boxes.isEmpty()) {
             localBounds = UNIT_LOCAL_BOUNDS
@@ -292,6 +330,12 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
     }
 
     private fun calculatedMass(): Float {
+        assembly?.let { structure ->
+            return structure.shape.boxes.sumOf { part ->
+                val box = part.box
+                (box.max.x - box.min.x) * (box.max.y - box.min.y) * (box.max.z - box.min.z) * part.material.density
+            }.toFloat()
+        }
         val volume = localCollisionBoxes.sumOf { box ->
             (box.max.x - box.min.x) * (box.max.y - box.min.y) * (box.max.z - box.min.z)
         }
