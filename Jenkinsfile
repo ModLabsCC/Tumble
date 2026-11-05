@@ -8,11 +8,6 @@ pipeline {
         buildDiscarder(logRotator(numToKeepStr: '30'))
     }
     stages {
-        stage('Inspect test environment') {
-            steps {
-                sh 'id; cat /etc/os-release; command -v Xvfb || true; command -v docker || true; command -v apt-get || true; command -v xauth || true; ls /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so || true'
-            }
-        }
         stage('Build and GameTests') {
             steps {
                 sh 'chmod +x gradlew'
@@ -21,7 +16,11 @@ pipeline {
         }
         stage('Client GameTests') {
             steps {
-                sh 'xvfb-run -a ./gradlew runClientGameTest -PacceptMinecraftEula=true --no-daemon --stacktrace'
+                sh '''docker run --rm -v "$PWD:/workspace" -w /workspace eclipse-temurin:25-jdk sh -c '
+                    apt-get update -qq &&
+                    apt-get install -y --no-install-recommends xvfb xauth libgl1-mesa-dri libglx-mesa0 &&
+                    xvfb-run -a ./gradlew runClientGameTest -PacceptMinecraftEula=true --no-daemon --stacktrace
+                ' '''
             }
         }
         stage('Packaged server GameTests') {
