@@ -26,6 +26,11 @@ fun main() {
                 stepSamples[index] = stepped - start
                 snapshotSamples[index] = System.nanoTime() - stepped
             }
+            val combinedSamples = LongArray(180) {
+                val start = System.nanoTime()
+                check(world.stepAndSnapshots().size == count)
+                System.nanoTime() - start
+            }
             fun report(samples: LongArray): String {
                 samples.sort()
                 return "median %.3f ms, p95 %.3f ms".format(
@@ -33,7 +38,7 @@ fun main() {
                     samples[samples.size * 95 / 100] / 1_000_000.0
                 )
             }
-            println("$count moving bodies: step ${report(stepSamples)}; snapshots ${report(snapshotSamples)}")
+            println("$count moving bodies: step ${report(stepSamples)}; snapshots ${report(snapshotSamples)}; combined ${report(combinedSamples)}")
         }
     }
 }
