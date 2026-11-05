@@ -13,6 +13,29 @@ import org.slf4j.LoggerFactory
 
 class ServerPhysicsServiceTest {
     @Test
+    fun `submersion submitted after body creation makes a log rise`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:water")
+        service.start()
+        try {
+            service.submit(PhysicsCommand.SpawnBody(
+                UUID.randomUUID(), dimension,
+                bodyDefinition().copy(
+                    transform = PhysicsTransform(PhysicsVector(0.5, 2.0, 0.5)),
+                    buoyancy = PhysicsBuoyancy(true, 1.8f, 0.18f, 0.18f, 0.08f)
+                )
+            ))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            service.submit(PhysicsCommand.SetSubmersion(dimension, body, 1f))
+            waitUntil { service.latestFrame(dimension).bodies[body]?.transform?.position?.y?.let { it > 3.0 } == true }
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
     fun `command wakeups cannot advance the simulation ahead of the fixed clock`() {
         val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
         val dimension = PhysicsDimensionId("test:fixed-clock")

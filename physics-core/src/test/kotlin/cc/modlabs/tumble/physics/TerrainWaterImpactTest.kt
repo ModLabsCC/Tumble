@@ -48,6 +48,20 @@ class TerrainWaterImpactTest {
     }
 
     @Test
+    fun `fully submerged buoyant body rises after resting on terrain`() = PhysicsWorld().use { world ->
+        world.syncTerrain(listOf(TerrainBlockGeometry(
+            PhysicsBlockPosition(0, 0, 0), listOf(TerrainBox(PhysicsBox.UNIT, PhysicsMaterial.DEFAULT))
+        )))
+        val body = world.createBody(bodyAt(0.5, 2.0, 0.5, buoyancy = PhysicsBuoyancy(true, 1.8f, 0.18f, 0.18f, 0.08f)))
+        repeat(360) { world.step() }
+        assertTrue(assertNotNull(world.snapshot(body)).sleeping)
+        world.setBuoyancyForceScale(1.5f)
+        world.setSubmersion(body, 1f)
+        repeat(180) { world.stepAndSnapshots() }
+        assertTrue(assertNotNull(world.snapshot(body)).transform.position.y > 3.0)
+    }
+
+    @Test
     fun `a sleeping buoyant body wakes when water disappears`() {
         PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
             val body = world.createBody(bodyAt(0.0, 0.0, 0.0, buoyancy = PhysicsBuoyancy(enabled = true)))
