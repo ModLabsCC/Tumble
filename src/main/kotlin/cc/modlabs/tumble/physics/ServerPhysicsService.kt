@@ -86,9 +86,8 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                 if (state.get() != PhysicsServiceState.RUNNING) break
                 step++
                 worlds.forEach { (dimension, world) ->
-                    world.step()
                     frames.computeIfAbsent(dimension) { AtomicReference(PhysicsSnapshotFrame.EMPTY) }
-                        .set(PhysicsSnapshotFrame.of(step, world.snapshots().associateBy { it.bodyId }))
+                        .set(PhysicsSnapshotFrame.of(step, world.stepAndSnapshots().associateBy { it.bodyId }))
                     world.consumeImpactEvents().forEach { event -> publishImpact(PhysicsImpactNotification(dimension, event)) }
                 }
                 completedSteps.incrementAndGet()

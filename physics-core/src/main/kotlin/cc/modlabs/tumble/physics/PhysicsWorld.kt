@@ -240,6 +240,12 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         return latestMovedSnapshots
     }
 
+    /** Advances once and reuses move-event snapshots when collecting all bodies. */
+    fun stepAndSnapshots(): List<PhysicsBodySnapshot> {
+        val moved = step().associateBy { it.bodyId }
+        return bodies.map { (id, body) -> moved[id] ?: snapshotOf(id, body) }
+    }
+
     /** Owning physics thread only. */
     fun setLinearVelocity(bodyId: PhysicsBodyId, velocity: PhysicsVector): Boolean = withBody(bodyId) { body ->
         velocity.toNativeVector().use { nativeVelocity -> b3Body_SetLinearVelocity(body.nativeId, nativeVelocity) }
