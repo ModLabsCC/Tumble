@@ -8,6 +8,7 @@
       "cc.modlabs.tumble.PhysicsWorldGameTest",
       "cc.modlabs.tumble.TumbleAddonGameTest",
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyGameTests" },
+      { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyTerrainGameTests" },
       {
         "adapter": "kotlin",
         "value": "cc.modlabs.tumble.gametest.TumbleGameTests"
