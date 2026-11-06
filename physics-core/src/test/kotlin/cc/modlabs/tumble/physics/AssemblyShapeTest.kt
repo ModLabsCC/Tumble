@@ -52,6 +52,21 @@ class AssemblyShapeTest {
     }
 
     @Test
+    fun `staged component stays static until explicit activation`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val frames = PhysicsJointFrames(PhysicsTransform(PhysicsVector(1.0, 0.0, 0.0)), PhysicsTransform(PhysicsVector(-1.0, 0.0, 0.0)))
+        val definitions = listOf(
+            PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0)), linearVelocity = PhysicsVector(2.0, 0.0, 0.0)),
+            PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)), linearVelocity = PhysicsVector(2.0, 0.0, 0.0))
+        )
+        val ids = assertNotNull(world.restoreComponent(definitions, listOf(RestoredJoint(0, 1, PhysicsJointKind.WELD, frames)), false))
+        repeat(30) { world.step() }
+        assertEquals(0.0, assertNotNull(world.snapshot(ids[0])).transform.position.x, 0.001)
+        assertTrue(world.activateRestoredComponent(ids, definitions))
+        repeat(30) { world.step() }
+        assertTrue(assertNotNull(world.snapshot(ids[0])).transform.position.x > 0.1)
+    }
+
+    @Test
     fun `restoring a component rolls back all bodies if any joint fails`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
         val frames = PhysicsJointFrames(PhysicsTransform(PhysicsVector(1.0, 0.0, 0.0)), PhysicsTransform(PhysicsVector(-1.0, 0.0, 0.0)))
         val definitions = listOf(
@@ -77,6 +92,61 @@ class AssemblyShapeTest {
         val second = assertNotNull(world.snapshot(ids[1]))
         assertEquals(2.0, (second.transform.position - first.transform.position).length(), 0.1)
         assertTrue(first.transform.position.x > 1.0, "saved velocity was not restored")
+    }
+
+    @Test
+    fun `connection preparation cannot release a concurrent terrain suspension`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0))))
+        val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0))))
+        val request = java.util.UUID.randomUUID()
+        assertNotNull(world.prepareConnection(request, first, second))
+        assertTrue(assertNotNull(world.snapshot(first)).suspended)
+        assertTrue(assertNotNull(world.snapshot(second)).suspended)
+        assertTrue(world.suspend(first))
+        assertTrue(world.cancelConnectionPreparation(request))
+        assertTrue(assertNotNull(world.snapshot(first)).suspended)
+        assertFalse(assertNotNull(world.snapshot(second)).suspended)
+        assertTrue(world.resume(first))
+        assertFalse(assertNotNull(world.snapshot(first)).suspended)
+    }
+
+    @Test
+    fun `destroying a prepared endpoint keeps its peer parked until cancellation`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0))))
+        val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0))))
+        val request = java.util.UUID.randomUUID()
+        assertNotNull(world.prepareConnection(request, first, second))
+        assertTrue(world.destroyBody(first))
+        assertTrue(assertNotNull(world.snapshot(second)).suspended)
+        assertTrue(world.cancelConnectionPreparation(request))
+        assertFalse(assertNotNull(world.snapshot(second)).suspended)
+    }
+
+    @Test
+    fun `installing a prepared weld preserves terrain suspension across the new joint`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0))))
+        val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0))))
+        val request = java.util.UUID.randomUUID()
+        val frames = assertNotNull(world.prepareConnection(request, first, second))
+        assertTrue(world.suspend(first))
+        assertTrue(world.installPreparedConnection(request, first, second, PhysicsJointKind.WELD, frames, 0f))
+        assertTrue(assertNotNull(world.snapshot(first)).suspended)
+        assertTrue(assertNotNull(world.snapshot(second)).suspended)
+        assertTrue(world.resume(first))
+        assertFalse(assertNotNull(world.snapshot(first)).suspended)
+        assertFalse(assertNotNull(world.snapshot(second)).suspended)
+    }
+
+    @Test
+    fun `failed prepared connection remains parked until explicit cancellation`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0))))
+        val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0))))
+        val request = java.util.UUID.randomUUID()
+        val frames = assertNotNull(world.prepareConnection(request, first, second))
+        assertFalse(world.installPreparedConnection(request, first, second, PhysicsJointKind.ROPE, frames, 0f))
+        assertTrue(assertNotNull(world.snapshot(first)).suspended)
+        assertTrue(assertNotNull(world.snapshot(second)).suspended)
+        assertTrue(world.cancelConnectionPreparation(request))
     }
 
     @Test

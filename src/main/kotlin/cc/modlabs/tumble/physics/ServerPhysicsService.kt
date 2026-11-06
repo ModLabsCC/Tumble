@@ -11,9 +11,13 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import org.slf4j.Logger
 
 class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
+    private val stepBoundary = ReentrantLock(true)
+    private val pendingSuspensions = AtomicInteger()
     private val commands = ConcurrentLinkedQueue<PhysicsCommand>()
     private val acknowledgements = ConcurrentLinkedQueue<PhysicsAcknowledgement>()
     private val impacts = ConcurrentLinkedQueue<PhysicsImpactNotification>()
@@ -42,11 +46,45 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
     fun isRunning() = state.get() == PhysicsServiceState.RUNNING
 
     fun submit(command: PhysicsCommand): Boolean {
-        if (state.get() != PhysicsServiceState.RUNNING) return false
-        commands += command
+        if (command is PhysicsCommand.SuspendBody || command is PhysicsCommand.SuspendProp || command is PhysicsCommand.ParkComponent) {
+            stepBoundary.withLock {
+                if (state.get() != PhysicsServiceState.RUNNING) return false
+                pendingSuspensions.incrementAndGet()
+                commands += command
+            }
+        } else {
+            if (state.get() != PhysicsServiceState.RUNNING) return false
+            commands += command
+        }
         LockSupport.unpark(thread)
         return true
     }
+
+    fun submitSuspendedSpawn(command: PhysicsCommand.SpawnBody): Boolean {
+        stepBoundary.withLock {
+            if (state.get() != PhysicsServiceState.RUNNING) return false
+            commands += command
+            pendingSuspensions.incrementAndGet()
+            commands += PhysicsCommand.SuspendProp(command.dimension, command.propId)
+        }
+        LockSupport.unpark(thread)
+        return true
+    }
+
+    fun invalidateRestore(token: PhysicsRestoreToken, dimension: PhysicsDimensionId, bodies: List<ParkBody>, requestId: UUID): PhysicsSnapshotFrame =
+        invalidateRestores(listOf(token), dimension, bodies, requestId)
+
+    fun invalidateRestores(tokens: Collection<PhysicsRestoreToken>, dimension: PhysicsDimensionId, bodies: List<ParkBody>, requestId: UUID): PhysicsSnapshotFrame =
+        stepBoundary.withLock {
+            tokens.forEach { it.valid = false }
+            val before = latestFrame(dimension)
+            if (bodies.isNotEmpty() && state.get() == PhysicsServiceState.RUNNING) {
+                pendingSuspensions.incrementAndGet()
+                commands += PhysicsCommand.ParkComponent(dimension, bodies, requestId)
+            }
+            LockSupport.unpark(thread)
+            before
+        }
 
     fun latestFrame(dimension: PhysicsDimensionId): PhysicsSnapshotFrame =
         frames[dimension]?.get() ?: PhysicsSnapshotFrame.EMPTY
@@ -73,25 +111,35 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
         val worlds = mutableMapOf<PhysicsDimensionId, PhysicsWorld>()
         val bodies = mutableMapOf<UUID, RuntimeBody>()
         val terrain = mutableMapOf<PhysicsDimensionId, MutableSet<cc.modlabs.tumble.physics.PhysicsSectionPosition>>()
+        val restored = mutableMapOf<PhysicsRestoreToken, RestoredRuntimeComponent>()
         val interval = 1_000_000_000L / 60L
         var nextStep = System.nanoTime()
         var step = 0L
         try {
             while (state.get() == PhysicsServiceState.RUNNING) {
                 val remaining = nextStep - System.nanoTime()
-                if (remaining > 0) {
+                if (remaining > 0 && pendingSuspensions.get() == 0) {
                     LockSupport.parkNanos(remaining)
                     continue
                 }
                 val started = System.nanoTime()
-                drainCommands(worlds, bodies, terrain)
+                drainCommands(worlds, bodies, terrain, restored)
                 if (state.get() != PhysicsServiceState.RUNNING) break
-                step++
-                worlds.forEach { (dimension, world) ->
-                    frames.computeIfAbsent(dimension) { AtomicReference(PhysicsSnapshotFrame.EMPTY) }
-                        .set(PhysicsSnapshotFrame.of(step, world.stepAndSnapshots().associateBy { it.bodyId }))
-                    world.consumeImpactEvents().forEach { event -> publishImpact(PhysicsImpactNotification(dimension, event)) }
+                val stepped = stepBoundary.withLock {
+                    if (pendingSuspensions.get() != 0 || System.nanoTime() < nextStep) false else {
+                        restored.forEach { (token, group) ->
+                            if (!token.valid && group.active) group.bodies.forEach { worlds[group.dimension]?.suspend(it.bodyId) }
+                        }
+                        step++
+                        worlds.forEach { (dimension, world) ->
+                            frames.computeIfAbsent(dimension) { AtomicReference(PhysicsSnapshotFrame.EMPTY) }
+                                .set(PhysicsSnapshotFrame.of(step, world.stepAndSnapshots().associateBy { it.bodyId }))
+                            world.consumeImpactEvents().forEach { event -> publishImpact(PhysicsImpactNotification(dimension, event)) }
+                        }
+                        true
+                    }
                 }
+                if (!stepped) continue
                 completedSteps.incrementAndGet()
                 workNanos.addAndGet(System.nanoTime() - started)
                 nextStep += interval
@@ -118,7 +166,8 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
     private fun drainCommands(
         worlds: MutableMap<PhysicsDimensionId, PhysicsWorld>,
         bodies: MutableMap<UUID, RuntimeBody>,
-        terrain: MutableMap<PhysicsDimensionId, MutableSet<cc.modlabs.tumble.physics.PhysicsSectionPosition>>
+        terrain: MutableMap<PhysicsDimensionId, MutableSet<cc.modlabs.tumble.physics.PhysicsSectionPosition>>,
+        restored: MutableMap<PhysicsRestoreToken, RestoredRuntimeComponent>
     ) {
         var processed = 0
         while (true) {
@@ -130,6 +179,7 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                     bodies.entries.removeIf { it.value.dimension == command.dimension }
                     terrain.remove(command.dimension)
                     frames.remove(command.dimension)
+                    restored.entries.removeIf { it.value.dimension == command.dimension }
                 }
                 is PhysicsCommand.SpawnBody -> try {
                     val world = worlds.getOrPut(command.dimension, ::createWorld)
@@ -143,27 +193,66 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                         command.requestId
                     )
                 }
+                is PhysicsCommand.ParkComponent -> {
+                    val world = worlds[command.dimension]
+                    val valid = world != null && command.bodies.isNotEmpty() &&
+                        command.bodies.map { it.propId }.toSet().size == command.bodies.size &&
+                        command.bodies.all { bodies[it.propId] == RuntimeBody(command.dimension, it.bodyId) && world.snapshot(it.bodyId) != null }
+                    if (!valid) acknowledgements += PhysicsAcknowledgement.ComponentParked(command.requestId, emptyMap(), false)
+                    else {
+                        val snapshots = command.bodies.associate { it.propId to requireNotNull(world.snapshot(it.bodyId)) }
+                        command.bodies.forEach { world.destroyBody(it.bodyId); bodies.remove(it.propId) }
+                        restored.entries.removeIf { (_, group) -> group.dimension == command.dimension && group.bodies.all { body -> body in command.bodies } }
+                        acknowledgements += PhysicsAcknowledgement.ComponentParked(command.requestId, snapshots, true)
+                    }
+                    pendingSuspensions.decrementAndGet()
+                }
                 is PhysicsCommand.RestoreComponent -> {
                     val ids = command.bodies.map { it.propId }
                     val requests = command.bodies.map { it.requestId }
                     val result = try {
-                        if (ids.isEmpty() || ids.toSet().size != ids.size || requests.toSet().size != requests.size || ids.any(bodies::containsKey)) null
-                        else worlds.getOrPut(command.dimension, ::createWorld).restoreComponent(command.bodies.map { it.definition }, command.joints)
+                        if (ids.isEmpty() || ids.toSet().size != ids.size || requests.toSet().size != requests.size || ids.any(bodies::containsKey) || command.token?.valid == false) null
+                        else worlds.getOrPut(command.dimension, ::createWorld).restoreComponent(command.bodies.map { it.definition }, command.joints, command.token == null)
                     } catch (error: Throwable) {
                         logger.error("Failed to restore physics component", error)
                         null
                     }
                     if (result == null) {
-                        command.bodies.forEach {
+                        if (command.token != null) acknowledgements += PhysicsAcknowledgement.ComponentStaged(command.token, emptyList(), false)
+                        else command.bodies.forEach {
                             acknowledgements += PhysicsAcknowledgement.BodyCreationFailed(it.propId, "Component restore failed", it.requestId)
                         }
                     } else {
-                        command.bodies.zip(result).forEach { (body, id) ->
+                        val parked = command.bodies.zip(result).map { (body, id) ->
                             bodies[body.propId] = RuntimeBody(command.dimension, id)
+                            ParkBody(body.propId, id)
+                        }
+                        if (command.token != null) {
+                            restored[command.token] = RestoredRuntimeComponent(command.dimension, parked, command.bodies.map { it.definition })
+                            acknowledgements += PhysicsAcknowledgement.ComponentStaged(command.token, parked, true)
+                        } else command.bodies.zip(result).forEach { (body, id) ->
                             acknowledgements += PhysicsAcknowledgement.BodyCreated(body.propId, command.dimension, id, body.requestId)
                         }
                     }
                 }
+                is PhysicsCommand.ActivateRestoredComponent -> {
+                    val group = restored[command.token]
+                    val success = command.token.valid && group != null && !group.active &&
+                        worlds[group.dimension]?.activateRestoredComponent(group.bodies.map { it.bodyId }, group.definitions) == true
+                    if (success) group!!.active = true
+                    acknowledgements += PhysicsAcknowledgement.ComponentActivated(command.token, success)
+                }
+                is PhysicsCommand.PrepareConnection -> {
+                    val frames = worlds[command.dimension]?.prepareConnection(command.requestId, command.bodyA, command.bodyB)
+                    acknowledgements += PhysicsAcknowledgement.ConnectionPrepared(command.requestId, frames)
+                }
+                is PhysicsCommand.InstallPreparedConnection -> {
+                    val success = worlds[command.dimension]?.installPreparedConnection(
+                        command.requestId, command.bodyA, command.bodyB, command.kind, command.frames, command.ropeLength
+                    ) == true
+                    acknowledgements += PhysicsAcknowledgement.ConnectionCreated(command.requestId, success)
+                }
+                is PhysicsCommand.CancelConnectionPreparation -> worlds[command.dimension]?.cancelConnectionPreparation(command.requestId)
                 is PhysicsCommand.DestroyBody -> {
                     worlds[command.dimension]?.destroyBody(command.bodyId)
                     bodies.entries.removeIf {
@@ -208,9 +297,15 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                     terrain[command.dimension]?.remove(command.section)
                 }
                 is PhysicsCommand.WakeBody -> worlds[command.dimension]?.wake(command.bodyId)
-                is PhysicsCommand.SuspendBody -> worlds[command.dimension]?.suspend(command.bodyId)
-                is PhysicsCommand.SuspendProp -> bodies[command.propId]?.takeIf { it.dimension == command.dimension }?.let {
-                    worlds[command.dimension]?.suspend(it.bodyId)
+                is PhysicsCommand.SuspendBody -> {
+                    worlds[command.dimension]?.suspend(command.bodyId)
+                    pendingSuspensions.decrementAndGet()
+                }
+                is PhysicsCommand.SuspendProp -> {
+                    bodies[command.propId]?.takeIf { it.dimension == command.dimension }?.let {
+                        worlds[command.dimension]?.suspend(it.bodyId)
+                    }
+                    pendingSuspensions.decrementAndGet()
                 }
                 is PhysicsCommand.ResumeBody -> worlds[command.dimension]?.resume(command.bodyId)
                 is PhysicsCommand.SetMotionType -> worlds[command.dimension]
@@ -306,6 +401,13 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
             if (thread.isAlive) logger.error("Project Tumble physics thread did not stop within 5 seconds")
         }
     }
+
+    private data class RestoredRuntimeComponent(
+        val dimension: PhysicsDimensionId,
+        val bodies: List<ParkBody>,
+        val definitions: List<PhysicsBodyDefinition>,
+        var active: Boolean = false
+    )
 
     private data class RuntimeBody(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId)
     private data class PhysicsWorldTuning(

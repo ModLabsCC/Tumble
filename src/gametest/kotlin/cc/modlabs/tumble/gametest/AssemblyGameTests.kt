@@ -26,6 +26,8 @@ import cc.modlabs.tumble.entity.PhysicsPropEntity
 import cc.modlabs.tumble.entity.TumbleEntities
 import cc.modlabs.tumble.item.TumbleItems
 import cc.modlabs.tumble.physics.ToolGunWeldResult
+import cc.modlabs.tumble.physics.ToolGunMode
+import cc.modlabs.tumble.physics.ToolGunResult
 import cc.modlabs.tumble.api.TumbleApi
 import cc.modlabs.tumble.network.AssemblyPayload
 import com.mojang.serialization.JsonOps
@@ -99,8 +101,112 @@ class AssemblyGameTests {
         }
     }
 
+    @GameTest(maxTicks = 1600)
+    fun reopenedManagerWaitsForBothJournaledEndpoints(helper: GameTestHelper) {
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        val origin = BlockPos(5504, 50, 0)
+        helper.level.setChunkForced(origin.x shr 4, 0, true)
+        helper.level.getChunkAt(origin)
+        for (x in 0..4) for (z in 0..2) helper.level.setBlock(origin.offset(x, -1, z), Blocks.STONE.defaultBlockState(), 3)
+        val stone = Blocks.STONE.defaultBlockState()
+        val structure = AssemblyStructure.of(AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone))), listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5)))
+        ))
+        val assembly = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level).apply {
+            setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+            initializeAssembly(structure)
+        }
+        helper.assertTrue(helper.level.addFreshEntity(assembly), "could not add assembly")
+        runtime.manager.entityLoaded(assembly, helper.level)
+        val peer = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 2.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn peer")
+        val player = helper.makeMockPlayer(GameType.CREATIVE).apply {
+            setPos(origin.x + 1.5, origin.y.toDouble(), origin.z + 2.5)
+            setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
+        }
+        val dimension = helper.level.physicsDimensionId()
+        var phase = 0
+        var checkpoint = 0L
+        var reopenedService: ServerPhysicsService? = null
+        var reopenedManager: PhysicsPropManager? = null
+        var restoredAssembly: PhysicsPropEntity? = null
+        var restoredPeer: PhysicsPropEntity? = null
+        var beforeX = 0.0
+        helper.succeedWhen {
+            Thread.sleep(5)
+            val frame = runtime.service.latestFrame(dimension)
+            reopenedManager?.tick()
+            when (phase) {
+                0 -> {
+                    val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
+                    if (assembly.uuid !in ready || peer.uuid !in ready) return@succeedWhen helper.assertTrue(false, "original bodies not ready")
+                    helper.assertTrue(runtime.manager.useToolGunWeld(player, assembly) == ToolGunWeldResult.SELECTED, "weld selection failed")
+                    helper.assertTrue(runtime.manager.useToolGunWeld(player, peer) == ToolGunWeldResult.WELDED, "weld creation failed")
+                    phase = 1
+                }
+                1 -> {
+                    if (TumbleApi.status(helper.level, assembly.uuid) != TumbleApi.PropStatus.READY ||
+                        TumbleApi.status(helper.level, peer.uuid) != TumbleApi.PropStatus.READY)
+                        return@succeedWhen helper.assertTrue(false, "original weld not installed")
+                    fun copy(prop: PhysicsPropEntity): PhysicsPropEntity {
+                        val output = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
+                        prop.saveWithoutId(output)
+                        return requireNotNull(TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)).also {
+                            it.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), output.buildResult()))
+                        }
+                    }
+                    restoredAssembly = copy(assembly)
+                    restoredPeer = copy(peer)
+                    val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-reopen-test")).also { it.start() }
+                    reopenedService = service
+                    service.submit(PhysicsCommand.CreateDimension(dimension))
+                    val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service),
+                        LoggerFactory.getLogger("tumble-reopen-test"), TumbleTuning())
+                    reopenedManager = manager
+                    manager.entityLoaded(requireNotNull(restoredPeer), helper.level)
+                    checkpoint = service.latestFrame(dimension).physicsStep
+                    phase = 2
+                }
+                2 -> {
+                    val service = requireNotNull(reopenedService)
+                    if (service.latestFrame(dimension).physicsStep - checkpoint < 20) return@succeedWhen helper.assertTrue(false, "waiting for missing endpoint")
+                    helper.assertTrue(requireNotNull(reopenedManager).networkProps().none { it.propId == peer.uuid }, "peer escaped the reopened journal gate")
+                    requireNotNull(reopenedManager).entityLoaded(requireNotNull(restoredAssembly), helper.level)
+                    phase = 3
+                }
+                3 -> {
+                    val manager = requireNotNull(reopenedManager)
+                    val bodies = manager.networkProps().associateBy { it.propId }
+                    val peerBody = bodies[peer.uuid] ?: return@succeedWhen helper.assertTrue(false, "reopened peer not ready")
+                    if (bodies[assembly.uuid] == null) return@succeedWhen helper.assertTrue(false, "reopened assembly not ready")
+                    beforeX = requireNotNull(restoredAssembly).x
+                    requireNotNull(reopenedService).submit(PhysicsCommand.SetLinearVelocity(dimension, peerBody.bodyId, PhysicsVector(40.0, 0.0, 0.0)))
+                    checkpoint = requireNotNull(reopenedService).latestFrame(dimension).physicsStep
+                    phase = 4
+                }
+                4 -> if (requireNotNull(reopenedService).latestFrame(dimension).physicsStep - checkpoint >= 20) {
+                    helper.assertTrue(requireNotNull(restoredAssembly).x > beforeX + 0.1, "reopened journal did not restore the native weld")
+                    requireNotNull(reopenedService).close()
+                    return@succeedWhen
+                }
+            }
+            helper.assertTrue(false, "waiting for reopened journal, phase=$phase")
+        }
+    }
+
     @GameTest(maxTicks = 800)
-    fun removingWeldWithPeerUnloadedDoesNotRestoreIt(helper: GameTestHelper) {
+    fun removingWeldWithPeerUnloadedDoesNotRestoreIt(helper: GameTestHelper) = checkRemovingUnloadedPeer(helper, ToolGunMode.WELD)
+
+    @GameTest(maxTicks = 800)
+    fun removingRopeWithPeerUnloadedDoesNotRestoreIt(helper: GameTestHelper) = checkRemovingUnloadedPeer(helper, ToolGunMode.ROPE)
+
+    @GameTest(maxTicks = 800)
+    fun removingAxisWithPeerUnloadedDoesNotRestoreIt(helper: GameTestHelper) = checkRemovingUnloadedPeer(helper, ToolGunMode.AXIS)
+
+    @GameTest(maxTicks = 800)
+    fun removingNoCollideWithPeerUnloadedDoesNotRestoreIt(helper: GameTestHelper) = checkRemovingUnloadedPeer(helper, ToolGunMode.NO_COLLIDE)
+
+    private fun checkRemovingUnloadedPeer(helper: GameTestHelper, mode: ToolGunMode) {
         val runtime = PhysicsServices.runtime(helper.level.server)!!
         val origin = helper.absolutePos(BlockPos(1, 4, 1))
         val first = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5))
@@ -111,12 +217,13 @@ class AssemblyGameTests {
             setPos(origin.x + 1.5, origin.y.toDouble(), origin.z + 2.5)
             setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
         }
+        repeat(mode.ordinal) { runtime.manager.cycleToolGunMode(player, 1) }
         val dimension = helper.level.physicsDimensionId()
         var phase = 0
         var checkpoint = 0L
         var removalAccepted = false
         var savedPeer: net.minecraft.nbt.CompoundTag? = null
-        var firstX = 0.0
+        var initialDistance = 0.0
         helper.succeedWhen {
             Thread.sleep(5)
             val frame = runtime.service.latestFrame(dimension)
@@ -124,8 +231,8 @@ class AssemblyGameTests {
                 0 -> {
                     val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
                     if (first.uuid !in ready || peer.uuid !in ready) return@succeedWhen helper.assertTrue(false, "bodies are not ready")
-                    helper.assertTrue(runtime.manager.useToolGunWeld(player, first) == ToolGunWeldResult.SELECTED, "weld selection failed")
-                    helper.assertTrue(runtime.manager.useToolGunWeld(player, peer) == ToolGunWeldResult.WELDED, "weld creation failed")
+                    helper.assertTrue(runtime.manager.useToolGun(player, first) == ToolGunResult.SELECTED, "connection selection failed")
+                    helper.assertTrue(runtime.manager.useToolGun(player, peer) == ToolGunResult.APPLIED, "connection creation failed")
                     checkpoint = frame.physicsStep
                     phase = 1
                 }
@@ -135,11 +242,11 @@ class AssemblyGameTests {
                     savedPeer = saved.buildResult()
                     runtime.manager.entityUnloaded(peer, helper.level, true)
                     peer.discard()
-                    removalAccepted = runtime.manager.removeToolGunWelds(player, first)
+                    removalAccepted = runtime.manager.useToolGunPrimary(player, first)
                     phase = 2
                 }
                 2 -> {
-                    helper.assertTrue(removalAccepted, "could not remove the weld while its peer was unloaded")
+                    helper.assertTrue(removalAccepted, "could not remove $mode while its peer was unloaded")
                     val restored = TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)
                         ?: error("could not reload peer")
                     restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), requireNotNull(savedPeer)))
@@ -151,13 +258,23 @@ class AssemblyGameTests {
                 3 -> {
                     val body = runtime.manager.networkProps().firstOrNull { it.propId == peer.uuid }
                         ?: return@succeedWhen helper.assertTrue(false, "peer is not ready")
-                    firstX = first.x
-                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, body.bodyId, PhysicsVector(12.0, 0.0, 0.0)))
+                    val firstBody = runtime.manager.networkProps().firstOrNull { it.propId == first.uuid }
+                        ?: return@succeedWhen helper.assertTrue(false, "first prop is not ready")
+                    initialDistance = peer.x - first.x
+                    if (mode == ToolGunMode.NO_COLLIDE) {
+                        val firstSnapshot = TumbleApi.snapshot(helper.level, first.uuid) ?: return@succeedWhen helper.assertTrue(false, "first snapshot unavailable")
+                        runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, firstBody.bodyId, PhysicsVector.ZERO))
+                        runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, body.bodyId, PhysicsVector.ZERO))
+                        runtime.service.submit(PhysicsCommand.SetTransform(dimension, body.bodyId, firstSnapshot.transform))
+                    } else runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, body.bodyId, PhysicsVector(12.0, 0.0, 0.0)))
                     checkpoint = frame.physicsStep
                     phase = 4
                 }
                 4 -> if (frame.physicsStep - checkpoint >= 30) {
-                    helper.assertTrue(kotlin.math.abs(first.x - firstX) < 0.25, "deleted weld was restored")
+                    if (mode == ToolGunMode.NO_COLLIDE) {
+                        helper.assertTrue(first.position().distanceTo(peer.position()) > 0.5, "removed no-collide still suppressed collisions")
+                    } else helper.assertTrue(peer.x - first.x > initialDistance + 0.5,
+                        "peer did not separate after $mode removal: first=${first.position()}, peer=${peer.position()}, initial=$initialDistance")
                     return@succeedWhen
                 }
             }
@@ -174,8 +291,17 @@ class AssemblyGameTests {
     @GameTest(maxTicks = 1200)
     fun linkedPropSavedBeforeVisibilityChangesWaitsForAssembly(helper: GameTestHelper) = checkLinkedReload(helper, 2)
 
-    private fun checkLinkedReload(helper: GameTestHelper, ordering: Int) {
-        val origin = BlockPos(3104 + ordering * 128, 50, 0)
+    @GameTest(maxTicks = 1600)
+    fun ropeConnectionReturnsAfterReload(helper: GameTestHelper) = checkLinkedReload(helper, 2, ToolGunMode.ROPE)
+
+    @GameTest(maxTicks = 1600)
+    fun axisConnectionReturnsAfterReload(helper: GameTestHelper) = checkLinkedReload(helper, 2, ToolGunMode.AXIS)
+
+    @GameTest(maxTicks = 1600)
+    fun noCollideConnectionReturnsAfterReload(helper: GameTestHelper) = checkLinkedReload(helper, 2, ToolGunMode.NO_COLLIDE)
+
+    private fun checkLinkedReload(helper: GameTestHelper, ordering: Int, mode: ToolGunMode = ToolGunMode.WELD) {
+        val origin = BlockPos(3104 + ordering * 128 + mode.ordinal * 512, 50, 0)
         val remote = origin.offset(32, 0, 0)
         for (position in listOf(origin, remote)) {
             helper.level.setChunkForced(position.x shr 4, 0, true)
@@ -201,6 +327,7 @@ class AssemblyGameTests {
             setPos(origin.x + 1.5, 50.0, 3.0)
             setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
         }
+        repeat(mode.ordinal) { runtime.manager.cycleToolGunMode(player, 1) }
         val dimension = helper.level.physicsDimensionId()
         var phase = 0
         var checkpoint = 0L
@@ -241,10 +368,10 @@ class AssemblyGameTests {
                 0 -> {
                     val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
                     helper.assertTrue(assembly.uuid in ready && other.uuid in ready, "physics bodies are not ready")
-                    val selected = runtime.manager.useToolGunWeld(player, assembly)
-                    val welded = runtime.manager.useToolGunWeld(player, other)
-                    weldFailure = "selection=$selected, weld=$welded, root=${TumbleApi.status(helper.level, assembly.uuid)}, other=${TumbleApi.status(helper.level, other.uuid)}"
-                    if (selected != ToolGunWeldResult.SELECTED || welded != ToolGunWeldResult.WELDED) phase = 5
+                    val selected = runtime.manager.useToolGun(player, assembly)
+                    val welded = runtime.manager.useToolGun(player, other)
+                    weldFailure = "selection=$selected, connection=$welded, mode=$mode, root=${TumbleApi.status(helper.level, assembly.uuid)}, other=${TumbleApi.status(helper.level, other.uuid)}"
+                    if (selected != ToolGunResult.SELECTED || welded != ToolGunResult.APPLIED) phase = 5
                     helper.assertTrue(phase != 5, weldFailure)
                     checkpoint = frame.physicsStep
                     phase = 1
@@ -261,9 +388,11 @@ class AssemblyGameTests {
                     }
                 }
                 2 -> if (frame.physicsStep - checkpoint >= 40) {
+                    val status = TumbleApi.status(helper.level, other.uuid)
                     val snapshot = TumbleApi.snapshot(helper.level, other.uuid)
-                        ?: return@succeedWhen helper.assertTrue(false, "linked body is not ready")
-                    helper.assertTrue(snapshot.suspended, "linked body was not paused")
+                    helper.assertTrue(status == TumbleApi.PropStatus.PENDING ||
+                        status == TumbleApi.PropStatus.PAUSED && (snapshot == null || snapshot.suspended),
+                        "linked body was not parked or paused: $status")
                     reloadOther(frame.physicsStep)
                 }
                 3 -> if (frame.physicsStep - checkpoint >= 30) {
@@ -293,13 +422,25 @@ class AssemblyGameTests {
                         TumbleApi.status(helper.level, other.uuid) != TumbleApi.PropStatus.READY
                     ) return@succeedWhen helper.assertTrue(false, "restored group is not ready")
                     val peer = runtime.manager.networkProps().first { it.propId == other.uuid }
+                    val root = runtime.manager.networkProps().first { it.propId == assembly.uuid }
                     assemblyHeight = assembly.y
-                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, peer.bodyId, PhysicsVector(0.0, 12.0, 0.0)))
+                    if (mode == ToolGunMode.NO_COLLIDE) {
+                        val rootSnapshot = TumbleApi.snapshot(helper.level, assembly.uuid) ?: return@succeedWhen helper.assertTrue(false, "root snapshot unavailable")
+                        runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, root.bodyId, PhysicsVector.ZERO))
+                        runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, peer.bodyId, PhysicsVector.ZERO))
+                        runtime.service.submit(PhysicsCommand.SetTransform(dimension, peer.bodyId, rootSnapshot.transform))
+                    } else runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, peer.bodyId, PhysicsVector(0.0, 40.0, 0.0)))
                     checkpoint = frame.physicsStep
                     phase = 7
                 }
-                7 -> if (frame.physicsStep - checkpoint >= 30) {
-                    helper.assertTrue(assembly.y > assemblyHeight + 0.1, "reloaded assembly did not move with welded peer")
+                7 -> if (frame.physicsStep - checkpoint >= 20) {
+                    if (mode == ToolGunMode.NO_COLLIDE) {
+                        helper.assertTrue(assembly.position().distanceTo(other.position()) < 0.5,
+                            "restored no-collide did not keep overlapping props together")
+                    } else helper.assertTrue(assembly.y > assemblyHeight + 0.1,
+                        "reloaded assembly did not move with linked peer: mode=$mode, y=${assembly.y}, start=$assemblyHeight, " +
+                            "assembly=${TumbleApi.status(helper.level, assembly.uuid)}, peer=${TumbleApi.status(helper.level, other.uuid)}, " +
+                            "assemblySnapshot=${TumbleApi.snapshot(helper.level, assembly.uuid)}, peerSnapshot=${TumbleApi.snapshot(helper.level, other.uuid)}")
                     return@succeedWhen
                 }
             }
