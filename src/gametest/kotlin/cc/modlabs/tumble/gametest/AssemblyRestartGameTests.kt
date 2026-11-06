@@ -13,6 +13,7 @@ import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.level.GameType
 import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.entity.PersistentEntitySectionManager
 import net.minecraft.world.phys.AABB
 
 /** Runs in two separate server processes against the same on-disk world. */
@@ -42,15 +43,30 @@ class AssemblyRestartGameTests {
             level.getBlockState(origin.east()).`is`(Blocks.OAK_STAIRS), "baseline blocks not loaded")
         val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
         player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
-        ServerEntityEvents.ENTITY_LOAD.register { entity, entityLevel ->
-            if (entityLevel === level && entity is PhysicsPropEntity && entity.blockPosition() == origin) {
-                Files.writeString(Path.of("assembly-crash-reached.txt"),
-                    "entity-load: ${level.getBlockState(origin)}, ${level.getBlockState(origin.east())}")
-                Runtime.getRuntime().halt(86)
+        val flush = System.getProperty("tumble.restart.flush", "none")
+        if (flush == "none") {
+            ServerEntityEvents.ENTITY_LOAD.register { entity, entityLevel ->
+                if (entityLevel === level && entity is PhysicsPropEntity && entity.blockPosition() == origin) {
+                    Files.writeString(Path.of("assembly-crash-reached.txt"),
+                        "entity-load: ${level.getBlockState(origin)}, ${level.getBlockState(origin.east())}")
+                    Runtime.getRuntime().halt(86)
+                }
             }
+            TumbleApi.convertAssembly(level, listOf(origin, origin.east()), player)
+            return helper.fail("conversion did not reach the injected crash")
         }
         TumbleApi.convertAssembly(level, listOf(origin, origin.east()), player)
-        helper.fail("conversion did not reach the injected crash")
+            ?: return helper.fail("conversion did not start")
+        when (flush) {
+            "block" -> level.chunkSource.save(true)
+            "entity" -> {
+                val field = level.javaClass.getDeclaredField("entityManager").apply { isAccessible = true }
+                (field.get(level) as PersistentEntitySectionManager<*>).saveAll()
+            }
+            else -> return helper.fail("unknown crash save order")
+        }
+        Files.writeString(Path.of("assembly-crash-reached.txt"), "${flush}-save: ${level.getBlockState(origin)}, ${level.getBlockState(origin.east())}")
+        Runtime.getRuntime().halt(86)
     }
 
     @GameTest(maxTicks = 1200)
@@ -59,14 +75,21 @@ class AssemblyRestartGameTests {
         val level = helper.level
         level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
         level.getChunkAt(origin)
+        level.waitForEntities(net.minecraft.world.level.ChunkPos(origin.x shr 4, origin.z shr 4), 0)
         helper.runAfterDelay(100) {
             val props = level.getEntitiesOfClass(PhysicsPropEntity::class.java, AABB(
                 origin.x - 32.0, origin.y - 80.0, origin.z - 32.0,
                 origin.x + 32.0, origin.y + 32.0, origin.z + 32.0
             ))
-            helper.assertTrue(props.isEmpty(), "unexpected persisted assembly after injected crash")
-            helper.assertTrue(level.getBlockState(origin) == Blocks.STONE.defaultBlockState() &&
-                level.getBlockState(origin.east()) == Blocks.OAK_STAIRS.defaultBlockState(), "crash lost or changed source blocks")
+            val originals = level.getBlockState(origin) == Blocks.STONE.defaultBlockState() &&
+                level.getBlockState(origin.east()) == Blocks.OAK_STAIRS.defaultBlockState()
+            val noSource = level.getBlockState(origin).isAir && level.getBlockState(origin.east()).isAir
+            val assembly = props.singleOrNull()?.assembly?.definition?.blocks?.associate { it.offset to it.state }
+            val captured = mapOf(BlockPos.ZERO to Blocks.STONE.defaultBlockState(),
+                BlockPos(1, 0, 0) to Blocks.OAK_STAIRS.defaultBlockState())
+            println("Assembly crash verification: originals=$originals, air=$noSource, props=${props.size}, captured=${assembly == captured}")
+            helper.assertTrue(originals && props.isEmpty() || noSource && assembly == captured,
+                "crash lost or duplicated source blocks: originals=$originals, air=$noSource, props=${props.size}")
             helper.assertTrue(level.getBlockState(origin.offset(3, 0, 0)).`is`(Blocks.DIAMOND_BLOCK), "baseline chunk was not persisted")
             helper.succeed()
         }

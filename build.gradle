@@ -157,6 +157,7 @@ tasks.register('runAssemblyRestartTest') {
         jvmArgs.add('-Dfabric-api.gametest')
         jvmArgs.add("-Dfabric-api.gametest.filter=tumble_test:assembly_restart_game_tests_${phase.replaceAll('([a-z])([A-Z])', '\$1_\$2').toLowerCase(Locale.ROOT)}")
         jvmArgs.add("-Dtumble.restart.phase=${phase}")
+        jvmArgs.add("-Dtumble.restart.flush=${providers.gradleProperty('assemblyCrashFlush').getOrElse('none')}")
         doFirst {
             if (!providers.gradleProperty('acceptMinecraftEula').map { it.toBoolean() }.getOrElse(false)) {
                 throw new GradleException('Pass -PacceptMinecraftEula=true to accept the Minecraft EULA for tests')
