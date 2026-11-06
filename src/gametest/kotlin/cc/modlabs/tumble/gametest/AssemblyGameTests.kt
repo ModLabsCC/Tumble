@@ -586,6 +586,8 @@ class AssemblyGameTests {
             }
             helper.assertTrue(blocked, "recovery ignored a chunk I/O failure reported before runtime registration")
             helper.assertTrue(Files.exists(directory.resolve("$id.journal")), "failed recovery deleted the journal")
+            PhysicsServices.stopped(server)
+            helper.assertTrue(server !in failures, "server stop retained its chunk I/O failure entry")
         } finally {
             runtimes[server] = runtime
             if (previousFailures == null) failures.remove(server) else failures[server] = previousFailures

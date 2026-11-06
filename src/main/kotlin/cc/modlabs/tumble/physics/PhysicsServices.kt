@@ -48,6 +48,9 @@ object PhysicsServices {
             it.publisher.close()
             it.service.close()
         }
+    }
+
+    fun stopped(server: MinecraftServer) {
         chunkIoFailures.remove(server)
     }
 

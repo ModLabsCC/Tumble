@@ -30,6 +30,7 @@ object TumbleMod : ModInitializer {
         ServerLifecycleEvents.SERVER_STARTING.register { PhysicsServices.start(it, logger) }
         ServerLifecycleEvents.SERVER_STARTED.register(PhysicsServices::recoverConversions)
         ServerLifecycleEvents.SERVER_STOPPING.register(PhysicsServices::stop)
+        ServerLifecycleEvents.SERVER_STOPPED.register(PhysicsServices::stopped)
         ServerLevelEvents.LOAD.register(PhysicsServices::levelLoaded)
         ServerLevelEvents.UNLOAD.register(PhysicsServices::levelUnloaded)
         ServerEntityEvents.ENTITY_LOAD.register(PhysicsServices::entityLoaded)
