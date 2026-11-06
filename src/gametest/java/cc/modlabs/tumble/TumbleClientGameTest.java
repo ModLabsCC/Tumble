@@ -22,6 +22,9 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.CompletableFuture;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.ResourceKey;
 
 public final class TumbleClientGameTest implements FabricClientGameTest {
     @Override
@@ -81,6 +84,32 @@ public final class TumbleClientGameTest implements FabricClientGameTest {
                 var pig = (LivingEntity) server.overworld().getEntity(pigId.get());
                 if (pig == null || !pig.isAlive() || pig.getY() < 100.3) {
                     throw new AssertionError("Held pig fell after its support was removed");
+                }
+            });
+            var reload = new AtomicReference<CompletableFuture<Void>>();
+            world.getServer().runOnServer(server -> {
+                var player = server.getPlayerList().getPlayers().getFirst();
+                player.setGameMode(GameType.SURVIVAL);
+                player.getInventory().add(new ItemStack(TumbleItems.INSTANCE.getGRAVITY_GUN()));
+                player.getInventory().add(new ItemStack(TumbleItems.INSTANCE.getPHYSICS_GUN()));
+                player.getInventory().add(new ItemStack(TumbleItems.INSTANCE.getTOOL_GUN()));
+                for (var name : new String[] { "gravity_gun", "physics_gun", "tool_gun" }) {
+                    player.getRecipeBook().add(ResourceKey.create(Registries.RECIPE, TumbleMod.INSTANCE.id(name)));
+                }
+                reload.set(server.reloadResources(server.getPackRepository().getSelectedIds()));
+            });
+            context.waitFor(client -> reload.get() != null && reload.get().isDone());
+            reload.get().join();
+            world.getServer().runOnServer(server -> {
+                var player = server.getPlayerList().getPlayers().getFirst();
+                for (var item : new net.minecraft.world.item.Item[] {
+                    TumbleItems.INSTANCE.getGRAVITY_GUN(), TumbleItems.INSTANCE.getPHYSICS_GUN(), TumbleItems.INSTANCE.getTOOL_GUN()
+                }) {
+                    if (!player.getInventory().contains(new ItemStack(item))) throw new AssertionError("Reload removed an owned tool");
+                }
+                for (var name : new String[] { "gravity_gun", "physics_gun", "tool_gun" }) {
+                    var recipe = ResourceKey.create(Registries.RECIPE, TumbleMod.INSTANCE.id(name));
+                    if (server.getRecipeManager().byKey(recipe).isPresent()) throw new AssertionError("Reload restored a tool recipe: " + name);
                 }
             });
         }
