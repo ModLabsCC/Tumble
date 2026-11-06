@@ -25,6 +25,7 @@ import org.slf4j.Logger
 
 object PhysicsServices {
     private val runtimes = Collections.synchronizedMap(IdentityHashMap<MinecraftServer, Runtime>())
+    private val stopping = Collections.synchronizedSet(Collections.newSetFromMap(IdentityHashMap<MinecraftServer, Boolean>()))
     private val chunkIoFailures = Collections.synchronizedMap(IdentityHashMap<MinecraftServer, AtomicLong>())
     private val placementCapture = ThreadLocal<PlacementCapture?>()
     private val pistonCapture = ThreadLocal<PistonCapture?>()
@@ -43,8 +44,15 @@ object PhysicsServices {
         runtimes[server] = Runtime(service, terrain, manager, ServerPhysicsSnapshotPublisher(server, service, manager))
     }
 
+    private fun detachForShutdown(server: MinecraftServer): Runtime? = synchronized(runtimes) {
+        val runtime = runtimes[server] ?: return null
+        stopping.add(server)
+        runtimes.remove(server)
+        runtime
+    }
+
     fun stop(server: MinecraftServer) {
-        val runtime = runtimes.remove(server) ?: return
+        val runtime = detachForShutdown(server) ?: return
         closePhysicsRuntime(runtime.manager::checkpointConnections, runtime.publisher::close, runtime.service::close)
     }
 
@@ -55,6 +63,7 @@ object PhysicsServices {
     fun stopped(server: MinecraftServer) {
         RecoveryChunkTickets.stopped(server)
         chunkIoFailures.remove(server)
+        stopping.remove(server)
     }
 
     fun levelLoaded(server: MinecraftServer, level: ServerLevel) {
@@ -101,7 +110,10 @@ object PhysicsServices {
     }
 
     fun beforePropRemoval(entity: cc.modlabs.tumble.entity.PhysicsPropEntity, level: ServerLevel): Boolean {
-        val manager = runtimes[level.server]?.manager ?: return true
+        val manager = synchronized(runtimes) {
+            if (level.server in stopping) return false
+            runtimes[level.server]?.manager ?: return true
+        }
         if (manager.findProp(entity.uuid) !== entity) return true
         if (manager.isBlockPlacementPending(entity.uuid)) return false
         return manager.beginPropRemoval(entity, level)
@@ -111,8 +123,13 @@ object PhysicsServices {
         runtimes[level.server]?.manager?.finishPropRemoval(entity, level)
     }
 
-    fun canTeleportProp(entity: cc.modlabs.tumble.entity.PhysicsPropEntity, level: ServerLevel, destination: ServerLevel): Boolean =
-        runtimes[level.server]?.manager?.canTeleportProp(entity, level, destination) ?: true
+    fun canTeleportProp(entity: cc.modlabs.tumble.entity.PhysicsPropEntity, level: ServerLevel, destination: ServerLevel): Boolean {
+        val manager = synchronized(runtimes) {
+            if (level.server in stopping) return false
+            runtimes[level.server]?.manager ?: return true
+        }
+        return manager.canTeleportProp(entity, level, destination)
+    }
 
     fun requestAssembly(player: ServerPlayer, propId: UUID) {
         runtimes[player.level().server]?.publisher?.requestAssembly(player, propId)

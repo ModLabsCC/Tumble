@@ -18,14 +18,17 @@ CASES = [
     ('removed', 'entity', 'direct'),
     ('checkpointed', 'none', 'tnt'),
     ('exploded', 'block', 'tnt'),
+    ('connectionIo', 'none', 'clear'),
 ]
 
 
-def run(task, flags):
+def run(task, flags, expected_connection_failure=False):
     result = subprocess.run([*GRADLE, task, '-PacceptMinecraftEula=true', *flags, '--console=plain'],
                             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, encoding='utf-8', errors='replace')
-    if result.returncode and not any(f'finished with non-zero exit value {code}' in result.stdout for code in (86, 87)):
+    expected = any(f'finished with non-zero exit value {code}' in result.stdout for code in (86, 87))
+    expected |= expected_connection_failure and 'Could not persist connection removal' in result.stdout
+    if result.returncode and not expected:
         print(result.stdout, end='', flush=True)
     return result
 
@@ -39,9 +42,13 @@ def main():
         if probe:
             probe_marker.unlink(missing_ok=True)
             flags.append('-PremovalTicketProbe=true')
-        crash = run('runRemovalCrashInject', flags)
-        if (crash.returncode == 0 or 'finished with non-zero exit value 86' not in crash.stdout
-                or not marker.is_file() or marker.read_text(encoding='utf-8') != stage):
+        connection_failure = stage == 'connectionIo'
+        crash = run('runRemovalCrashInject', flags, expected_connection_failure=connection_failure)
+        expected_failure = ('Could not persist connection removal' in crash.stdout and
+                            'Connected prop removal did not complete; journal retained' in crash.stdout
+                            if connection_failure else 'finished with non-zero exit value 86' in crash.stdout)
+        if (crash.returncode == 0 or not expected_failure or not marker.is_file()
+                or marker.read_text(encoding='utf-8') != stage):
             raise RuntimeError(f'{stage}/{flush}/{action}: expected crash was not reached')
         if probe and (not probe_marker.is_file() or probe_marker.read_text(encoding='utf-8') != 'ticking and retained'):
             raise RuntimeError('Temporary removal ticket did not protect an actively ticking chunk')

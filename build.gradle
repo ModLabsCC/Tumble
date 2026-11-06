@@ -122,6 +122,34 @@ tasks.register('runProductionGameTest', net.fabricmc.loom.task.prod.ServerProduc
     }
 }
 
+// These tests temporarily replace the server runtime and must not share a process with other tests.
+[
+    clear: 'tumble_test:assembly_game_tests_clear_retains_props_when_removal_journal_prepare_fails',
+    shutdown: 'tumble_test:tumble_game_tests_stopping_server_retains_props_after_physics_runtime_detaches'
+].each { name, filter ->
+    tasks.register("runIsolated${name.capitalize()}GameTest", net.fabricmc.loom.task.prod.ServerProductionRunTask) {
+        outputs.upToDateWhen { false }
+        installerVersion = '1.1.2'
+        runDir = layout.buildDirectory.dir("run/isolated-${name}").get().asFile
+        jvmArgs.add('-Dfabric-api.gametest')
+        jvmArgs.add("-Dfabric-api.gametest.filter=${filter}")
+        jvmArgs.add("-Dtumble.isolated.test=${name}")
+        doFirst {
+            if (!providers.gradleProperty('acceptMinecraftEula').map { it.toBoolean() }.getOrElse(false)) {
+                throw new GradleException('Pass -PacceptMinecraftEula=true to accept the Minecraft EULA for tests')
+            }
+            def directory = runDir.get().asFile
+            directory.mkdirs()
+            project.delete(new File(directory, 'world'))
+            new File(directory, 'eula.txt').text = 'eula=true\n'
+        }
+    }
+}
+tasks.register('runRecoveryLifecycleTests') {
+    dependsOn tasks.named('runIsolatedClearGameTest'), tasks.named('runIsolatedShutdownGameTest')
+}
+tasks.named('runProductionGameTest') { finalizedBy tasks.named('runRecoveryLifecycleTests') }
+
 // Both processes use the same world. Only the prepare phase removes a previous run.
 ['prepare', 'verify'].each { phase ->
     tasks.register("runAssemblyRestart${phase.capitalize()}", net.fabricmc.loom.task.prod.ServerProductionRunTask) {

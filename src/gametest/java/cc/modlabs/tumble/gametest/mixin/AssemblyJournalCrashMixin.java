@@ -32,5 +32,6 @@ abstract class AssemblyJournalCrashMixin {
     private void tumble$crashAfterStarted(UUID id, CallbackInfo callback) throws Exception {
         PlacementCrashHook.crash("started", directory);
         RemovalCrashHook.crash("started", directory);
+        RemovalCrashHook.failConnectionWriteAfterStarted(directory);
     }
 }
