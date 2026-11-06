@@ -70,8 +70,12 @@ class AssemblyGameTests {
             val journalClass = Class.forName("cc.modlabs.tumble.physics.DurableConnectionJournal")
             val journal = journalClass.getConstructor(java.nio.file.Path::class.java).newInstance(path)
             val recordClass = Class.forName("cc.modlabs.tumble.physics.DurableConnection")
-            val record = recordClass.constructors.single().newInstance(UUID.randomUUID(), helper.level.physicsDimensionId().value,
-                first.uuid, second.uuid, UUID.randomUUID(), cc.modlabs.tumble.physics.PhysicsJointKind.NO_COLLIDE, null, 0f, false)
+            val record = recordClass.getConstructor(UUID::class.java, String::class.java, UUID::class.java, UUID::class.java,
+                UUID::class.java, cc.modlabs.tumble.physics.PhysicsJointKind::class.java,
+                cc.modlabs.tumble.physics.PhysicsJointFrames::class.java, Float::class.javaPrimitiveType,
+                Boolean::class.javaPrimitiveType, List::class.java, Boolean::class.javaPrimitiveType)
+                .newInstance(UUID.randomUUID(), helper.level.physicsDimensionId().value, first.uuid, second.uuid,
+                    UUID.randomUUID(), cc.modlabs.tumble.physics.PhysicsJointKind.NO_COLLIDE, null, 0f, false, emptyList<Any>(), true)
             journalClass.getMethod("put", recordClass).invoke(journal, record)
             val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning())
             manager.javaClass.getDeclaredField("journal").apply { isAccessible = true }.set(manager, journal)
@@ -870,6 +874,9 @@ class AssemblyGameTests {
     fun linkedPropSavedBeforeVisibilityChangesWaitsForAssembly(helper: GameTestHelper) = checkLinkedReload(helper, 2)
 
     @GameTest(maxTicks = 1600)
+    fun unloadBeforeInstallAcknowledgementRetainsConnection(helper: GameTestHelper) = checkLinkedReload(helper, 3)
+
+    @GameTest(maxTicks = 1600)
     fun ropeConnectionReturnsAfterReload(helper: GameTestHelper) = checkLinkedReload(helper, 2, ToolGunMode.ROPE)
 
     @GameTest(maxTicks = 1600)
@@ -951,8 +958,28 @@ class AssemblyGameTests {
                     weldFailure = "selection=$selected, connection=$welded, mode=$mode, root=${TumbleApi.status(helper.level, assembly.uuid)}, other=${TumbleApi.status(helper.level, other.uuid)}"
                     if (selected != ToolGunResult.SELECTED || welded != ToolGunResult.APPLIED) phase = 5
                     helper.assertTrue(phase != 5, weldFailure)
-                    checkpoint = frame.physicsStep
-                    phase = 1
+                    if (ordering == 3) {
+                        val queueField = runtime.service.javaClass.getDeclaredField("acknowledgements").apply { isAccessible = true }
+                        @Suppress("UNCHECKED_CAST")
+                        val queue = queueField.get(runtime.service) as ConcurrentLinkedQueue<PhysicsAcknowledgement>
+                        val deadline = System.nanoTime() + 5_000_000_000L
+                        while (queue.none { it is PhysicsAcknowledgement.ConnectionPrepared } && System.nanoTime() < deadline) Thread.sleep(1)
+                        val prepared = queue.filterIsInstance<PhysicsAcknowledgement.ConnectionPrepared>().singleOrNull()
+                            ?: return@succeedWhen helper.assertTrue(false, "connection preparation not acknowledged")
+                        val lockField = runtime.service.javaClass.getDeclaredField("stepBoundary").apply { isAccessible = true }
+                        val lock = lockField.get(runtime.service) as java.util.concurrent.locks.ReentrantLock
+                        lock.lock()
+                        try {
+                            runtime.manager.tick()
+                            reloadOther(frame.physicsStep, otherFirst = true)
+                            queue.add(PhysicsAcknowledgement.ConnectionCreated(prepared.requestId, false))
+                        } finally {
+                            lock.unlock()
+                        }
+                    } else {
+                        checkpoint = frame.physicsStep
+                        phase = 1
+                    }
                 }
                 1 -> if (frame.physicsStep - checkpoint >= 10) {
                     if (ordering == 2) reloadOther(frame.physicsStep, otherFirst = true)

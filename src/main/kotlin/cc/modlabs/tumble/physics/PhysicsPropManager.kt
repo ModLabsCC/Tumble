@@ -988,6 +988,15 @@ class PhysicsPropManager(
         val request = UUID.randomUUID()
         if (bodies.isNotEmpty()) parkingGroups[request] = ParkingGroup(level, members, snapshotMembers)
         service.invalidateRestores(tokens, level.physicsDimensionId(), bodies, request)
+        // Installation may acknowledge after this component has been parked. A durable
+        // edge belongs to recovery now; a stale failure must not delete its journal.
+        pendingConnections.filterValues { it.first in members || it.second in members }.toList().forEach { (id, pending) ->
+            if (pending.record == null) failConnection(id, pending)
+            else {
+                pendingConnections.remove(id)
+                service.submit(PhysicsCommand.CancelConnectionPreparation(pending.dimension, id))
+            }
+        }
     }
 
     private fun parkStaged(token: PhysicsRestoreToken, group: RestoreGroup) {
@@ -2408,7 +2417,11 @@ class PhysicsPropManager(
                                 else -> null
                             }
                         }
-                        check(changed.isEmpty()) { "Connection endpoint changed during checkpoint: $changed" }
+                        if (changed.isNotEmpty()) {
+                            logger.warn("Connection endpoints changed during checkpoint: {}", changed)
+                            failConnection(acknowledgement.requestId, pending)
+                            continue
+                        }
                         val previous = activeConnections(level).filter { it.first in members && it.second in members }
                         journal.putAll(previous.map { it.copy(checkpoint = checkpoint) } + record)
                         pending.record = record
