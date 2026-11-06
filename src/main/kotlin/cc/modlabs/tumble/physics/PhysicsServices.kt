@@ -44,11 +44,8 @@ object PhysicsServices {
     }
 
     fun stop(server: MinecraftServer) {
-        runtimes[server]?.manager?.checkpointConnections()
-        runtimes.remove(server)?.let {
-            it.publisher.close()
-            it.service.close()
-        }
+        val runtime = runtimes.remove(server) ?: return
+        closePhysicsRuntime(runtime.manager::checkpointConnections, runtime.publisher::close, runtime.service::close)
     }
 
     fun checkpointConnections(server: MinecraftServer) {
@@ -342,4 +339,17 @@ object PhysicsServices {
 
     private const val MAX_PISTON_BOXES = 128
     private const val PLAYER_COLLISION_TRIM = 2.0 / 16.0
+}
+
+
+internal fun closePhysicsRuntime(checkpoint: () -> Unit, closePublisher: () -> Unit, closeService: () -> Unit) {
+    var failure: Throwable? = null
+    for (action in listOf(checkpoint, closePublisher, closeService)) {
+        try {
+            action()
+        } catch (error: Throwable) {
+            if (failure == null) failure = error else if (failure !== error) failure.addSuppressed(error)
+        }
+    }
+    failure?.let { throw it }
 }

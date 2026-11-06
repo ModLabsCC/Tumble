@@ -13,6 +13,23 @@ import org.slf4j.LoggerFactory
 
 class ServerPhysicsServiceTest {
     @Test
+    fun `shutdown closes publisher and worker even when checkpoint fails`() {
+        val primary = java.io.IOException("checkpoint failed")
+        val cleanup = java.io.IOException("publisher close failed")
+        val closed = mutableListOf<String>()
+        val error = kotlin.test.assertFailsWith<java.io.IOException> {
+            closePhysicsRuntime(
+                { throw primary },
+                { closed += "publisher"; throw cleanup },
+                { closed += "worker" }
+            )
+        }
+        kotlin.test.assertSame(primary, error)
+        assertEquals(listOf("publisher", "worker"), closed)
+        assertTrue(cleanup in error.suppressed)
+    }
+
+    @Test
     fun `invalidation prevents staged and active components from advancing again`() {
         for (activateFirst in listOf(false, true)) {
             val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
