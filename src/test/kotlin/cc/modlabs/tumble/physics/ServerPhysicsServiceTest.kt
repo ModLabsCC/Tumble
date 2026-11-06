@@ -13,6 +13,40 @@ import org.slf4j.LoggerFactory
 
 class ServerPhysicsServiceTest {
     @Test
+    fun `connection acknowledgements report native success and missing bodies`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:connection-ack")
+        service.start()
+        try {
+            repeat(2) { service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, bodyDefinition())) }
+            val bodies = mutableListOf<PhysicsBodyId>()
+            waitUntil {
+                (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { bodies += it.bodyId }
+                bodies.size == 2
+            }
+            val success = UUID.randomUUID()
+            val failure = UUID.randomUUID()
+            val filterSuccess = UUID.randomUUID()
+            val invalidRope = UUID.randomUUID()
+            service.submit(PhysicsCommand.CreateWeld(dimension, bodies[0], bodies[1], success))
+            service.submit(PhysicsCommand.CreateAxis(dimension, bodies[0], PhysicsBodyId(999999), failure))
+            service.submit(PhysicsCommand.CreateNoCollide(dimension, bodies[0], bodies[1], filterSuccess))
+            service.submit(PhysicsCommand.CreateRope(dimension, bodies[0], bodies[1], 0f, invalidRope))
+            val results = mutableListOf<PhysicsAcknowledgement.ConnectionCreated>()
+            waitUntil {
+                (service.pollAcknowledgement() as? PhysicsAcknowledgement.ConnectionCreated)?.let(results::add)
+                results.size == 4
+            }
+            assertTrue(results.single { it.requestId == success }.success)
+            assertFalse(results.single { it.requestId == failure }.success)
+            assertTrue(results.single { it.requestId == filterSuccess }.success)
+            assertFalse(results.single { it.requestId == invalidRope }.success)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
     fun `running state reflects a worker failure`() {
         val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
         val dimension = PhysicsDimensionId("test:worker-failure")

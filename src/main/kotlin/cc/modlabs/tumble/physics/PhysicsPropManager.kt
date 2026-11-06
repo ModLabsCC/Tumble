@@ -92,6 +92,8 @@ class PhysicsPropManager(
     private val toolModeByPlayer = mutableMapOf<UUID, ToolGunMode>()
     private val activeWelds = mutableSetOf<WeldKey>()
     private val toolConnections = mutableSetOf<WeldKey>()
+    private val confirmedToolConnections = mutableSetOf<WeldKey>()
+    private val pendingConnections = mutableMapOf<UUID, PendingConnection>()
     private val weldHistoryByPlayer = mutableMapOf<UUID, java.util.ArrayDeque<WeldKey>>()
     private val lastPhysicsGunControlTick = mutableMapOf<UUID, Long>()
     private val launchedProps = mutableMapOf<UUID, LaunchedProp>()
@@ -281,7 +283,9 @@ class PhysicsPropManager(
             sendToolGunState(player)
             return ToolGunWeldResult.FAILED
         }
-        return if (service.submit(PhysicsCommand.CreateWeld(level.physicsDimensionId(), firstBody, bodyId))) {
+        val requestId = UUID.randomUUID()
+        return if (service.submit(PhysicsCommand.CreateWeld(level.physicsDimensionId(), firstBody, bodyId, requestId))) {
+            pendingConnections[requestId] = PendingConnection(key, true, player.uuid)
             activeWelds += key
             weldHistoryByPlayer.getOrPut(player.uuid) { java.util.ArrayDeque() }.addLast(key)
             sendToolGunState(player)
@@ -348,16 +352,21 @@ class PhysicsPropManager(
             return ToolGunResult.FAILED
         }
         val dimension = level.physicsDimensionId()
+        val requestId = UUID.randomUUID()
         val accepted = when (mode) {
             ToolGunMode.ROPE -> {
                 val length = first.position().distanceTo(prop.position()).toFloat()
                 length.isFinite() && length > 0f &&
-                    service.submit(PhysicsCommand.CreateRope(dimension, firstBody, bodyId, length))
+                    service.submit(PhysicsCommand.CreateRope(dimension, firstBody, bodyId, length, requestId))
             }
-            ToolGunMode.AXIS -> service.submit(PhysicsCommand.CreateAxis(dimension, firstBody, bodyId))
-            ToolGunMode.NO_COLLIDE -> service.submit(PhysicsCommand.CreateNoCollide(dimension, firstBody, bodyId))
+            ToolGunMode.AXIS -> service.submit(PhysicsCommand.CreateAxis(dimension, firstBody, bodyId, requestId))
+            ToolGunMode.NO_COLLIDE -> service.submit(PhysicsCommand.CreateNoCollide(dimension, firstBody, bodyId, requestId))
         }
-        if (accepted) toolConnections += WeldKey.of(first.uuid, prop.uuid)
+        if (accepted) {
+            val key = WeldKey.of(first.uuid, prop.uuid)
+            pendingConnections[requestId] = PendingConnection(key, false, player.uuid)
+            toolConnections += key
+        }
         sendToolGunState(player)
         return if (accepted) ToolGunResult.APPLIED else ToolGunResult.FAILED
     }
@@ -373,7 +382,11 @@ class PhysicsPropManager(
                 weldSelectionByPlayer.remove(player.uuid)
                 service.submit(PhysicsCommand.DestroyToolConstraints(level.physicsDimensionId(), bodyId))
                     .also { accepted ->
-                        if (accepted) toolConnections.removeIf { it.contains(prop.uuid) }
+                        if (accepted) {
+                            toolConnections.removeIf { it.contains(prop.uuid) }
+                            confirmedToolConnections.removeIf { it.contains(prop.uuid) }
+                            pendingConnections.entries.removeIf { !it.value.weld && it.value.key.contains(prop.uuid) }
+                        }
                         sendToolGunState(player)
                     }
             }
@@ -395,6 +408,8 @@ class PhysicsPropManager(
         val dimension = level.physicsDimensionId()
         if (!service.submit(PhysicsCommand.DestroyBody(dimension, bodyId))) return false
         toolConnections.removeIf { it.contains(prop.uuid) }
+        confirmedToolConnections.removeIf { it.contains(prop.uuid) }
+        pendingConnections.entries.removeIf { it.value.key.contains(prop.uuid) }
         val removedWelds = activeWelds.filter { it.contains(prop.uuid) }.toSet()
         activeWelds.removeAll(removedWelds)
         weldHistoryByPlayer.values.forEach { history -> history.removeIf(removedWelds::contains) }
@@ -420,9 +435,12 @@ class PhysicsPropManager(
             sendToolGunState(player)
             return false
         }
-        activeWelds.removeAll(removed.toSet())
-        weldHistoryByPlayer.values.forEach { history -> history.removeIf(removed::contains) }
         val accepted = service.submit(PhysicsCommand.DestroyWelds(level.physicsDimensionId(), bodyId))
+        if (accepted) {
+            activeWelds.removeAll(removed.toSet())
+            pendingConnections.entries.removeIf { it.value.weld && it.value.key in removed }
+            weldHistoryByPlayer.values.forEach { history -> history.removeIf(removed::contains) }
+        }
         sendToolGunState(player)
         return accepted
     }
@@ -441,12 +459,15 @@ class PhysicsPropManager(
             if (firstProp != null && isTerrainPaused(firstProp, level) ||
                 secondProp != null && isTerrainPaused(secondProp, level)
             ) return false
-            history.removeLast()
-            activeWelds.remove(key)
             val first = firstProp?.runtimeBodyId
             val second = secondProp?.runtimeBodyId
             val accepted = first != null && second != null &&
                 service.submit(PhysicsCommand.DestroyWeld(level.physicsDimensionId(), first, second))
+            if (accepted) {
+                history.removeLast()
+                activeWelds.remove(key)
+                pendingConnections.entries.removeIf { it.value.weld && it.value.key == key }
+            }
             sendToolGunState(player)
             return accepted
         }
@@ -524,6 +545,8 @@ class PhysicsPropManager(
         val removedWelds = activeWelds.filter { it.contains(entity.uuid) }
         activeWelds.removeAll(removedWelds.toSet())
         toolConnections.removeIf { it.contains(entity.uuid) }
+        confirmedToolConnections.removeIf { it.contains(entity.uuid) }
+        pendingConnections.entries.removeIf { it.value.key.contains(entity.uuid) }
         weldHistoryByPlayer.values.forEach { history -> history.removeIf(removedWelds::contains) }
         val bodyId = associations.remove(entity.uuid) ?: entity.runtimeBodyId
         if (bodyId != null) {
@@ -1609,6 +1632,24 @@ class PhysicsPropManager(
     private fun drainAcknowledgements() {
         while (true) {
             when (val acknowledgement = service.pollAcknowledgement() ?: return) {
+                is PhysicsAcknowledgement.ConnectionCreated -> {
+                    val pending = pendingConnections.remove(acknowledgement.requestId) ?: continue
+                    if (acknowledgement.success) {
+                        if (!pending.weld) confirmedToolConnections += pending.key
+                    } else {
+                        if (pending.weld) {
+                            activeWelds.remove(pending.key)
+                            weldHistoryByPlayer.values.forEach { it.removeIf { key -> key == pending.key } }
+                        } else if (pending.key !in confirmedToolConnections &&
+                            pendingConnections.values.none { !it.weld && it.key == pending.key }
+                        ) toolConnections.remove(pending.key)
+                        logger.warn("Physics connection creation failed between {} and {}", pending.key.first, pending.key.second)
+                        server.playerList.getPlayer(pending.playerId)?.let {
+                            it.sendOverlayMessage(net.minecraft.network.chat.Component.translatable("message.tumble.tool_gun.failed"))
+                            sendToolGunState(it)
+                        }
+                    }
+                }
                 is PhysicsAcknowledgement.BodyCreated -> {
                     val entity = props[acknowledgement.propId]
                     if (entity == null || entity.isRemoved || !associations.acknowledge(
@@ -1760,6 +1801,8 @@ private data class PlatformMotion(
     val current: AABB,
     val delta: PhysicsVector
 )
+
+private data class PendingConnection(val key: WeldKey, val weld: Boolean, val playerId: UUID)
 
 private data class SelectedWeld(val propId: UUID, val face: Direction)
 

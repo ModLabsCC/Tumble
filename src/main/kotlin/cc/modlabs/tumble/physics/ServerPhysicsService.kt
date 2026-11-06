@@ -149,21 +149,31 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                         it.value.dimension == command.dimension && it.value.bodyId == command.bodyId
                     }
                 }
-                is PhysicsCommand.CreateWeld -> worlds[command.dimension]
-                    ?.createWeld(command.bodyA, command.bodyB)
+                is PhysicsCommand.CreateWeld -> {
+                    val success = worlds[command.dimension]?.createWeld(command.bodyA, command.bodyB) == true
+                    command.requestId?.let { acknowledgements += PhysicsAcknowledgement.ConnectionCreated(it, success) }
+                }
                 is PhysicsCommand.DestroyWelds -> worlds[command.dimension]
                     ?.destroyWelds(command.bodyId)
                 is PhysicsCommand.DestroyWeld -> worlds[command.dimension]
                     ?.destroyWeld(command.bodyA, command.bodyB)
                 is PhysicsCommand.CreateRope -> {
-                    if (command.length.isFinite() && command.length > 0f) {
-                        worlds[command.dimension]?.createRope(command.bodyA, command.bodyB, command.length)
-                    } else logger.warn("Ignoring rope with invalid length {}", command.length)
+                    val success = if (command.length.isFinite() && command.length > 0f) {
+                        worlds[command.dimension]?.createRope(command.bodyA, command.bodyB, command.length) == true
+                    } else {
+                        logger.warn("Ignoring rope with invalid length {}", command.length)
+                        false
+                    }
+                    command.requestId?.let { acknowledgements += PhysicsAcknowledgement.ConnectionCreated(it, success) }
                 }
-                is PhysicsCommand.CreateAxis -> worlds[command.dimension]
-                    ?.createAxis(command.bodyA, command.bodyB)
-                is PhysicsCommand.CreateNoCollide -> worlds[command.dimension]
-                    ?.createNoCollide(command.bodyA, command.bodyB)
+                is PhysicsCommand.CreateAxis -> {
+                    val success = worlds[command.dimension]?.createAxis(command.bodyA, command.bodyB) == true
+                    command.requestId?.let { acknowledgements += PhysicsAcknowledgement.ConnectionCreated(it, success) }
+                }
+                is PhysicsCommand.CreateNoCollide -> {
+                    val success = worlds[command.dimension]?.createNoCollide(command.bodyA, command.bodyB) == true
+                    command.requestId?.let { acknowledgements += PhysicsAcknowledgement.ConnectionCreated(it, success) }
+                }
                 is PhysicsCommand.DestroyToolConstraints -> worlds[command.dimension]
                     ?.destroyToolConstraints(command.bodyId)
                 is PhysicsCommand.ReplaceTerrainSection -> worlds.getOrPut(command.dimension, ::createWorld).let { world ->

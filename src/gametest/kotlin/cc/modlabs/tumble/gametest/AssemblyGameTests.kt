@@ -51,6 +51,54 @@ import net.minecraft.world.level.storage.TagValueInput
 import net.minecraft.world.level.storage.TagValueOutput
 
 class AssemblyGameTests {
+    @GameTest(maxTicks = 400)
+    fun failedNativeWeldCanBeRetried(helper: GameTestHelper) {
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        val origin = helper.absolutePos(BlockPos(1, 3, 1))
+        val first = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn first prop")
+        val second = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 2.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn second prop")
+        val player = helper.makeMockPlayer(GameType.CREATIVE).apply {
+            setPos(origin.x + 1.5, origin.y.toDouble(), origin.z + 2.5)
+            setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
+        }
+        val dimension = helper.level.physicsDimensionId()
+        var phase = 0
+        var checkpoint = 0L
+        var retry = ToolGunWeldResult.FAILED
+        helper.succeedWhen {
+            Thread.sleep(5)
+            val frame = runtime.service.latestFrame(dimension)
+            when (phase) {
+                0 -> {
+                    val bodies = runtime.manager.networkProps().associateBy { it.propId }
+                    val firstBody = bodies[first.uuid] ?: return@succeedWhen helper.assertTrue(false, "first body not ready")
+                    if (bodies[second.uuid] == null) return@succeedWhen helper.assertTrue(false, "second body not ready")
+                    runtime.service.submit(PhysicsCommand.DestroyBody(dimension, firstBody.bodyId))
+                    helper.assertTrue(runtime.manager.useToolGunWeld(player, first) == ToolGunWeldResult.SELECTED, "selection failed")
+                    helper.assertTrue(runtime.manager.useToolGunWeld(player, second) == ToolGunWeldResult.WELDED, "weld was not queued")
+                    checkpoint = frame.physicsStep
+                    phase = 1
+                }
+                1 -> if (frame.physicsStep - checkpoint >= 20) {
+                    helper.assertTrue(runtime.manager.useToolGunWeld(player, first) == ToolGunWeldResult.SELECTED, "retry selection failed")
+                    retry = runtime.manager.useToolGunWeld(player, second)
+                    phase = 2
+                }
+                2 -> {
+                    helper.assertTrue(retry == ToolGunWeldResult.WELDED, "failed native weld left a phantom connection: $retry")
+                    runtime.manager.entityUnloaded(first, helper.level)
+                    runtime.manager.entityUnloaded(second, helper.level)
+                    first.discard()
+                    second.discard()
+                    return@succeedWhen
+                }
+            }
+            helper.assertTrue(false, "waiting for failed weld acknowledgement")
+        }
+    }
+
     @GameTest(maxTicks = 1200)
     fun linkedPropReloadWaitsForMissingAssemblyTerrain(helper: GameTestHelper) = checkLinkedReload(helper, 0)
 

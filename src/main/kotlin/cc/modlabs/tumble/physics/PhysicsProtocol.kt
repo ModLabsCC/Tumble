@@ -30,7 +30,8 @@ sealed interface PhysicsCommand {
     data class CreateWeld(
         val dimension: PhysicsDimensionId,
         val bodyA: PhysicsBodyId,
-        val bodyB: PhysicsBodyId
+        val bodyB: PhysicsBodyId,
+        val requestId: UUID? = null
     ) : PhysicsCommand
     data class DestroyWelds(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId) : PhysicsCommand
     data class DestroyWeld(
@@ -42,17 +43,20 @@ sealed interface PhysicsCommand {
         val dimension: PhysicsDimensionId,
         val bodyA: PhysicsBodyId,
         val bodyB: PhysicsBodyId,
-        val length: Float
+        val length: Float,
+        val requestId: UUID? = null
     ) : PhysicsCommand
     data class CreateAxis(
         val dimension: PhysicsDimensionId,
         val bodyA: PhysicsBodyId,
-        val bodyB: PhysicsBodyId
+        val bodyB: PhysicsBodyId,
+        val requestId: UUID? = null
     ) : PhysicsCommand
     data class CreateNoCollide(
         val dimension: PhysicsDimensionId,
         val bodyA: PhysicsBodyId,
-        val bodyB: PhysicsBodyId
+        val bodyB: PhysicsBodyId,
+        val requestId: UUID? = null
     ) : PhysicsCommand
     data class DestroyToolConstraints(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId) : PhysicsCommand
     data class ReplaceTerrainSection(
@@ -114,16 +118,16 @@ sealed interface PhysicsCommand {
 }
 
 sealed interface PhysicsAcknowledgement {
-    val propId: UUID
+    data class ConnectionCreated(val requestId: UUID, val success: Boolean) : PhysicsAcknowledgement
 
     data class BodyCreated(
-        override val propId: UUID,
+        val propId: UUID,
         val dimension: PhysicsDimensionId,
         val bodyId: PhysicsBodyId,
         val requestId: UUID
     ) : PhysicsAcknowledgement
 
-    data class BodyCreationFailed(override val propId: UUID, val message: String, val requestId: UUID) : PhysicsAcknowledgement
+    data class BodyCreationFailed(val propId: UUID, val message: String, val requestId: UUID) : PhysicsAcknowledgement
 }
 
 data class PhysicsImpactNotification(
