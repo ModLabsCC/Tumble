@@ -12,7 +12,9 @@ import cc.modlabs.tumble.physics.PhysicsServices
 import cc.modlabs.tumble.physics.ToolGunResult
 import cc.modlabs.tumble.assembly.AssemblyStructure
 import cc.modlabs.tumble.item.TumbleItems
+import com.mojang.serialization.Codec
 import net.minecraft.core.registries.BuiltInRegistries
+import net.minecraft.core.BlockPos
 import net.minecraft.network.syncher.EntityDataAccessor
 import net.minecraft.network.syncher.EntityDataSerializers
 import net.minecraft.network.syncher.SynchedEntityData
@@ -41,6 +43,8 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
     val hasAssembly: Boolean get() = entityData.get(DATA_HAS_ASSEMBLY)
     internal var runtimeBodyId: PhysicsBodyId? = null
     internal var physicsPending = false
+    internal var recoveryOrigin: BlockPos? = null
+    internal var terrainBlockers: List<Long> = emptyList()
     internal var angularVelocity = PhysicsVector.ZERO
     internal var lastAppliedStep = 0L
     private var localBounds = UNIT_LOCAL_BOUNDS
@@ -219,6 +223,11 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
             output.putBoolean(HAS_ASSEMBLY, true)
             output.store(ASSEMBLY, AssemblyStructure.CODEC, it)
         }
+        recoveryOrigin?.let { output.store(RECOVERY_ORIGIN, BlockPos.CODEC, it) }
+        if (terrainBlockers.isNotEmpty()) {
+            output.putBoolean(HAS_TERRAIN_BLOCKERS, true)
+            output.store(TERRAIN_BLOCKERS, TERRAIN_BLOCKER_CODEC, terrainBlockers)
+        }
         output.putFloat(MASS, mass)
         output.putInt(TOOL_PHYSICS_PRESET, toolPhysicsPreset.ordinal)
     }
@@ -231,6 +240,10 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
         assembly = if (input.getBooleanOr(HAS_ASSEMBLY, false)) {
             input.read(ASSEMBLY, AssemblyStructure.CODEC).orElseThrow { IllegalStateException("Invalid saved assembly") }
         } else null
+        recoveryOrigin = input.read(RECOVERY_ORIGIN, BlockPos.CODEC).orElse(null)
+        terrainBlockers = if (input.getBooleanOr(HAS_TERRAIN_BLOCKERS, false)) {
+            input.read(TERRAIN_BLOCKERS, TERRAIN_BLOCKER_CODEC).orElseThrow { IllegalStateException("Invalid saved terrain blockers") }
+        } else emptyList()
         entityData.set(DATA_HAS_ASSEMBLY, assembly != null)
         refreshLocalBounds()
         refreshDimensions()
@@ -290,6 +303,10 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
         private const val BLOCK_STATE = "TumbleBlockState"
         private const val HAS_ASSEMBLY = "TumbleHasAssembly"
         private const val ASSEMBLY = "TumbleAssembly"
+        private const val RECOVERY_ORIGIN = "TumbleRecoveryOrigin"
+        private const val TERRAIN_BLOCKERS = "TumbleTerrainBlockers"
+        private const val HAS_TERRAIN_BLOCKERS = "TumbleHasTerrainBlockers"
+        private val TERRAIN_BLOCKER_CODEC = Codec.LONG.listOf()
         private const val MASS = "TumbleMass"
         private const val TOOL_PHYSICS_PRESET = "TumbleToolPhysicsPreset"
     }

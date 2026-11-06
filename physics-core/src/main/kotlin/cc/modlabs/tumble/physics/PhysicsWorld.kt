@@ -35,7 +35,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     private val temporaryBodies = mutableMapOf<PhysicsBodyId, Int>()
     private val welds = mutableListOf<NativeWeld>()
     private val toolJoints = mutableListOf<NativeToolJoint>()
-    private val suspensionRoots = mutableSetOf<PhysicsBodyId>()
+    private val suspensionRoots = mutableMapOf<PhysicsBodyId, Set<PhysicsBodyId>>()
     private val pendingImpactEvents = mutableListOf<PhysicsImpactEvent>()
     private var latestMovedSnapshots = emptyList<PhysicsBodySnapshot>()
     private var nextBodyId = 1L
@@ -60,8 +60,13 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     @JvmName("destroyBody")
     fun destroyBody(bodyId: PhysicsBodyId): Boolean {
         checkUsable()
-        val body = bodies.remove(bodyId) ?: return false
-        suspensionRoots.remove(bodyId)
+        val body = bodies[bodyId] ?: return false
+        suspensionRoots.replaceAll { _, seeds ->
+            val connected = connectedBodies(seeds)
+            if (bodyId in connected) connected - bodyId else seeds
+        }
+        suspensionRoots.entries.removeIf { it.value.isEmpty() }
+        bodies.remove(bodyId)
         temporaryBodies.remove(bodyId)
         bodyIdsByNativeKey.remove(body.nativeId.key())
         pendingImpactEvents.removeIf { it.bodyA == bodyId || it.bodyB == bodyId }
@@ -366,7 +371,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     fun suspend(bodyId: PhysicsBodyId): Boolean {
         checkUsable()
         if (bodyId !in bodies) return false
-        suspensionRoots.add(bodyId)
+        suspensionRoots.putIfAbsent(bodyId, setOf(bodyId))
         refreshSuspensions()
         return true
     }
@@ -375,15 +380,40 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     @JvmName("resume")
     fun resume(bodyId: PhysicsBodyId): Boolean {
         checkUsable()
-        if (bodyId !in bodies) return false
+        if (bodyId !in bodies && bodyId !in suspensionRoots) return false
         suspensionRoots.remove(bodyId)
         refreshSuspensions()
         return true
     }
 
     private fun refreshSuspensions() {
-        val paused = suspensionRoots.toMutableSet()
-        val queue = ArrayDeque(suspensionRoots)
+        val blockers = mutableMapOf<PhysicsBodyId, MutableSet<PhysicsBodyId>>()
+        suspensionRoots.forEach { (root, seeds) ->
+            connectedBodies(seeds).forEach { blockers.getOrPut(it, ::mutableSetOf).add(root) }
+        }
+        bodies.forEach { (id, body) ->
+            body.suspensionRoots = blockers[id]?.let { java.util.Collections.unmodifiableSet(it) } ?: emptySet()
+            val suspended = body.suspended
+            if (body.suspensionRoots.isNotEmpty() && suspended == null) {
+                val snapshot = snapshotOf(id, body)
+                body.suspended = SuspendedMotion(body.motionType, snapshot.linearVelocity, snapshot.angularVelocity)
+                b3Body_SetType(body.nativeId, PhysicsMotionType.STATIC.nativeValue)
+            } else if (body.suspensionRoots.isEmpty() && suspended != null) {
+                b3Body_SetType(body.nativeId, suspended.motionType.nativeValue)
+                if (suspended.motionType != PhysicsMotionType.STATIC) {
+                    suspended.linearVelocity.toNativeVector().use { b3Body_SetLinearVelocity(body.nativeId, it) }
+                    suspended.angularVelocity.toNativeVector().use { b3Body_SetAngularVelocity(body.nativeId, it) }
+                    b3Body_SetAwake(body.nativeId, true)
+                }
+                body.motionType = suspended.motionType
+                body.suspended = null
+            }
+        }
+    }
+
+    private fun connectedBodies(seeds: Set<PhysicsBodyId>): Set<PhysicsBodyId> {
+        val paused = seeds.toMutableSet()
+        val queue = ArrayDeque(seeds)
         while (queue.isNotEmpty()) {
             val id = queue.removeFirst()
             welds.forEach { joint ->
@@ -395,23 +425,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
                 if (other != null && paused.add(other)) queue.addLast(other)
             }
         }
-        bodies.forEach { (id, body) ->
-            val suspended = body.suspended
-            if (id in paused && suspended == null) {
-                val snapshot = snapshotOf(id, body)
-                body.suspended = SuspendedMotion(body.motionType, snapshot.linearVelocity, snapshot.angularVelocity)
-                b3Body_SetType(body.nativeId, PhysicsMotionType.STATIC.nativeValue)
-            } else if (id !in paused && suspended != null) {
-                b3Body_SetType(body.nativeId, suspended.motionType.nativeValue)
-                if (suspended.motionType != PhysicsMotionType.STATIC) {
-                    suspended.linearVelocity.toNativeVector().use { b3Body_SetLinearVelocity(body.nativeId, it) }
-                    suspended.angularVelocity.toNativeVector().use { b3Body_SetAngularVelocity(body.nativeId, it) }
-                    b3Body_SetAwake(body.nativeId, true)
-                }
-                body.motionType = suspended.motionType
-                body.suspended = null
-            }
-        }
+        return paused
     }
 
     /** Owning physics thread only. The body must be kinematic. */
@@ -778,7 +792,8 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
                 body.suspended?.angularVelocity ?: angularVelocity.toPhysicsVector(),
                 !b3Body_IsAwake(nativeId),
                 body.mass,
-                body.suspended != null
+                body.suspended != null,
+                body.suspensionRoots
             )
         } finally {
             angularVelocity.close()
@@ -933,7 +948,8 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         val buoyancy: PhysicsBuoyancy,
         val mass: Float,
         var submersion: Float = 0f,
-        var suspended: SuspendedMotion? = null
+        var suspended: SuspendedMotion? = null,
+        var suspensionRoots: Set<PhysicsBodyId> = emptySet()
     )
 
     private data class SuspendedMotion(

@@ -24,6 +24,8 @@ import cc.modlabs.tumble.physics.PhysicsWorld
 import cc.modlabs.tumble.physics.PhysicsServices
 import cc.modlabs.tumble.entity.PhysicsPropEntity
 import cc.modlabs.tumble.entity.TumbleEntities
+import cc.modlabs.tumble.item.TumbleItems
+import cc.modlabs.tumble.physics.ToolGunWeldResult
 import cc.modlabs.tumble.api.TumbleApi
 import cc.modlabs.tumble.network.AssemblyPayload
 import com.mojang.serialization.JsonOps
@@ -40,6 +42,8 @@ import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.StairBlock
 import net.minecraft.util.ProblemReporter
 import net.minecraft.world.entity.EntitySpawnReason
+import net.minecraft.world.entity.EquipmentSlot
+import net.minecraft.world.item.ItemStack
 import net.minecraft.world.level.GameType
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.server.players.NameAndId
@@ -47,6 +51,244 @@ import net.minecraft.world.level.storage.TagValueInput
 import net.minecraft.world.level.storage.TagValueOutput
 
 class AssemblyGameTests {
+    @GameTest(maxTicks = 1200)
+    fun linkedPropReloadWaitsForMissingAssemblyTerrain(helper: GameTestHelper) = checkLinkedReload(helper, false)
+
+    @GameTest(maxTicks = 1200)
+    fun immediatelySavedLinkedPropWaitsForMissingAssemblyTerrain(helper: GameTestHelper) = checkLinkedReload(helper, true)
+
+    private fun checkLinkedReload(helper: GameTestHelper, immediate: Boolean) {
+        val origin = BlockPos(if (immediate) 3232 else 3104, 50, 0)
+        val remote = origin.offset(32, 0, 0)
+        for (position in listOf(origin, remote)) {
+            helper.level.setChunkForced(position.x shr 4, 0, true)
+            helper.level.getChunkAt(position)
+        }
+        for (x in 0..5) for (z in 0..3) helper.level.setBlock(origin.offset(x, -1, z), Blocks.STONE.defaultBlockState(), 3)
+        helper.level.setBlock(remote.below(), Blocks.STONE.defaultBlockState(), 3)
+        val stone = Blocks.STONE.defaultBlockState()
+        val definition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone), AssemblyBlock(BlockPos(32, 0, 0), stone)))
+        val structure = AssemblyStructure.of(definition, listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))),
+            AssemblyCollisionBox(1, PhysicsBox(PhysicsVector(31.5, -0.5, -0.5), PhysicsVector(32.5, 0.5, 0.5)))
+        ))
+        val assembly = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        assembly.setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+        assembly.initializeAssembly(structure)
+        helper.assertTrue(helper.level.addFreshEntity(assembly), "could not add assembly")
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        runtime.manager.entityLoaded(assembly, helper.level)
+        var other = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 2.5, 50.5, 0.5), stone)
+            ?: return helper.fail("could not create linked prop")
+        val player = helper.makeMockPlayer(GameType.CREATIVE).apply {
+            setPos(origin.x + 1.5, 50.0, 3.0)
+            setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
+        }
+        val dimension = helper.level.physicsDimensionId()
+        var phase = 0
+        var checkpoint = 0L
+        var weldFailure = "none"
+        fun reloadOther(step: Long) {
+            val saved = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
+            other.saveWithoutId(saved)
+            runtime.manager.entityUnloaded(assembly, helper.level, true)
+            assembly.discard()
+            runtime.manager.entityUnloaded(other, helper.level, true)
+            other.discard()
+            val restored = TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)
+                ?: error("could not reload linked prop")
+            restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), saved.buildResult()))
+            helper.assertTrue(helper.level.addFreshEntity(restored), "could not add reloaded prop")
+            runtime.manager.entityLoaded(restored, helper.level)
+            other = restored
+            checkpoint = step
+            phase = 3
+        }
+        helper.succeedWhen {
+            Thread.sleep(5)
+            val frame = runtime.service.latestFrame(dimension)
+            when (phase) {
+                0 -> {
+                    val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
+                    helper.assertTrue(assembly.uuid in ready && other.uuid in ready, "physics bodies are not ready")
+                    val selected = runtime.manager.useToolGunWeld(player, assembly)
+                    val welded = runtime.manager.useToolGunWeld(player, other)
+                    weldFailure = "selection=$selected, weld=$welded, root=${TumbleApi.status(helper.level, assembly.uuid)}, other=${TumbleApi.status(helper.level, other.uuid)}"
+                    if (selected != ToolGunWeldResult.SELECTED || welded != ToolGunWeldResult.WELDED) phase = 5
+                    helper.assertTrue(phase != 5, weldFailure)
+                    checkpoint = frame.physicsStep
+                    phase = 1
+                }
+                1 -> if (frame.physicsStep - checkpoint >= 10) {
+                    PhysicsServices.chunkUnloaded(helper.level, remote.x shr 4, 0)
+                    helper.assertTrue(TumbleApi.status(helper.level, assembly.uuid) == TumbleApi.PropStatus.PAUSED, "assembly did not enter terrain wait")
+                    checkpoint = frame.physicsStep
+                    if (immediate) reloadOther(frame.physicsStep) else phase = 2
+                }
+                2 -> if (frame.physicsStep - checkpoint >= 40) {
+                    val snapshot = TumbleApi.snapshot(helper.level, other.uuid)
+                        ?: return@succeedWhen helper.assertTrue(false, "linked body is not ready")
+                    helper.assertTrue(snapshot.suspended, "linked body was not paused")
+                    reloadOther(frame.physicsStep)
+                }
+                3 -> if (frame.physicsStep - checkpoint >= 30) {
+                    val status = TumbleApi.status(helper.level, other.uuid)
+                    helper.assertTrue((status == TumbleApi.PropStatus.PENDING || status == TumbleApi.PropStatus.PAUSED) &&
+                        TumbleApi.snapshot(helper.level, other.uuid) == null,
+                        "reloaded prop started while assembly terrain was missing: $status")
+                    PhysicsServices.chunkLoaded(helper.level, remote.x shr 4, 0)
+                    phase = 4
+                }
+                4 -> if (TumbleApi.status(helper.level, other.uuid) == TumbleApi.PropStatus.READY) return@succeedWhen
+                5 -> helper.assertTrue(false, weldFailure)
+            }
+            helper.assertTrue(false, "waiting for linked reload, phase=$phase")
+        }
+    }
+
+    @GameTest(maxTicks = 800)
+    fun linkedPropDoesNotStayPausedWhenAssemblyChangesDimension(helper: GameTestHelper) {
+        val origin = BlockPos(2944, 50, 0)
+        helper.level.setChunkForced(origin.x shr 4, 0, true)
+        helper.level.getChunkAt(origin)
+        for (x in 0..5) for (z in 0..3) helper.level.setBlock(origin.offset(x, -1, z), Blocks.STONE.defaultBlockState(), 3)
+        val stone = Blocks.STONE.defaultBlockState()
+        val structure = AssemblyStructure.of(AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone))), listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5)))
+        ))
+        val assembly = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        assembly.setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+        assembly.initializeAssembly(structure)
+        helper.assertTrue(helper.level.addFreshEntity(assembly), "could not add assembly")
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        runtime.manager.entityLoaded(assembly, helper.level)
+        val other = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 2.5, 50.5, 0.5), stone)
+            ?: return helper.fail("could not create linked prop")
+        val dimension = helper.level.physicsDimensionId()
+        var phase = 0
+        var checkpoint = 0L
+        helper.succeedWhen {
+            Thread.sleep(5)
+            val frame = runtime.service.latestFrame(dimension)
+            val snapshot = TumbleApi.snapshot(helper.level, other.uuid)
+                ?: return@succeedWhen helper.assertTrue(false, "linked body is not ready, phase=$phase, status=${TumbleApi.status(helper.level, other.uuid)}, service=${runtime.service.debugState()}")
+            when (phase) {
+                0 -> {
+                    val root = runtime.manager.networkProps().firstOrNull { it.propId == assembly.uuid }
+                        ?: return@succeedWhen helper.assertTrue(false, "assembly body is not ready")
+                    val linked = runtime.manager.networkProps().first { it.propId == other.uuid }
+                    runtime.service.submit(PhysicsCommand.CreateWeld(dimension, root.bodyId, linked.bodyId))
+                    checkpoint = frame.physicsStep
+                    phase = 1
+                }
+                1 -> if (frame.physicsStep - checkpoint >= 10) {
+                    assembly.setRemoved(net.minecraft.world.entity.Entity.RemovalReason.CHANGED_DIMENSION)
+                    runtime.manager.entityUnloaded(assembly, helper.level, true)
+                    checkpoint = frame.physicsStep
+                    phase = 2
+                }
+                2 -> if (frame.physicsStep - checkpoint >= 30) {
+                    helper.assertTrue(!snapshot.suspended, "dimension transfer stranded the linked prop")
+                    return@succeedWhen
+                }
+            }
+            helper.assertTrue(false, "waiting for dimension transfer, phase=$phase")
+        }
+    }
+
+    @GameTest(maxTicks = 800)
+    fun linkedPropWaitsForTerrainAfterAssemblyUnloads(helper: GameTestHelper) = checkLinkedUnload(helper, false)
+
+    @GameTest(maxTicks = 800)
+    fun linkedPropWaitsWhenAssemblyUnloadsBeforeTerrain(helper: GameTestHelper) = checkLinkedUnload(helper, true)
+
+    private fun checkLinkedUnload(helper: GameTestHelper, unloadFirst: Boolean) {
+        val origin = BlockPos(if (unloadFirst) 2576 else 1728, 50, 0)
+        val remote = origin.offset(32, 0, 0)
+        for (position in listOf(origin, remote)) {
+            helper.level.setChunkForced(position.x shr 4, 0, true)
+            helper.level.getChunkAt(position)
+        }
+        for (x in 0..5) for (z in 0..3) helper.level.setBlock(origin.offset(x, -1, z), Blocks.STONE.defaultBlockState(), 3)
+        helper.level.setBlock(remote.below(), Blocks.STONE.defaultBlockState(), 3)
+        val stone = Blocks.STONE.defaultBlockState()
+        val definition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone), AssemblyBlock(BlockPos(32, 0, 0), stone)))
+        val structure = AssemblyStructure.of(definition, listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))),
+            AssemblyCollisionBox(1, PhysicsBox(PhysicsVector(31.5, -0.5, -0.5), PhysicsVector(32.5, 0.5, 0.5)))
+        ))
+        val assembly = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        assembly.setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+        assembly.initializeAssembly(structure)
+        helper.assertTrue(helper.level.addFreshEntity(assembly), "could not add assembly")
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        runtime.manager.entityLoaded(assembly, helper.level)
+        val other = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 2.5, 50.5, 0.5), stone)
+            ?: return helper.fail("could not create linked prop")
+        val unrelatedOrigin = BlockPos(if (unloadFirst) 2800 else 2400, 50, 0)
+        helper.level.setChunkForced(unrelatedOrigin.x shr 4, 0, true)
+        helper.level.getChunkAt(unrelatedOrigin)
+        helper.assertTrue(!helper.level.chunkSource.hasChunk((unrelatedOrigin.x + 64) shr 4, 0), "unrelated remote chunk is unexpectedly loaded")
+        val unrelatedDefinition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone), AssemblyBlock(BlockPos(64, 0, 0), stone)))
+        val unrelatedStructure = AssemblyStructure.of(unrelatedDefinition, listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))),
+            AssemblyCollisionBox(1, PhysicsBox(PhysicsVector(63.5, -0.5, -0.5), PhysicsVector(64.5, 0.5, 0.5)))
+        ))
+        val unrelated = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        unrelated.setPos(unrelatedOrigin.x + 0.5, unrelatedOrigin.y + 0.5, 0.5)
+        unrelated.initializeAssembly(unrelatedStructure)
+        helper.assertTrue(helper.level.addFreshEntity(unrelated), "could not add unrelated assembly")
+        runtime.manager.entityLoaded(unrelated, helper.level)
+        val dimension = helper.level.physicsDimensionId()
+        var phase = 0
+        var checkpoint = 0L
+        helper.succeedWhen {
+            Thread.sleep(5)
+            val frame = runtime.service.latestFrame(dimension)
+            val snapshot = TumbleApi.snapshot(helper.level, other.uuid)
+                ?: return@succeedWhen helper.assertTrue(false, "linked body is not ready")
+            when (phase) {
+                0 -> {
+                    val root = runtime.manager.networkProps().firstOrNull { it.propId == assembly.uuid }
+                        ?: return@succeedWhen helper.assertTrue(false, "assembly body is not ready")
+                    val linked = runtime.manager.networkProps().first { it.propId == other.uuid }
+                    runtime.service.submit(PhysicsCommand.CreateWeld(dimension, root.bodyId, linked.bodyId))
+                    checkpoint = frame.physicsStep
+                    phase = 1
+                }
+                1 -> if (frame.physicsStep - checkpoint >= 10) {
+                    if (unloadFirst) {
+                        runtime.manager.entityUnloaded(assembly, helper.level, true)
+                        assembly.discard()
+                    }
+                    PhysicsServices.chunkUnloaded(helper.level, remote.x shr 4, 0)
+                    checkpoint = frame.physicsStep
+                    phase = 2
+                }
+                2 -> if (frame.physicsStep - checkpoint >= 30) {
+                    helper.assertTrue(snapshot.suspended, "linked prop did not pause when terrain unloaded")
+                    if (!unloadFirst) {
+                        runtime.manager.entityUnloaded(assembly, helper.level, true)
+                        assembly.discard()
+                    }
+                    checkpoint = frame.physicsStep
+                    phase = 3
+                }
+                3 -> if (frame.physicsStep - checkpoint >= 30) {
+                    helper.assertTrue(snapshot.suspended, "linked prop resumed while terrain was missing")
+                    PhysicsServices.chunkLoaded(helper.level, remote.x shr 4, 0)
+                    checkpoint = frame.physicsStep
+                    phase = 4
+                }
+                4 -> if (frame.physicsStep - checkpoint >= 30) {
+                    helper.assertTrue(!snapshot.suspended, "linked prop remained paused after terrain returned")
+                    return@succeedWhen
+                }
+            }
+            helper.assertTrue(false, "waiting for linked unload, phase=$phase")
+        }
+    }
+
     @GameTest(maxTicks = 2500)
     fun assemblyPausesIfTerrainUnloadsBeforeBodyAcknowledgement(helper: GameTestHelper) {
         val origin = BlockPos(1664, 50, 0)
@@ -78,7 +320,7 @@ class AssemblyGameTests {
         }
     }
 
-    @GameTest(maxTicks = 2500)
+    @GameTest(maxTicks = 800)
     fun movingAssemblyPausesAndResumesAcrossTerrainUnload(helper: GameTestHelper) {
         val origin = BlockPos(1536, 50, 0)
         val remote = origin.offset(32, 0, 0)
@@ -128,7 +370,8 @@ class AssemblyGameTests {
                     phase = 3
                 }
                 3 -> if (step - checkpoint >= 30) {
-                    helper.assertTrue(snapshot.transform.position.x > pausedX + 0.2, "assembly did not resume its motion")
+                    helper.assertTrue(snapshot.transform.position.x > pausedX + 0.2,
+                        "assembly did not resume its motion: paused=$pausedX, x=${snapshot.transform.position.x}, velocity=${snapshot.linearVelocity.x}, suspended=${snapshot.suspended}, status=${TumbleApi.status(helper.level, entity.uuid)}")
                     return@succeedWhen
                 }
             }
@@ -222,6 +465,132 @@ class AssemblyGameTests {
         helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE) && helper.level.getBlockState(origin.east()) == originalStair,
             "failed assembly did not restore the original blocks")
         helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.UNAVAILABLE, "failed assembly remained alongside restored blocks")
+        helper.succeed()
+    }
+
+    @GameTest
+    fun blockedAssemblyRollbackRecoversAfterTheObstructionIsRemoved(helper: GameTestHelper) {
+        val origin = BlockPos(1824, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, 0, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        helper.level.setBlock(origin.east(), Blocks.OAK_STAIRS.defaultBlockState(), 3)
+        val expected = helper.level.getBlockState(origin.east())
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val id = TumbleApi.convertAssembly(helper.level, listOf(origin, origin.east()), player)
+            ?: return helper.fail("could not start assembly conversion")
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        val field = runtime.service.javaClass.getDeclaredField("acknowledgements")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val acknowledgements = field.get(runtime.service) as ConcurrentLinkedQueue<PhysicsAcknowledgement>
+        val deadline = System.nanoTime() + 5_000_000_000L
+        var created: PhysicsAcknowledgement.BodyCreated? = null
+        while (created == null && System.nanoTime() < deadline) {
+            created = acknowledgements.filterIsInstance<PhysicsAcknowledgement.BodyCreated>().firstOrNull { it.propId == id }
+            if (created == null) Thread.sleep(1)
+        }
+        val body = created ?: return helper.fail("physics worker did not create the test body")
+        helper.assertTrue(acknowledgements.remove(body), "could not intercept the acknowledgement")
+        runtime.service.submit(PhysicsCommand.DestroyBody(body.dimension, body.bodyId))
+        helper.level.setBlock(origin.east(), Blocks.DIRT.defaultBlockState(), 3)
+        acknowledgements.add(PhysicsAcknowledgement.BodyCreationFailed(id, "injected assembly failure", body.requestId))
+        runtime.manager.tick()
+        helper.assertTrue(helper.level.getBlockState(origin.east()).`is`(Blocks.DIRT), "rollback overwrote the obstruction")
+        helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.FAILED, "blocked rollback lost the assembly")
+        helper.assertTrue(!TumbleApi.remove(helper.level, id), "recovering assembly was removed")
+        helper.level.setBlock(origin.east(), Blocks.AIR.defaultBlockState(), 3)
+        runtime.manager.tick()
+        helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE) && helper.level.getBlockState(origin.east()) == expected,
+            "assembly was not recovered after the obstruction was removed")
+        helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.UNAVAILABLE, "recovered assembly was not removed")
+        helper.succeed()
+    }
+
+    @GameTest
+    fun blockedAssemblyRecoverySurvivesSavingAndReloading(helper: GameTestHelper) {
+        val origin = BlockPos(1888, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, 0, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        helper.level.setBlock(origin.east(), Blocks.OAK_STAIRS.defaultBlockState(), 3)
+        val expected = helper.level.getBlockState(origin.east())
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val id = TumbleApi.convertAssembly(helper.level, listOf(origin, origin.east()), player)
+            ?: return helper.fail("could not start assembly conversion")
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        val field = runtime.service.javaClass.getDeclaredField("acknowledgements")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val acknowledgements = field.get(runtime.service) as ConcurrentLinkedQueue<PhysicsAcknowledgement>
+        val deadline = System.nanoTime() + 5_000_000_000L
+        var created: PhysicsAcknowledgement.BodyCreated? = null
+        while (created == null && System.nanoTime() < deadline) {
+            created = acknowledgements.filterIsInstance<PhysicsAcknowledgement.BodyCreated>().firstOrNull { it.propId == id }
+            if (created == null) Thread.sleep(1)
+        }
+        val body = created ?: return helper.fail("physics worker did not create the test body")
+        helper.assertTrue(acknowledgements.remove(body), "could not intercept the acknowledgement")
+        runtime.service.submit(PhysicsCommand.DestroyBody(body.dimension, body.bodyId))
+        helper.level.setBlock(origin.east(), Blocks.DIRT.defaultBlockState(), 3)
+        acknowledgements.add(PhysicsAcknowledgement.BodyCreationFailed(id, "injected assembly failure", body.requestId))
+        runtime.manager.tick()
+        val propsField = runtime.manager.javaClass.getDeclaredField("props")
+        propsField.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val props = propsField.get(runtime.manager) as Map<UUID, PhysicsPropEntity>
+        val original = props[id] ?: return helper.fail("failed assembly is missing")
+        val saved = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
+        original.saveWithoutId(saved)
+        runtime.manager.entityUnloaded(original, helper.level, true)
+        original.discard()
+        val restored = TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)
+            ?: return helper.fail("could not reload assembly")
+        restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), saved.buildResult()))
+        helper.assertTrue(helper.level.addFreshEntity(restored), "could not add reloaded assembly")
+        runtime.manager.entityLoaded(restored, helper.level)
+        helper.assertTrue(TumbleApi.status(helper.level, restored.uuid) == TumbleApi.PropStatus.FAILED, "reload lost pending recovery")
+        helper.level.setBlock(origin.east(), Blocks.AIR.defaultBlockState(), 3)
+        runtime.manager.tick()
+        helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE) && helper.level.getBlockState(origin.east()) == expected,
+            "reloaded assembly did not restore the captured blocks")
+        helper.succeed()
+    }
+
+    @GameTest
+    fun blockedRecoveriesDoNotStarveLaterAssemblies(helper: GameTestHelper) {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("assembly-recovery-fairness-test"))
+        service.start()
+        val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), LoggerFactory.getLogger("assembly-recovery-fairness-test"), TumbleTuning())
+        val stone = Blocks.STONE.defaultBlockState()
+        val definition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone)))
+        val structure = AssemblyStructure.of(definition, listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5)))
+        ))
+        val start = BlockPos(2112, 4, 0)
+        for (chunk in (start.x shr 4)..((start.x + 32) shr 4)) {
+            helper.level.setChunkForced(chunk, 0, true)
+            helper.level.getChunkAt(BlockPos(chunk shl 4, 4, 0))
+        }
+        repeat(9) { index ->
+            val origin = start.offset(index * 4, 0, 0)
+            helper.level.setBlock(origin, if (index < 8) Blocks.DIRT.defaultBlockState() else Blocks.AIR.defaultBlockState(), 3)
+            val entity = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+            entity.setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+            entity.initializeAssembly(structure)
+            val recovery = entity.javaClass.getDeclaredField("recoveryOrigin")
+            recovery.isAccessible = true
+            recovery.set(entity, origin)
+            manager.entityLoaded(entity, helper.level)
+        }
+        try {
+            repeat(2) { manager.tick() }
+            helper.assertTrue(helper.level.getBlockState(start.offset(32, 0, 0)).`is`(Blocks.STONE), "later recovery was starved")
+        } finally {
+            service.close()
+        }
         helper.succeed()
     }
 

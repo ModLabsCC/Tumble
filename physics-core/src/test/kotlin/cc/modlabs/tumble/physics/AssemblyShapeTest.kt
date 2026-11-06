@@ -9,12 +9,28 @@ import kotlin.test.assertTrue
 
 class AssemblyShapeTest {
     @Test
+    fun `unloading a suspended root does not release its connected body`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val root = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0))))
+        val other = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)), linearVelocity = PhysicsVector(2.0, 0.0, 0.0)))
+        assertTrue(world.createWeld(root, other))
+        assertTrue(world.suspend(root))
+        assertTrue(world.destroyBody(root))
+        assertTrue(assertNotNull(world.snapshot(other)).suspended)
+        repeat(30) { world.step() }
+        assertEquals(2.0, assertNotNull(world.snapshot(other)).transform.position.x, 0.001)
+        assertTrue(world.resume(root))
+        repeat(30) { world.step() }
+        assertTrue(assertNotNull(world.snapshot(other)).transform.position.x > 2.2)
+    }
+
+    @Test
     fun `removing a weld releases the unblocked body`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
         val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0))))
         val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)), linearVelocity = PhysicsVector(2.0, 0.0, 0.0)))
         assertTrue(world.createWeld(first, second))
         assertTrue(world.suspend(first))
         assertTrue(assertNotNull(world.snapshot(second)).suspended)
+        assertTrue(first in assertNotNull(world.snapshot(second)).suspensionRoots)
         assertTrue(world.destroyWeld(first, second))
         assertTrue(assertNotNull(world.snapshot(first)).suspended)
         assertFalse(assertNotNull(world.snapshot(second)).suspended)

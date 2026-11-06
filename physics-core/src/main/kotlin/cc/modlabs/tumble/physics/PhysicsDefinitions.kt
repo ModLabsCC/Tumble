@@ -113,7 +113,8 @@ data class PhysicsBodySnapshot(
     val angularVelocity: PhysicsVector,
     val sleeping: Boolean,
     val mass: Float = 0f,
-    val suspended: Boolean = false
+    val suspended: Boolean = false,
+    val suspensionRoots: Set<PhysicsBodyId> = emptySet()
 ) {
     init {
         require(mass.isFinite() && mass >= 0f) { "Body mass must be finite and non-negative" }
