@@ -21,11 +21,10 @@ class AssemblyTerrainGameTests {
     @GameTest
     fun rotatingAssemblyCoversItsDistantTipPath(helper: GameTestHelper) {
         val stone = Blocks.STONE.defaultBlockState()
-        val definition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone), AssemblyBlock(BlockPos(50, 0, 0), stone)))
-        val structure = AssemblyStructure.of(definition, listOf(
-            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))),
-            AssemblyCollisionBox(1, PhysicsBox(PhysicsVector(49.5, -0.5, -0.5), PhysicsVector(50.5, 0.5, 0.5)))
-        ))
+        val definition = AssemblyDefinition.of((0..50).map { AssemblyBlock(BlockPos(it, 0, 0), stone) })
+        val structure = AssemblyStructure.of(definition, (0..50).map { x ->
+            AssemblyCollisionBox(x, PhysicsBox(PhysicsVector(x - 0.5, -0.5, -0.5), PhysicsVector(x + 0.5, 0.5, 0.5)))
+        })
         val assembly = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
         assembly.setPos(0.5, 50.0, 8.5)
         assembly.initializeAssembly(structure)
