@@ -789,6 +789,33 @@ class AssemblyGameTests {
     }
 
     @GameTest
+    fun pendingAssemblyCannotRideOrCarryAnotherEntity(helper: GameTestHelper) {
+        val origin = BlockPos(50560, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val id = TumbleApi.convertAssembly(helper.level, listOf(origin), player)
+            ?: return helper.fail("could not start assembly conversion")
+        val manager = PhysicsServices.runtime(helper.level.server)!!.manager
+        val field = manager.javaClass.getDeclaredField("props").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val entity = (field.get(manager) as Map<UUID, PhysicsPropEntity>)[id] ?: return helper.fail("assembly missing")
+        val other = net.minecraft.world.entity.item.ItemEntity(helper.level, origin.x.toDouble(), origin.y.toDouble(), origin.z.toDouble(), ItemStack(net.minecraft.world.item.Items.STONE))
+        helper.assertTrue(!entity.startRiding(other, true, false), "pending assembly became a forced passenger")
+        helper.assertTrue(!other.startRiding(entity, true, false), "pending assembly accepted a forced passenger")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
+            helper.assertTrue(entity.startRiding(other, true, false), "completed assembly could not ride")
+            entity.stopRiding()
+            helper.assertTrue(other.startRiding(entity, true, false), "completed assembly could not carry a passenger")
+            other.stopRiding()
+        }
+    }
+
+    @GameTest
     fun mutableInputPositionsCannotChangeTheCapturedSource(helper: GameTestHelper) {
         val origin = BlockPos(50304, 4, 0)
         helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)

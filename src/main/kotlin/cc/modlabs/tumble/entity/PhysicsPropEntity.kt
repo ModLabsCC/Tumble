@@ -154,6 +154,15 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
     override fun isPushable() = false
     override fun canBeCollidedWith(other: Entity?) = false
     override fun isPickable() = true
+
+    private fun conversionPending(): Boolean = recoveryOrigin != null ||
+        (level() as? ServerLevel)?.let { PhysicsServices.assemblyConversionPending(it, uuid) } == true
+
+    override fun startRiding(entity: Entity, force: Boolean, sendEvent: Boolean): Boolean =
+        !conversionPending() && super.startRiding(entity, force, sendEvent)
+
+    override fun couldAcceptPassenger(): Boolean = !conversionPending() && super.couldAcceptPassenger()
+
     override fun causeFallDamage(distance: Double, multiplier: Float, source: DamageSource) = false
     override fun hurtServer(level: ServerLevel, source: DamageSource, amount: Float): Boolean {
         val player = source.entity as? Player ?: return false
