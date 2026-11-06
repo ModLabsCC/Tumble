@@ -108,9 +108,7 @@ object TumbleApi {
         val prop = manager.findProp(propId)?.takeIf { it.level() === level && !it.isRemoved } ?: return false
         if (manager.isBlockPlacementPending(propId)) return false
         if (prop.assembly != null && (prop.physicsPending || manager.isRecoveringAssembly(propId))) return false
-        if (!manager.entityUnloaded(prop, level)) return false
-        prop.discard()
-        return true
+        return manager.removeProp(prop, level)
     }
 
     private const val MAX_IMPULSE_SPEED_CHANGE = 64.0

@@ -44,11 +44,8 @@ object PhysicsServices {
     }
 
     fun stop(server: MinecraftServer) {
-        runtimes[server]?.manager?.checkpointConnections()
-        runtimes.remove(server)?.let {
-            it.publisher.close()
-            it.service.close()
-        }
+        val runtime = runtimes.remove(server) ?: return
+        closePhysicsRuntime(runtime.manager::checkpointConnections, runtime.publisher::close, runtime.service::close)
     }
 
     fun checkpointConnections(server: MinecraftServer) {
@@ -56,6 +53,7 @@ object PhysicsServices {
     }
 
     fun stopped(server: MinecraftServer) {
+        RecoveryChunkTickets.stopped(server)
         chunkIoFailures.remove(server)
     }
 
@@ -68,6 +66,8 @@ object PhysicsServices {
     }
 
     fun recoverConversions(server: MinecraftServer) {
+        runtimes[server]?.manager?.recoverRemovals()
+        runtimes[server]?.manager?.recoverPlacements()
         runtimes[server]?.manager?.recoverConversions()
     }
 
@@ -104,7 +104,11 @@ object PhysicsServices {
         val manager = runtimes[level.server]?.manager ?: return true
         if (manager.findProp(entity.uuid) !== entity) return true
         if (manager.isBlockPlacementPending(entity.uuid)) return false
-        return manager.entityUnloaded(entity, level)
+        return manager.beginPropRemoval(entity, level)
+    }
+
+    fun afterPropRemoval(entity: cc.modlabs.tumble.entity.PhysicsPropEntity, level: ServerLevel) {
+        runtimes[level.server]?.manager?.finishPropRemoval(entity, level)
     }
 
     fun canTeleportProp(entity: cc.modlabs.tumble.entity.PhysicsPropEntity, level: ServerLevel, destination: ServerLevel): Boolean =
@@ -342,4 +346,17 @@ object PhysicsServices {
 
     private const val MAX_PISTON_BOXES = 128
     private const val PLAYER_COLLISION_TRIM = 2.0 / 16.0
+}
+
+
+internal fun closePhysicsRuntime(checkpoint: () -> Unit, closePublisher: () -> Unit, closeService: () -> Unit) {
+    var failure: Throwable? = null
+    for (action in listOf(checkpoint, closePublisher, closeService)) {
+        try {
+            action()
+        } catch (error: Throwable) {
+            if (failure == null) failure = error else if (failure !== error) failure.addSuppressed(error)
+        }
+    }
+    failure?.let { throw it }
 }

@@ -32,3 +32,14 @@ The connection journal uses an atomic replacement after forcing the new file con
 
 
 A prop cannot be linked while it is riding another entity or carrying passengers. While a connection is pending or active, Tumble rejects riding in either direction, including forced riding. Existing version 2 connection journals lack proof of this restriction: those components remain parked, and existing passenger relationships may load so their data is not discarded. Keep the journal and a world backup and determine a safe manual recovery before removing or migrating such a record. Other mods that directly modify entity riding relationships can bypass this guard.
+## Connected prop placement recovery
+
+When the physics gun turns a connected prop into a block, Tumble saves the level and journals the destination before changing it. A crash before the placement commits restores the prop and its links; after commit, recovery finishes the block placement and removes the prop and its links. Recovery checks the destination and entity before normal ticks, and stops with the journal intact if the state is ambiguous. The destination must initially be air; connected props with block entities cannot use this operation.
+
+If placement recovery stops, back up the entire world, including `tumble-prop-placement-journal` and the connection journal, before investigating the reported UUID and destination. Locate the prop and preserve any unexpected block or entity contents. Do not delete the retained placement journal until the prop, destination, and links have been reconciled. The same process-crash and external-mod limitations above apply; mods that move a pending prop outside its recorded chunk or change chunk internals can defeat the absence check. This journal does not cover conversion of an unconnected prop to a block.
+
+## Connected prop deletion recovery
+
+Deleting a connected prop first checkpoints its level and writes a removal intent. Recovery either retains the original prop and links when the intent was only prepared, or finishes removing the prop and its links once the removal was committed. The same checkpoint precedes TNT impact explosions, including for an unconnected TNT prop. If the server stops between that checkpoint and the explosion, the TNT can be consumed without an explosion; explosion effects themselves are not a transaction.
+
+If deletion recovery stops, back up the entire world including `tumble-prop-removal-journal` and the connection journal. Locate the recorded UUID and its saved chunk, preserve any unexpected entities or passenger data, and resolve the reported mismatch before restarting. Never delete a retained journal until the prop and its links have been reconciled. The same server-process-crash scope and external-mod limitations described above apply to pending removals.
