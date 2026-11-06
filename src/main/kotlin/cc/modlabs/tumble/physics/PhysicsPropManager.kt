@@ -244,7 +244,7 @@ class PhysicsPropManager(
             initializeAssembly(structure)
             recoveryOrigin = origin
         }
-        val record = AssemblyRecoveryRecord(level.physicsDimensionId().value, origin, structure.definition, fenced = true)
+        val record = AssemblyRecoveryRecord(level.physicsDimensionId().value, origin, structure.definition, fenced = true, passengerSafe = true)
         try {
             conversionJournal.prepare(entity.uuid, record.encode())
         } catch (error: Exception) {
@@ -341,7 +341,7 @@ class PhysicsPropManager(
         return true
     }
 
-    fun assemblyConversionPending(id: UUID): Boolean = id in recoveryRecords
+    fun assemblyConversionPending(id: UUID): Boolean = recoveryRecords[id]?.passengerSafe == true
 
     private fun setConversionBlock(block: ConvertedBlock, state: BlockState, owner: UUID): Boolean {
         check(conversionWritePermit == null)
@@ -398,6 +398,7 @@ class PhysicsPropManager(
                     continue
                 }
                 if (found == null) {
+                    check(record.passengerSafe) { "Assembly $id may be saved as an unloaded passenger; journal retained" }
                     // shortcut: external teleports can move a pending entity elsewhere; fence movement before supporting them.
                     check(restoreJournalBlocks(id, record, level)) { "Assembly recovery for $id is obstructed; journal retained" }
                     checkpointConversion(id, level)
@@ -408,6 +409,7 @@ class PhysicsPropManager(
                 check(entity.level() === level && entity.assembly?.definition?.blocks == record.definition.blocks) {
                     "Assembly entity for $id does not match its journal"
                 }
+                check(!entity.isPassenger && entity.passengers.isEmpty()) { "Assembly $id has passenger relationships; journal retained" }
                 check(restoreJournalBlocks(id, record, level)) { "Assembly recovery for $id is obstructed; journal retained" }
                 pendingConversions.remove(id)
                 entityUnloaded(entity, level)
@@ -1542,6 +1544,8 @@ class PhysicsPropManager(
     }
 
     private fun rollbackPendingConversion(propId: UUID): Boolean {
+        val entity = props[propId]
+        if (entity?.assembly != null && (entity.isPassenger || entity.passengers.isNotEmpty())) return false
         pendingConversions[propId]?.let {
             val remaining = it.toMutableList()
             if (recoveryRecords[propId]?.fenced == true) {

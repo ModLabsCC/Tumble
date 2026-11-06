@@ -18,11 +18,13 @@ internal data class AssemblyRecoveryRecord(
     val dimension: String,
     val origin: BlockPos,
     val definition: AssemblyDefinition,
-    val fenced: Boolean = false
+    val fenced: Boolean = false,
+    val passengerSafe: Boolean = false
 ) {
     fun encode(): ByteArray = JsonObject().apply {
         addProperty("dimension", dimension)
         addProperty("fenced", fenced)
+        addProperty("passengerSafe", passengerSafe)
         add("origin", BlockPos.CODEC.encodeStart(JsonOps.INSTANCE, origin).result().orElseThrow())
         add("definition", AssemblyDefinition.CODEC.encodeStart(JsonOps.INSTANCE, definition).result().orElseThrow())
     }.toString().toByteArray(Charsets.UTF_8)
@@ -36,7 +38,8 @@ internal data class AssemblyRecoveryRecord(
                 dimension,
                 BlockPos.CODEC.parse(JsonOps.INSTANCE, json.get("origin")).result().orElseThrow(),
                 AssemblyDefinition.CODEC.parse(JsonOps.INSTANCE, json.get("definition")).result().orElseThrow(),
-                json.get("fenced")?.asBoolean ?: false
+                json.get("fenced")?.asBoolean ?: false,
+                json.get("passengerSafe")?.asBoolean ?: false
             )
         }
     }

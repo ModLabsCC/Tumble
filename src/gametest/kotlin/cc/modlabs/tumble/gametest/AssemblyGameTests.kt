@@ -284,6 +284,21 @@ class AssemblyGameTests {
         }
     }
 
+    private fun writeRecoveryJournal(
+        directory: java.nio.file.Path, id: UUID, helper: GameTestHelper, origin: BlockPos,
+        definition: AssemblyDefinition, fenced: Boolean, passengerSafe: Boolean, started: Boolean
+    ) {
+        val recordClass = Class.forName("cc.modlabs.tumble.physics.AssemblyRecoveryRecord")
+        val record = recordClass.getConstructor(String::class.java, BlockPos::class.java, AssemblyDefinition::class.java,
+            Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+            .newInstance(helper.level.physicsDimensionId().value, origin, definition, fenced, passengerSafe)
+        val payload = recordClass.getMethod("encode").invoke(record) as ByteArray
+        val journalClass = Class.forName("cc.modlabs.tumble.physics.AssemblyConversionJournal")
+        val journal = journalClass.getConstructor(java.nio.file.Path::class.java).newInstance(directory)
+        journalClass.getMethod("prepare", UUID::class.java, ByteArray::class.java).invoke(journal, id, payload)
+        if (started) journalClass.getMethod("markStarted", UUID::class.java).invoke(journal, id)
+    }
+
     private fun obstructProtectedSource(manager: PhysicsPropManager, helper: GameTestHelper, id: UUID, position: BlockPos) {
         val permit = manager.javaClass.getDeclaredField("conversionWritePermit").apply { isAccessible = true }
         permit.set(manager, id to (helper.level.physicsDimensionId().value to position))
@@ -759,13 +774,7 @@ class AssemblyGameTests {
             runtimes[server] = runtime
             val origin = BlockPos(50240, 4, 0)
             val definition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, Blocks.STONE.defaultBlockState())))
-            val recordClass = Class.forName("cc.modlabs.tumble.physics.AssemblyRecoveryRecord")
-            val record = recordClass.getConstructor(String::class.java, BlockPos::class.java, AssemblyDefinition::class.java, Boolean::class.javaPrimitiveType)
-                .newInstance(helper.level.physicsDimensionId().value, origin, definition, true)
-            val payload = recordClass.getMethod("encode").invoke(record) as ByteArray
-            val journalClass = Class.forName("cc.modlabs.tumble.physics.AssemblyConversionJournal")
-            val journal = journalClass.getConstructor(java.nio.file.Path::class.java).newInstance(directory)
-            journalClass.getMethod("prepare", UUID::class.java, ByteArray::class.java).invoke(journal, id, payload)
+            writeRecoveryJournal(directory, id, helper, origin, definition, true, true, false)
             val manager = PhysicsPropManager(server, service, TerrainSectionTracker(service), logger, TumbleTuning(), directory)
             val recover = manager.javaClass.declaredMethods.single { it.name.startsWith("recoverConversions") }
             val blocked = try { recover.invoke(manager); false } catch (error: java.lang.reflect.InvocationTargetException) {
@@ -926,6 +935,70 @@ class AssemblyGameTests {
             "conversion accepted a block that changed during capture")
         helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE), "removed source block was not restored")
         helper.assertTrue(helper.level.getBlockState(origin.east()).`is`(Blocks.DIRT), "rollback overwrote the changed block")
+        helper.succeed()
+    }
+
+    @GameTest
+    fun legacyJournalWithMissingEntityIsRetained(helper: GameTestHelper) {
+        val origin = BlockPos(50688, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.AIR.defaultBlockState(), 3)
+        val directory = Files.createTempDirectory("tumble-legacy-passenger-test")
+        val id = UUID.randomUUID()
+        val logger = LoggerFactory.getLogger("assembly-legacy-passenger-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        try {
+            val definition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, Blocks.STONE.defaultBlockState())))
+            writeRecoveryJournal(directory, id, helper, origin, definition, true, false, true)
+            val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning(), directory)
+            val recover = manager.javaClass.declaredMethods.single { it.name.startsWith("recoverConversions") }
+            val blocked = try { recover.invoke(manager); false } catch (error: java.lang.reflect.InvocationTargetException) {
+                error.cause is IllegalStateException
+            }
+            helper.assertTrue(blocked, "legacy journal assumed an unloaded passenger was absent")
+            helper.assertTrue(helper.level.getBlockState(origin).isAir, "ambiguous recovery restored source blocks")
+            helper.assertTrue(Files.exists(directory.resolve("$id.journal")), "ambiguous recovery deleted its journal")
+        } finally {
+            service.close()
+            Files.deleteIfExists(directory.resolve("$id.journal"))
+            Files.deleteIfExists(directory)
+        }
+        helper.succeed()
+    }
+
+    @GameTest
+    fun legacyRecoveryRetainsAssemblyWithPassengers(helper: GameTestHelper) {
+        val origin = BlockPos(50816, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.AIR.defaultBlockState(), 3)
+        val stone = Blocks.STONE.defaultBlockState()
+        val definition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone)))
+        val structure = AssemblyStructure.of(definition, listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5)))
+        ))
+        val entity = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        entity.setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+        entity.initializeAssembly(structure)
+        entity.javaClass.getDeclaredField("recoveryOrigin").apply { isAccessible = true }.set(entity, origin)
+        val passenger = net.minecraft.world.entity.item.ItemEntity(helper.level, origin.x.toDouble(), origin.y.toDouble(), origin.z.toDouble(), ItemStack(net.minecraft.world.item.Items.STONE))
+        helper.assertTrue(passenger.startRiding(entity, true, false), "could not construct legacy passenger relationship")
+        val logger = LoggerFactory.getLogger("assembly-legacy-passenger-relationship-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        val directory = Files.createTempDirectory("tumble-legacy-passenger-relationship")
+        val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning(), directory)
+        try {
+            manager.entityLoaded(entity, helper.level)
+            manager.tick()
+            helper.assertTrue(!entity.isRemoved && helper.level.getBlockState(origin).isAir, "recovery discarded a passenger-bearing assembly")
+            passenger.stopRiding()
+            manager.tick()
+            helper.assertTrue(entity.isRemoved && helper.level.getBlockState(origin) == stone, "recovery did not resume after dismount")
+        } finally {
+            service.close()
+            Files.deleteIfExists(directory)
+        }
         helper.succeed()
     }
 

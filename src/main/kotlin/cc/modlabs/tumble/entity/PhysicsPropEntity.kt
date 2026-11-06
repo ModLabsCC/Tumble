@@ -155,7 +155,7 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
     override fun canBeCollidedWith(other: Entity?) = false
     override fun isPickable() = true
 
-    private fun conversionPending(): Boolean = recoveryOrigin != null ||
+    private fun conversionPending(): Boolean =
         (level() as? ServerLevel)?.let { PhysicsServices.assemblyConversionPending(it, uuid) } == true
 
     override fun startRiding(entity: Entity, force: Boolean, sendEvent: Boolean): Boolean =
