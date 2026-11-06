@@ -235,26 +235,28 @@ class PhysicsPropManager(
         entityLoaded(entity, level)
         failedAssemblyConversions.remove(entity.uuid)
         val removed = ArrayList<ConvertedBlock>(captured.size)
+        var removalFailed = false
         try {
             for (block in captured) {
                 if (level.getBlockState(block.position) != block.state) {
-                    abortAssemblyConversion(entity, level, removed)
-                    return null
+                    removalFailed = true
+                    break
                 }
                 removed += block
                 if (!level.setBlock(block.position, Blocks.AIR.defaultBlockState(), CONVERSION_FLAGS)) {
-                    abortAssemblyConversion(entity, level, removed)
-                    return null
+                    removalFailed = true
+                    break
                 }
             }
-            terrain.primeForPositions(level, positions)
-            activateEntity(entity, level)
+            if (!removalFailed) {
+                terrain.primeForPositions(level, positions)
+                activateEntity(entity, level)
+            }
         } catch (error: Exception) {
             logger.error("Failed to convert assembly at {}", origin, error)
-            abortAssemblyConversion(entity, level, removed)
-            return null
+            removalFailed = true
         }
-        if (!entity.physicsPending && entity.runtimeBodyId == null) {
+        if (removalFailed || !entity.physicsPending && entity.runtimeBodyId == null) {
             abortAssemblyConversion(entity, level, removed)
             return null
         }
@@ -277,14 +279,19 @@ class PhysicsPropManager(
 
     private fun checkpointConversion(id: UUID, level: ServerLevel) {
         if (id !in recoveryRecords) return
-        val failures = journalFailureEpoch.getValue(id)
-        check(chunkIoFailures.get() == failures) { "A chunk I/O failure occurred during assembly conversion $id; journal retained" }
-        level.save(null, true, false)
-        check(chunkIoFailures.get() == failures) { "Could not save assembly conversion $id; journal retained" }
-        conversionJournal.complete(id)
-        recoveryRecords.remove(id)
-        journalRecords.remove(id)
-        journalFailureEpoch.remove(id)
+        try {
+            val failures = journalFailureEpoch.getValue(id)
+            check(chunkIoFailures.get() == failures) { "A chunk I/O failure occurred during assembly conversion $id; journal retained" }
+            level.save(null, true, false)
+            check(chunkIoFailures.get() == failures) { "Could not save assembly conversion $id; journal retained" }
+            conversionJournal.complete(id)
+            recoveryRecords.remove(id)
+            journalRecords.remove(id)
+            journalFailureEpoch.remove(id)
+        } catch (error: Exception) {
+            server.halt(false)
+            throw error
+        }
     }
 
     internal fun recoverConversions() {
