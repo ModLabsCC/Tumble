@@ -952,8 +952,12 @@ class AssemblyGameTests {
             when (phase) {
                 0 -> {
                     val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
-                    helper.assertTrue(assembly.uuid in ready && other.uuid in ready, "physics bodies are not ready")
+                    helper.assertTrue(assembly.uuid in ready && other.uuid in ready &&
+                        TumbleApi.status(helper.level, assembly.uuid) == TumbleApi.PropStatus.READY &&
+                        TumbleApi.status(helper.level, other.uuid) == TumbleApi.PropStatus.READY, "physics bodies are not ready")
+                    player.setPos(assembly.x, assembly.y, assembly.z + 2.0)
                     val selected = runtime.manager.useToolGun(player, assembly)
+                    player.setPos(other.x, other.y, other.z + 2.0)
                     val welded = runtime.manager.useToolGun(player, other)
                     weldFailure = "selection=$selected, connection=$welded, mode=$mode, root=${TumbleApi.status(helper.level, assembly.uuid)}, other=${TumbleApi.status(helper.level, other.uuid)}"
                     if (selected != ToolGunResult.SELECTED || welded != ToolGunResult.APPLIED) phase = 5

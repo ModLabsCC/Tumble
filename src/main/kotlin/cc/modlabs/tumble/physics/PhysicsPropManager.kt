@@ -807,7 +807,7 @@ class PhysicsPropManager(
         if (!service.submit(PhysicsCommand.DestroyBody(dimension, bodyId))) return false
         toolConnections.removeIf { it.contains(prop.uuid) }
         confirmedToolConnections.removeIf { it.contains(prop.uuid) }
-        pendingConnections.entries.removeIf { it.value.key.contains(prop.uuid) }
+        cancelPendingConnections { it.key.contains(prop.uuid) }
         val removedWelds = activeWelds.filter { it.contains(prop.uuid) }.toSet()
         activeWelds.removeAll(removedWelds)
         weldHistoryByPlayer.values.forEach { history -> history.removeIf(removedWelds::contains) }
@@ -2392,7 +2392,10 @@ class PhysicsPropManager(
                 }
                 is PhysicsAcknowledgement.ConnectionPrepared -> {
                     val pending = pendingConnections[acknowledgement.requestId]
-                    if (pending == null) continue
+                    if (pending == null) {
+                        releasePreparedConnection(acknowledgement.requestId)
+                        continue
+                    }
                     val frames = acknowledgement.frames
                     if (frames == null) {
                         failConnection(acknowledgement.requestId, pending)
