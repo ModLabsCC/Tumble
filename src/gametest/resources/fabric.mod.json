@@ -16,6 +16,7 @@
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.RemovalRestartGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyTerrainGameTests" },
+      { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.PistonLoadGameTests" },
       {
         "adapter": "kotlin",
         "value": "cc.modlabs.tumble.gametest.TumbleGameTests"

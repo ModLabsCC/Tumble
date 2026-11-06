@@ -10,6 +10,7 @@
     "PistonBaseBlockMixin",
     "PistonMovingBlockEntityMixin",
     "ShulkerBoxBlockEntityMixin",
+    "PistonMovingDataLoadMixin",
     "ServerExplosionMixin"
   ],
   "injectors": {
