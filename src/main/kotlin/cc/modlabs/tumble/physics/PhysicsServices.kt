@@ -65,6 +65,7 @@ object PhysicsServices {
     }
 
     fun recoverConversions(server: MinecraftServer) {
+        runtimes[server]?.manager?.recoverPlacements()
         runtimes[server]?.manager?.recoverConversions()
     }
 

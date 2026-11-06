@@ -195,3 +195,22 @@ tasks.register('runAssemblyRestartTest') {
         }
     }
 }
+
+['inject', 'verify'].each { phase ->
+    tasks.register("runPlacementCrash${phase.capitalize()}", net.fabricmc.loom.task.prod.ServerProductionRunTask) {
+        outputs.upToDateWhen { false }
+        installerVersion = '1.1.2'
+        runDir = layout.buildDirectory.dir('run/placementCrash').get().asFile
+        jvmArgs.add('-Dfabric-api.gametest')
+        jvmArgs.add("-Dfabric-api.gametest.filter=tumble_test:placement_restart_game_tests_${phase}")
+        jvmArgs.add("-Dtumble.placement.stage=${providers.gradleProperty('placementCrashStage').getOrElse('prepared')}")
+        jvmArgs.add("-Dtumble.placement.flush=${providers.gradleProperty('placementCrashFlush').getOrElse('none')}")
+        doFirst {
+            if (!providers.gradleProperty('acceptMinecraftEula').map { it.toBoolean() }.getOrElse(false)) throw new GradleException('Pass -PacceptMinecraftEula=true')
+            def directory = runDir.get().asFile
+            directory.mkdirs()
+            if (phase == 'inject') project.delete(new File(directory, 'world'), new File(directory, 'placement-crash-reached.txt'), new File(directory, 'placement-crash-ids.txt'))
+            new File(directory, 'eula.txt').text = 'eula=true\n'
+        }
+    }
+}

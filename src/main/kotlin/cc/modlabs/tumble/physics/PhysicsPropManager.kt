@@ -112,8 +112,12 @@ class PhysicsPropManager(
     private val conversionJournal = AssemblyConversionJournal(journalDirectory)
     private val journalRecords = conversionJournal.pending().toMutableMap()
     private val recoveryRecords = journalRecords.mapValuesTo(mutableMapOf()) { AssemblyRecoveryRecord.decode(it.value.payload) }
+    private val placementJournal = AssemblyConversionJournal(server.getWorldPath(LevelResource.ROOT).resolve("tumble-prop-placement-journal"))
+    private val placementStages = placementJournal.pending().toMutableMap()
+    private val placementRecords = placementStages.mapValuesTo(mutableMapOf()) { PropPlacementRecord.decode(it.value.payload) }
     private val journalFailureEpoch = recoveryRecords.keys.associateWithTo(mutableMapOf()) { 0L }
     private val conversionLocks = mutableMapOf<Pair<String, BlockPos>, UUID>()
+    private val placementLocks = mutableMapOf<Pair<String, BlockPos>, UUID>()
     private var conversionWritePermit: Pair<UUID, Pair<String, BlockPos>>? = null
     private val failedAssemblyConversions = linkedSetOf<UUID>()
     private val pendingItemConversions = mutableMapOf<UUID, ConvertedItem>()
@@ -133,6 +137,11 @@ class PhysicsPropManager(
 
     init {
         recoveryRecords.forEach { (id, record) -> lockConversion(id, record) }
+        placementRecords.forEach { (id, record) ->
+            val key = record.dimension to record.position
+            check(key !in conversionLocks && placementLocks.putIfAbsent(key, id) == null) { "Overlapping placement recovery journals" }
+            pendingBlockPlacements += id
+        }
         submitNativeTuning()
     }
 
@@ -184,7 +193,7 @@ class PhysicsPropManager(
         ) return null
         val selected = positions.map { it.immutable() }
         if (selected.isEmpty() || selected.size > AssemblyDefinition.MAX_BLOCKS || selected.toSet().size != selected.size ||
-            selected.any { (level.physicsDimensionId().value to it) in conversionLocks }
+            selected.any { (level.physicsDimensionId().value to it) in conversionLocks || (level.physicsDimensionId().value to it) in placementLocks }
         ) return null
         val origin = selected.first()
         if (player.distanceToSqr(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5) > PHYSICS_GUN_REACH_SQUARED) return null
@@ -329,8 +338,16 @@ class PhysicsPropManager(
     }
 
     fun conversionWriteBlocked(level: ServerLevel, position: BlockPos, state: BlockState): Boolean {
-        if (conversionLocks.isEmpty()) return false
+        if (conversionLocks.isEmpty() && placementLocks.isEmpty()) return false
         val key = level.physicsDimensionId().value to position
+        val placementOwner = placementLocks[key]
+        if (placementOwner != null) {
+            if (conversionWritePermit == (placementOwner to key)) {
+                conversionWritePermit = null
+                return false
+            }
+            return true
+        }
         val owner = conversionLocks[key] ?: return false
         if (conversionWritePermit == (owner to key)) {
             conversionWritePermit = null
@@ -343,12 +360,12 @@ class PhysicsPropManager(
         return true
     }
 
-    fun assemblyConversionPending(id: UUID): Boolean = recoveryRecords[id]?.passengerSafe == true
+    fun assemblyConversionPending(id: UUID): Boolean = recoveryRecords[id]?.passengerSafe == true || id in pendingBlockPlacements
 
-    private fun setConversionBlock(block: ConvertedBlock, state: BlockState, owner: UUID): Boolean {
+    private fun setConversionBlock(block: ConvertedBlock, state: BlockState, owner: UUID, flags: Int = CONVERSION_FLAGS): Boolean {
         check(conversionWritePermit == null)
         conversionWritePermit = owner to (block.level.physicsDimensionId().value to block.position)
-        return try { block.level.setBlock(block.position, state, CONVERSION_FLAGS) }
+        return try { block.level.setBlock(block.position, state, flags) }
         finally { conversionWritePermit = null }
     }
 
@@ -423,6 +440,65 @@ class PhysicsPropManager(
         }
     }
 
+    internal fun recoverPlacements() {
+        for ((id, record) in placementRecords.toMap()) {
+            val level = server.allLevels.firstOrNull { it.physicsDimensionId().value == record.dimension }
+                ?: error("Missing dimension for prop placement $id")
+            check(PhysicsServices.chunkIoFailureCount(server) == 0L) { "Chunk I/O failed before prop placement recovery $id" }
+            val chunk = ChunkPos(record.position.x shr 4, record.position.z shr 4)
+            val wasForced = level.forceLoadedChunks.contains(chunk.pack())
+            try {
+                level.setChunkForced(chunk.x, chunk.z, true)
+                level.getChunk(chunk.x, chunk.z)
+                level.waitForEntities(chunk, 0)
+                check(PhysicsServices.chunkIoFailureCount(server) == 0L) { "Could not load prop placement $id" }
+                val found = level.getEntityInAnyDimension(id)
+                val entity = found as? PhysicsPropEntity
+                check(found == null || entity != null && entity.level() === level && entity.assembly == null &&
+                    entity.blockState == record.placed && !entity.isPassenger && entity.passengers.isEmpty()) {
+                    "Prop for placement $id is inconsistent; journal retained"
+                }
+                val current = level.getBlockState(record.position)
+                check(current == record.previous || current == record.placed) { "Prop placement $id is obstructed; journal retained" }
+                val block = ConvertedBlock(level, record.position, record.previous)
+                val committed = placementStages.getValue(id).started
+                if (!committed) {
+                    check(entity != null) { "Prepared prop $id is absent; journal retained" }
+                    if (current != record.previous) check(setConversionBlock(block, record.previous, id)) { "Could not undo prop placement $id" }
+                } else {
+                    if (current != record.placed) check(setConversionBlock(block, record.placed, id, Block.UPDATE_ALL)) { "Could not finish prop placement $id" }
+                    check(tombstoneConnections(level) { it.first == id || it.second == id }) { "Could not unlink prop placement $id" }
+                    if (entity != null) {
+                        check(entityUnloaded(entity, level)) { "Could not remove prop placement $id" }
+                        entity.discard()
+                    }
+                }
+                checkpointPlacement(id, level)
+                if (!committed && entity != null) {
+                    entity.physicsPending = false
+                    activateEntity(entity, level)
+                }
+            } finally {
+                if (!wasForced) level.setChunkForced(chunk.x, chunk.z, false)
+            }
+        }
+    }
+
+    private fun checkpointPlacement(id: UUID, level: ServerLevel) {
+        try {
+            check(PhysicsServices.chunkIoFailureCount(server) == 0L) { "Chunk I/O failed during prop placement $id" }
+            level.save(null, true, false)
+            check(PhysicsServices.chunkIoFailureCount(server) == 0L) { "Could not save prop placement $id" }
+            placementJournal.complete(id)
+            placementRecords.remove(id)?.let { placementLocks.remove(it.dimension to it.position, id) }
+            placementStages.remove(id)
+            pendingBlockPlacements.remove(id)
+        } catch (error: Exception) {
+            server.halt(false)
+            throw error
+        }
+    }
+
     private fun restoreJournalBlocks(id: UUID, record: AssemblyRecoveryRecord, level: ServerLevel): Boolean {
         val blocks = record.definition.blocks.map {
             ConvertedBlock(level, record.origin.offset(it.offset), it.state)
@@ -448,6 +524,7 @@ class PhysicsPropManager(
                 !level.getBlockState(position).canBeReplaced()
             ) return false
             val component = componentFor(level, prop.uuid)
+            if (component.size > 1) return placeConnectedPropAsBlock(prop, level, position, component)
             if (component.any { it in pendingBlockPlacements }) return false
             pendingBlockPlacements.addAll(component)
             try {
@@ -479,6 +556,73 @@ class PhysicsPropManager(
         prop.setDeltaMovement(Vec3.ZERO)
         prop.angularVelocity = PhysicsVector.ZERO
         return true
+    }
+
+    private fun placeConnectedPropAsBlock(prop: PhysicsPropEntity, level: ServerLevel, position: BlockPos, component: Set<UUID>): Boolean {
+        val previous = level.getBlockState(position)
+        val key = level.physicsDimensionId().value to position.immutable()
+        if (prop.isRemoved || prop.blockState.isAir || prop.blockState.hasBlockEntity() || !level.isInWorldBounds(position) || !previous.isAir || prop.isPassenger || prop.passengers.isNotEmpty() ||
+            PhysicsServices.chunkIoFailureCount(server) != 0L || key in conversionLocks || key in placementLocks ||
+            component.any { it in pendingBlockPlacements }
+        ) return false
+        pendingBlockPlacements.addAll(component)
+        placementLocks[key] = prop.uuid
+        try {
+            try {
+                val updates = componentCheckpointUpdates(level, component, activeConnections(level))
+                    ?: error("Connected prop checkpoint is not ready")
+                journal.putAll(updates)
+                level.save(null, true, false)
+                check(PhysicsServices.chunkIoFailureCount(server) == 0L) { "Chunk I/O failed before prop placement" }
+            } catch (error: Exception) {
+                logger.error("Could not checkpoint connected prop before block placement", error)
+                return false
+            }
+            val record = PropPlacementRecord(level.physicsDimensionId().value, position.immutable(), previous, prop.blockState)
+            try {
+                placementJournal.prepare(prop.uuid, record.encode())
+            } catch (error: Exception) {
+                logger.error("Could not journal connected prop block placement", error)
+                return false
+            }
+            placementRecords[prop.uuid] = record
+            placementStages[prop.uuid] = AssemblyConversionJournal.Pending(record.encode(), false)
+            val placed = try {
+                setConversionBlock(ConvertedBlock(level, position, previous), prop.blockState, prop.uuid, Block.UPDATE_ALL)
+            } catch (error: Exception) {
+                server.halt(false)
+                throw error
+            }
+            if (!placed) {
+                if (level.getBlockState(position) != previous) {
+                    server.halt(false)
+                    return false
+                }
+                placementJournal.complete(prop.uuid)
+                placementStages.remove(prop.uuid)
+                placementRecords.remove(prop.uuid)
+                return false
+            }
+            try {
+                placementJournal.markStarted(prop.uuid)
+                placementStages[prop.uuid] = AssemblyConversionJournal.Pending(record.encode(), true)
+                check(tombstoneConnections(level) { it.first == prop.uuid || it.second == prop.uuid }) { "Could not unlink placed prop" }
+                parkForRecovery(level, component)
+                check(entityUnloaded(prop, level)) { "Could not remove placed prop" }
+                prop.discard()
+                checkpointPlacement(prop.uuid, level)
+                return true
+            } catch (error: Exception) {
+                logger.error("Connected prop placement did not complete; journal retained", error)
+                server.halt(false)
+                throw error
+            }
+        } finally {
+            if (prop.uuid !in placementRecords) {
+                placementLocks.remove(key, prop.uuid)
+                pendingBlockPlacements.removeAll(component)
+            }
+        }
     }
 
     private fun restoreConnectionsAfterFailedPlacement(connections: List<DurableConnection>) {
@@ -744,21 +888,27 @@ class PhysicsPropManager(
             val level = server.allLevels.firstOrNull { it.physicsDimensionId().value == record.dimension } ?: return@forEach
             val members = componentFor(level, record.first)
             visited += members
-            if (parkingGroups.values.any { group -> group.members.any { it in members } } ||
-                pendingConnections.values.any { it.first in members || it.second in members }) return@forEach
-            val frame = service.latestFrame(level.physicsDimensionId())
-            val states = members.mapNotNull { id ->
-                val prop = props[id]?.takeIf { it.level() === level && !it.isRemoved } ?: return@mapNotNull null
-                val body = prop.runtimeBodyId ?: return@mapNotNull null
-                val group = memberRestoreTokens[id]?.let(restoreGroups::get)
-                if (group != null && (!group.activated || frame.physicsStep <= group.activationAfterStep)) return@mapNotNull null
-                frame.bodies[body]?.toDurableState(id)
-            }
-            if (states.size != members.size) return@forEach
-            updates += records.filter { it.dimension == record.dimension && it.first in members && it.second in members }
-                .map { it.copy(checkpoint = states) }
+            updates += componentCheckpointUpdates(level, members, records) ?: return@forEach
         }
         if (updates.isNotEmpty()) journal.putAll(updates)
+    }
+
+    private fun componentCheckpointUpdates(
+        level: ServerLevel, members: Set<UUID>, records: List<DurableConnection>
+    ): List<DurableConnection>? {
+        if (!service.isRunning() || parkingGroups.values.any { group -> group.members.any { it in members } } ||
+            pendingConnections.values.any { it.first in members || it.second in members }) return null
+        val frame = service.latestFrame(level.physicsDimensionId())
+        val states = members.mapNotNull { id ->
+            val prop = props[id]?.takeIf { it.level() === level && !it.isRemoved } ?: return@mapNotNull null
+            val body = prop.runtimeBodyId ?: return@mapNotNull null
+            val group = memberRestoreTokens[id]?.let(restoreGroups::get)
+            if (group != null && (!group.activated || frame.physicsStep <= group.activationAfterStep)) return@mapNotNull null
+            frame.bodies[body]?.toDurableState(id)
+        }
+        if (states.size != members.size) return null
+        return records.filter { it.dimension == level.physicsDimensionId().value && it.first in members && it.second in members }
+            .map { it.copy(checkpoint = states) }
     }
 
     fun connectionRelationshipsBlocked(id: UUID): Boolean = id in props &&
@@ -927,6 +1077,10 @@ class PhysicsPropManager(
         unloadedTerrainWaits.filter { it.level === level && it.propId == entity.uuid }.forEach { it.observedUnload = true }
         if (entity.assembly != null) assemblies[entity.uuid] = entity
         associations.register(entity.uuid)
+        if (entity.uuid in placementRecords) {
+            entity.physicsPending = true
+            return
+        }
         recoveryRecords[entity.uuid]?.let { entity.recoveryOrigin = it.origin }
         val recoveryOrigin = entity.recoveryOrigin
         val recoveryStructure = entity.assembly

@@ -10,6 +10,7 @@
       "cc.modlabs.tumble.TumbleAddonGameTest",
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyRestartGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.ConnectionCrashGameTests" },
+      { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.PlacementRestartGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyTerrainGameTests" },
       {
