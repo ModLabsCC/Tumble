@@ -163,6 +163,20 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
     override fun canBeCollidedWith(other: Entity?) = false
     override fun isPickable() = true
 
+    override fun remove(reason: RemovalReason) {
+        val serverLevel = level() as? ServerLevel
+        if (serverLevel != null && (reason == RemovalReason.KILLED || reason == RemovalReason.DISCARDED) &&
+            !PhysicsServices.beforePropRemoval(this, serverLevel)
+        ) return
+        super.remove(reason)
+    }
+
+    override fun teleport(transition: net.minecraft.world.level.portal.TeleportTransition): Entity? {
+        val serverLevel = level() as? ServerLevel
+        if (serverLevel != null && !PhysicsServices.canTeleportProp(this, serverLevel, transition.newLevel())) return null
+        return super.teleport(transition)
+    }
+
     private fun passengerRelationshipsBlocked(): Boolean =
         (level() as? ServerLevel)?.let {
             PhysicsServices.assemblyConversionPending(it, uuid) || PhysicsServices.connectionRelationshipsBlocked(it, uuid)
