@@ -203,6 +203,7 @@ tasks.register('runAssemblyRestartTest') {
         runDir = layout.buildDirectory.dir('run/placementCrash').get().asFile
         jvmArgs.add('-Dfabric-api.gametest')
         jvmArgs.add("-Dfabric-api.gametest.filter=tumble_test:placement_restart_game_tests_${phase}")
+        jvmArgs.add("-Dtumble.placement.phase=${phase}")
         jvmArgs.add("-Dtumble.placement.stage=${providers.gradleProperty('placementCrashStage').getOrElse('prepared')}")
         jvmArgs.add("-Dtumble.placement.flush=${providers.gradleProperty('placementCrashFlush').getOrElse('none')}")
         doFirst {

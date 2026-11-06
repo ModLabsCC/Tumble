@@ -2397,9 +2397,18 @@ class PhysicsPropManager(
                         snapshots.forEach { (id, snapshot) -> props.getValue(id).let { it.applySnapshot(it.lastAppliedStep + 1, snapshot) } }
                         level.save(null, true, false)
                         check(PhysicsServices.chunkIoFailureCount(server) == failures) { "Connection endpoint checkpoint failed" }
-                        check(members.all { id -> props[id]?.let {
-                            !it.isRemoved && it.level() === level && !it.isPassenger && it.passengers.isEmpty()
-                        } == true }) { "Connection endpoint changed or gained passengers during checkpoint" }
+                        val changed = members.mapNotNull { id ->
+                            val prop = props[id]
+                            when {
+                                prop == null -> "$id missing"
+                                prop.isRemoved -> "$id removed"
+                                prop.level() !== level -> "$id changed level"
+                                prop.isPassenger -> "$id is a passenger"
+                                prop.passengers.isNotEmpty() -> "$id carries passengers"
+                                else -> null
+                            }
+                        }
+                        check(changed.isEmpty()) { "Connection endpoint changed during checkpoint: $changed" }
                         val previous = activeConnections(level).filter { it.first in members && it.second in members }
                         journal.putAll(previous.map { it.copy(checkpoint = checkpoint) } + record)
                         pending.record = record

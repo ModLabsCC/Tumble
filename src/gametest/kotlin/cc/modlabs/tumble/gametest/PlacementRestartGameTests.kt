@@ -30,6 +30,7 @@ class PlacementRestartGameTests {
 
     @GameTest(maxTicks = 1200)
     fun inject(helper: GameTestHelper) {
+        if (System.getProperty("tumble.placement.phase") != "inject") return helper.succeed()
         val level = helper.level
         level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
         level.getChunkAt(origin)
@@ -72,6 +73,7 @@ class PlacementRestartGameTests {
 
     @GameTest(maxTicks = 1200)
     fun verify(helper: GameTestHelper) {
+        if (System.getProperty("tumble.placement.phase") != "verify") return helper.succeed()
         val lines = Files.readAllLines(idFile)
         val first = UUID.fromString(lines[0])
         val second = UUID.fromString(lines[1])
