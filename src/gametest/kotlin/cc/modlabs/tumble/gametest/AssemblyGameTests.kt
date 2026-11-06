@@ -970,7 +970,15 @@ class AssemblyGameTests {
                         val lock = lockField.get(runtime.service) as java.util.concurrent.locks.ReentrantLock
                         lock.lock()
                         try {
+                            val lockDeadline = System.nanoTime() + 5_000_000_000L
+                            while (!lock.hasQueuedThreads() && System.nanoTime() < lockDeadline) Thread.sleep(1)
+                            helper.assertTrue(lock.hasQueuedThreads(), "physics worker did not reach the step boundary")
                             runtime.manager.tick()
+                            val pendingField = runtime.manager.javaClass.getDeclaredField("pendingConnections").apply { isAccessible = true }
+                            val pending = (pendingField.get(runtime.manager) as Map<*, *>)[prepared.requestId]
+                                ?: return@succeedWhen helper.assertTrue(false, "installation was not pending")
+                            val record = pending.javaClass.getDeclaredField("record").apply { isAccessible = true }.get(pending)
+                            helper.assertTrue(record != null, "connection was not durable before unload")
                             reloadOther(frame.physicsStep, otherFirst = true)
                             queue.add(PhysicsAcknowledgement.ConnectionCreated(prepared.requestId, false))
                         } finally {
