@@ -39,4 +39,3 @@ abstract class RemovalManagerCrashMixin {
         RemovalCrashHook.crash("checkpointed", null);
     }
 }
-
