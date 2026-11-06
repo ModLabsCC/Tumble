@@ -55,6 +55,14 @@ object PhysicsServices {
         runtimes[server]?.service?.submit(PhysicsCommand.RemoveDimension(level.physicsDimensionId()))
     }
 
+    fun recoverConversions(server: MinecraftServer) {
+        runtimes[server]?.manager?.recoverConversions()
+    }
+
+    fun chunkIoFailed(server: MinecraftServer) {
+        runtimes[server]?.manager?.chunkIoFailed()
+    }
+
     fun entityLoaded(entity: Entity, level: ServerLevel) {
         runtimes[level.server]?.manager?.let { manager ->
             if (entity is ItemEntity) manager.itemLoaded(entity, level)

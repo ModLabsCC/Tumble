@@ -31,6 +31,7 @@ import cc.modlabs.tumble.network.AssemblyPayload
 import com.mojang.serialization.JsonOps
 import io.netty.buffer.Unpooled
 import java.util.UUID
+import java.nio.file.Files
 import java.util.concurrent.ConcurrentLinkedQueue
 import org.slf4j.LoggerFactory
 import net.fabricmc.fabric.api.gametest.v1.GameTest
@@ -542,6 +543,34 @@ class AssemblyGameTests {
             }
             helper.assertTrue(false, "waiting for terrain pause, phase=$phase")
         }
+    }
+
+    @GameTest
+    fun journalWriteFailureDoesNotRemoveBlocks(helper: GameTestHelper) {
+        val origin = BlockPos(2400, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val logger = LoggerFactory.getLogger("assembly-journal-write-failure-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        val directory = Files.createTempDirectory("tumble-journal-test")
+        val blocked = directory.resolve("journal")
+        try {
+            val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning(), blocked)
+            Files.writeString(blocked, "obstruction")
+            val method = manager.javaClass.declaredMethods.single { it.name.startsWith("convertAssembly") && it.parameterCount == 4 }
+            helper.assertTrue(method.invoke(manager, helper.level, listOf(origin), player, false) == null,
+                "conversion accepted a failed journal write")
+            helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE), "journal write failure removed a block")
+            helper.assertTrue(Files.readString(blocked) == "obstruction", "journal write overwrote another file")
+        } finally {
+            service.close()
+            Files.deleteIfExists(blocked)
+            Files.deleteIfExists(directory)
+        }
+        helper.succeed()
     }
 
     @GameTest

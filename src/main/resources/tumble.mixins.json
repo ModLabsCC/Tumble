@@ -6,6 +6,7 @@
     "BlockItemMixin",
     "EntityMovementMixin",
     "LevelChunkMixin",
+    "MinecraftServerMixin",
     "PistonBaseBlockMixin",
     "ServerExplosionMixin"
   ],
