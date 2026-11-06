@@ -52,13 +52,16 @@ import net.minecraft.world.level.storage.TagValueOutput
 
 class AssemblyGameTests {
     @GameTest(maxTicks = 1200)
-    fun linkedPropReloadWaitsForMissingAssemblyTerrain(helper: GameTestHelper) = checkLinkedReload(helper, false)
+    fun linkedPropReloadWaitsForMissingAssemblyTerrain(helper: GameTestHelper) = checkLinkedReload(helper, 0)
 
     @GameTest(maxTicks = 1200)
-    fun immediatelySavedLinkedPropWaitsForMissingAssemblyTerrain(helper: GameTestHelper) = checkLinkedReload(helper, true)
+    fun immediatelySavedLinkedPropWaitsForMissingAssemblyTerrain(helper: GameTestHelper) = checkLinkedReload(helper, 1)
 
-    private fun checkLinkedReload(helper: GameTestHelper, immediate: Boolean) {
-        val origin = BlockPos(if (immediate) 3232 else 3104, 50, 0)
+    @GameTest(maxTicks = 1200)
+    fun linkedPropSavedBeforeVisibilityChangesWaitsForAssembly(helper: GameTestHelper) = checkLinkedReload(helper, 2)
+
+    private fun checkLinkedReload(helper: GameTestHelper, ordering: Int) {
+        val origin = BlockPos(3104 + ordering * 128, 50, 0)
         val remote = origin.offset(32, 0, 0)
         for (position in listOf(origin, remote)) {
             helper.level.setChunkForced(position.x shr 4, 0, true)
@@ -89,13 +92,20 @@ class AssemblyGameTests {
         var checkpoint = 0L
         var weldFailure = "none"
         var undoWhilePaused: Boolean? = null
-        fun reloadOther(step: Long) {
+        fun reloadOther(step: Long, otherFirst: Boolean = false) {
             val saved = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
             other.saveWithoutId(saved)
+            if (otherFirst) {
+                runtime.manager.entityUnloaded(other, helper.level, true)
+                other.discard()
+            }
             runtime.manager.entityUnloaded(assembly, helper.level, true)
             assembly.discard()
-            runtime.manager.entityUnloaded(other, helper.level, true)
-            other.discard()
+            if (otherFirst) PhysicsServices.chunkUnloaded(helper.level, remote.x shr 4, 0)
+            else {
+                runtime.manager.entityUnloaded(other, helper.level, true)
+                other.discard()
+            }
             val restored = TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)
                 ?: error("could not reload linked prop")
             restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), saved.buildResult()))
@@ -121,12 +131,15 @@ class AssemblyGameTests {
                     phase = 1
                 }
                 1 -> if (frame.physicsStep - checkpoint >= 10) {
-                    PhysicsServices.chunkUnloaded(helper.level, remote.x shr 4, 0)
-                    helper.assertTrue(TumbleApi.status(helper.level, assembly.uuid) == TumbleApi.PropStatus.PAUSED, "assembly did not enter terrain wait")
-                    if (undoWhilePaused == null) undoWhilePaused = runtime.manager.undoToolGunWeld(player)
-                    helper.assertTrue(undoWhilePaused == false, "undo broke a terrain-paused group")
-                    checkpoint = frame.physicsStep
-                    if (immediate) reloadOther(frame.physicsStep) else phase = 2
+                    if (ordering == 2) reloadOther(frame.physicsStep, otherFirst = true)
+                    else {
+                        PhysicsServices.chunkUnloaded(helper.level, remote.x shr 4, 0)
+                        helper.assertTrue(TumbleApi.status(helper.level, assembly.uuid) == TumbleApi.PropStatus.PAUSED, "assembly did not enter terrain wait")
+                        if (undoWhilePaused == null) undoWhilePaused = runtime.manager.undoToolGunWeld(player)
+                        helper.assertTrue(undoWhilePaused == false, "undo broke a terrain-paused group")
+                        checkpoint = frame.physicsStep
+                        if (ordering == 1) reloadOther(frame.physicsStep) else phase = 2
+                    }
                 }
                 2 -> if (frame.physicsStep - checkpoint >= 40) {
                     val snapshot = TumbleApi.snapshot(helper.level, other.uuid)
