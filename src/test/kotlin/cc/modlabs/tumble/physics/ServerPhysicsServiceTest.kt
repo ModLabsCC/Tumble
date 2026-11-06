@@ -13,6 +13,207 @@ import org.slf4j.LoggerFactory
 
 class ServerPhysicsServiceTest {
     @Test
+    fun `consecutive invalidations coalesce without crossing replacements or spawn barriers`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:invalidation-order")
+        val section = PhysicsSectionPosition(0, 0, 0)
+        service.start()
+        try {
+            val lock = service.javaClass.getDeclaredField("stepBoundary").apply { isAccessible = true }.get(service) as java.util.concurrent.locks.ReentrantLock
+            lock.lock()
+            try {
+                repeat(2000) { assertTrue(service.submit(PhysicsCommand.InvalidateTerrainSection(dimension, section))) }
+                service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, section, emptyList()))
+                repeat(2000) { assertTrue(service.submit(PhysicsCommand.InvalidateTerrainSection(dimension, section))) }
+                service.submitSuspendedSpawn(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, bodyDefinition()))
+                val queue = service.javaClass.getDeclaredField("commands").apply { isAccessible = true }.get(service) as java.util.concurrent.ConcurrentLinkedQueue<*>
+                val ordered = queue.map { item -> requireNotNull(item).javaClass.getDeclaredField("command").apply { isAccessible = true }.get(item) }
+                assertEquals(5, ordered.size, "duplicate invalidations were not coalesced")
+                assertTrue(ordered[0] is PhysicsCommand.InvalidateTerrainSection && ordered[1] is PhysicsCommand.ReplaceTerrainSection &&
+                    ordered[2] is PhysicsCommand.InvalidateTerrainSection && ordered[3] is PhysicsCommand.SpawnBody &&
+                    ordered[4] is PhysicsCommand.SuspendProp, "terrain or spawn/suspend FIFO ordering changed")
+            } finally { lock.unlock() }
+            waitUntil { service.debugState().queuedCommands == 0 }
+        } finally { service.close() }
+    }
+
+    @Test
+    fun `barrier admission bounds queued invalidations and releases producers`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:bounded-invalidations")
+        val maxQueued = java.util.concurrent.atomic.AtomicInteger()
+        val completed = java.util.concurrent.atomic.AtomicBoolean()
+        service.start()
+        try {
+            val lock = service.javaClass.getDeclaredField("stepBoundary").apply { isAccessible = true }.get(service) as java.util.concurrent.locks.ReentrantLock
+            val producer = Thread {
+                lock.lock()
+                try {
+                    repeat(3000) { index ->
+                        check(service.submit(PhysicsCommand.InvalidateTerrainSection(dimension, PhysicsSectionPosition(index, 0, 0))))
+                        maxQueued.accumulateAndGet(service.debugState().queuedCommands, ::maxOf)
+                    }
+                    completed.set(true)
+                } finally { lock.unlock() }
+            }.apply { isDaemon = true; start() }
+            producer.join(10_000)
+            assertTrue(completed.get() && !producer.isAlive, "barrier producer did not resume after backpressure")
+            assertTrue(maxQueued.get() <= 1024, "barrier queue exceeded its bound: ${maxQueued.get()}")
+            waitUntil { service.debugState().queuedCommands == 0 }
+        } finally { service.close() }
+    }
+
+    @Test
+    fun `normal backlog leaves barrier capacity and concurrent shutdown releases producers`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:shutdown-backlog")
+        val maxQueued = java.util.concurrent.atomic.AtomicInteger()
+        val done = java.util.concurrent.CountDownLatch(1)
+        val started = java.util.concurrent.CountDownLatch(1)
+        service.start()
+        val lock = service.javaClass.getDeclaredField("stepBoundary").apply { isAccessible = true }.get(service) as java.util.concurrent.locks.ReentrantLock
+        val producer = Thread {
+            try {
+                lock.lock()
+                try {
+                    repeat(960) { index ->
+                        check(service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, PhysicsSectionPosition(index, 0, 0), emptyList())))
+                    }
+                    started.countDown()
+                    // This waits for ordinary capacity and releases the reentrant lock.
+                    repeat(5000) { index ->
+                        if (!service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, PhysicsSectionPosition(index, 1, 0), emptyList()))) return@Thread
+                        maxQueued.accumulateAndGet(service.debugState().queuedCommands, ::maxOf)
+                    }
+                } finally { lock.unlock() }
+            } finally { done.countDown() }
+        }.apply { isDaemon = true; start() }
+        try {
+            assertTrue(started.await(5, java.util.concurrent.TimeUnit.SECONDS), "backlog was not established")
+            assertTrue(service.submit(PhysicsCommand.InvalidateTerrainSection(dimension, PhysicsSectionPosition(-1, 0, 0))), "reserved barrier could not be admitted")
+            val closer = Thread { service.close() }.apply { isDaemon = true; start() }
+            closer.join(10_000)
+            assertFalse(closer.isAlive, "shutdown stalled behind a command backlog")
+            assertTrue(done.await(5, java.util.concurrent.TimeUnit.SECONDS), "blocked producer did not exit after shutdown")
+            assertTrue(maxQueued.get() <= 1024, "total queue exceeded limit: ${maxQueued.get()}")
+            assertFalse(service.submit(PhysicsCommand.InvalidateTerrainSection(dimension, PhysicsSectionPosition(-2, 0, 0))), "submission accepted after shutdown")
+        } finally { service.close() }
+    }
+
+    @Test
+    fun `four consecutive interrupted scans require fail closed parking`() {
+        val restarts = TerrainScanRestarts(4)
+        repeat(3) { restarts.invalidated(); assertFalse(restarts.shouldPark()) }
+        restarts.invalidated()
+        assertTrue(restarts.shouldPark())
+        restarts.reset()
+        assertFalse(restarts.shouldPark())
+        repeat(3) { restarts.invalidated() }
+        restarts.reset() // A completed scan breaks the consecutive sequence.
+        restarts.invalidated()
+        assertFalse(restarts.shouldPark())
+    }
+
+    @Test
+    fun `nine connected assemblies larger than a terrain scan budget can advance`() = checkConnectedTerrainBudget(9, false)
+
+    @Test
+    fun `terrain scan restarts park a large component without starving unrelated physics`() = checkConnectedTerrainBudget(400, true)
+
+    private fun checkConnectedTerrainBudget(count: Int, stress: Boolean) {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:connected-terrain-budget")
+        val box = PhysicsAabb(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))
+        val guard = AssemblyTerrainGuard(List(110) { box }, 0, 2)
+        val definitions = (0 until count).map { index ->
+            bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(8.0 + 16.0 * index, 8.0, 8.0)))
+        }
+        val coverage = definitions.map { requireNotNull(AssemblyTerrainCoverage.calculate(guard, it.transform, PhysicsVector.ZERO, PhysicsVector.ZERO)) }
+        assertTrue(coverage.sumOf { it.visits } > 16_384, "fixture does not exceed the global scan budget")
+        val bodies = definitions.map { RestoreBody(UUID.randomUUID(), UUID.randomUUID(), it, guard) }
+        val frames = PhysicsJointFrames(PhysicsTransform(PhysicsVector(8.0, 0.0, 0.0)), PhysicsTransform(PhysicsVector(-8.0, 0.0, 0.0)))
+        val joints = (0 until count - 1).map { RestoredJoint(it, it + 1, PhysicsJointKind.WELD, frames) }
+        val token = PhysicsRestoreToken()
+        service.start()
+        try {
+            service.submit(PhysicsCommand.ConfigureWorlds(0.0, 1f, 18f))
+            coverage.flatMap { it.sections }.toSet().forEach { service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, it, emptyList())) }
+            service.submit(PhysicsCommand.RestoreComponent(dimension, bodies, joints, token))
+            var staged: PhysicsAcknowledgement.ComponentStaged? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.ComponentStaged)?.let { staged = it }; staged != null }
+            assertTrue(requireNotNull(staged).success, "component did not stage")
+            service.submit(PhysicsCommand.ActivateRestoredComponent(token))
+            var activated: PhysicsAcknowledgement.ComponentActivated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.ComponentActivated)?.let { activated = it }; activated != null }
+            assertTrue(requireNotNull(activated).success, "component did not activate")
+            val ids = requireNotNull(staged).bodies.map { it.bodyId }
+            val initial = service.latestFrame(dimension).physicsStep
+            waitUntil {
+                val frame = service.latestFrame(dimension)
+                frame.physicsStep >= initial + 10 && ids.all { frame.bodies[it]?.suspended == false }
+            }
+            if (!stress) return
+            val ordinaryDimension = PhysicsDimensionId("test:ordinary-progress")
+            service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), ordinaryDimension, bodyDefinition()))
+            var ordinary: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { ordinary = it }; ordinary != null }
+            val ordinaryBody = requireNotNull(ordinary).bodyId
+            fun whileCommands(command: () -> Unit, requireGuardedActive: Boolean, delayNanos: Long = 1_000_000L, extra: () -> Boolean = { true }) {
+                val active = java.util.concurrent.atomic.AtomicBoolean(true)
+                val producer = Thread {
+                    while (active.get()) {
+                        command()
+                        java.util.concurrent.locks.LockSupport.parkNanos(delayNanos)
+                    }
+                }.apply { isDaemon = true; start() }
+                try {
+                    val start = service.latestFrame(ordinaryDimension).physicsStep
+                    try {
+                        waitUntil { service.latestFrame(ordinaryDimension).physicsStep >= start + 10 && extra() }
+                    } catch (error: AssertionError) {
+                        val invalidations = service.javaClass.getDeclaredField("terrainScanInvalidations").apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong
+                        val fallbacks = service.javaClass.getDeclaredField("terrainScanFallbacks").apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong
+                        throw AssertionError("ordinary start=$start now=${service.latestFrame(ordinaryDimension).physicsStep} invalidations=${invalidations.get()} fallbacks=${fallbacks.get()} service=${service.debugState()}", error)
+                    }
+                    assertTrue(producer.isAlive, "producer stopped before ordinary physics advanced")
+                    if (requireGuardedActive) assertTrue(ids.all { service.latestFrame(dimension).bodies[it]?.suspended == false },
+                        "unrelated ordinary commands parked a guarded component")
+                } finally {
+                    active.set(false)
+                    producer.join(2000)
+                }
+            }
+            whileCommands({ service.submit(PhysicsCommand.SetLinearVelocity(ordinaryDimension, ordinaryBody, PhysicsVector(1.0, 0.0, 0.0))) }, true)
+            val unrelated = PhysicsSectionPosition(1000, 0, 0)
+            val invalidations = service.javaClass.getDeclaredField("terrainScanInvalidations").apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong
+            val fallbacks = service.javaClass.getDeclaredField("terrainScanFallbacks").apply { isAccessible = true }.get(service) as java.util.concurrent.atomic.AtomicLong
+            val beforeInvalidations = invalidations.get()
+            val beforeFallbacks = fallbacks.get()
+            val guardedStart = service.latestFrame(dimension).physicsStep
+            val alternatingMaxQueued = java.util.concurrent.atomic.AtomicInteger()
+            whileCommands({
+                service.submit(PhysicsCommand.InvalidateTerrainSection(dimension, unrelated))
+                service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, unrelated, emptyList()))
+                alternatingMaxQueued.accumulateAndGet(service.debugState().queuedCommands, ::maxOf)
+            }, false, 0L, {
+                val frame = service.latestFrame(dimension)
+                (fallbacks.get() > beforeFallbacks && ids.all { frame.bodies[it]?.suspended == true }) ||
+                    (frame.physicsStep >= guardedStart + 10 && ids.all { frame.bodies[it]?.suspended == false })
+            })
+            assertTrue(alternatingMaxQueued.get() <= 1024, "alternating terrain queue grew beyond its admission bound: ${alternatingMaxQueued.get()}")
+            println("terrain scan stress: invalidations=${invalidations.get() - beforeInvalidations}, fallbacks=${fallbacks.get() - beforeFallbacks}, maxQueued=${alternatingMaxQueued.get()}")
+            if (fallbacks.get() > beforeFallbacks) assertTrue(ids.all { service.latestFrame(dimension).bodies[it]?.suspended == true },
+                "fallback allowed an incompletely checked component to move")
+            ids.forEach { service.submit(PhysicsCommand.ResumeBody(dimension, it)) }
+            val resumed = service.latestFrame(dimension).physicsStep
+            waitUntil {
+                val frame = service.latestFrame(dimension)
+                frame.physicsStep >= resumed + 10 && ids.all { frame.bodies[it]?.suspended == false }
+            }
+        } finally { service.close() }
+    }
+
+    @Test
     fun `shutdown closes publisher and worker even when checkpoint fails`() {
         val primary = java.io.IOException("checkpoint failed")
         val cleanup = java.io.IOException("publisher close failed")
@@ -27,6 +228,243 @@ class ServerPhysicsServiceTest {
         kotlin.test.assertSame(primary, error)
         assertEquals(listOf("publisher", "worker"), closed)
         assertTrue(cleanup in error.suppressed)
+    }
+
+    @Test
+    fun `invalidated terrain retains collision for ordinary props until replacement`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:ordinary-collision-during-invalidation")
+        val section = PhysicsSectionPosition(0, 0, 0)
+        val wall = TerrainBlockGeometry(PhysicsBlockPosition(12, 8, 8), listOf(
+            TerrainBox(PhysicsBox(PhysicsVector(12.0, 8.0, 8.0), PhysicsVector(13.0, 9.0, 9.0)))
+        ))
+        service.start()
+        try {
+            service.submit(PhysicsCommand.ConfigureWorlds(0.0, 1f, 18f))
+            service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, section, listOf(wall)))
+            service.submit(PhysicsCommand.InvalidateTerrainSection(dimension, section))
+            val definition = bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(8.0, 8.5, 8.5)), linearVelocity = PhysicsVector(6.0, 0.0, 0.0))
+            service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, definition))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            val initialStep = service.latestFrame(dimension).physicsStep
+            waitUntil { service.latestFrame(dimension).physicsStep - initialStep >= 70 }
+            val snapshot = requireNotNull(service.latestFrame(dimension).bodies[body])
+            assertTrue(snapshot.transform.position.x in 8.5..11.6, "ordinary prop passed through invalidated wall: ${snapshot.transform.position.x}")
+        } finally { service.close() }
+    }
+
+    @Test
+    fun `guarded transform cannot rotate into uninstalled terrain`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:guarded-transform")
+        val guard = AssemblyTerrainGuard(listOf(
+            PhysicsAabb(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5)),
+            PhysicsAabb(PhysicsVector(11.5, -0.5, -0.5), PhysicsVector(12.5, 0.5, 0.5))
+        ), 0, 2)
+        val definition = bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(8.0, 8.0, 8.0)))
+        val target = PhysicsTransform(definition.transform.position, PhysicsRotation(0.0, 1.0, 0.0, 0.0))
+        val initial = requireNotNull(AssemblyTerrainCoverage.sections(guard, definition.transform, PhysicsVector.ZERO, PhysicsVector.ZERO))
+        val swept = requireNotNull(AssemblyTerrainCoverage.calculate(guard, definition.transform, PhysicsVector.ZERO, PhysicsVector.ZERO, target = target)).sections
+        assertTrue((swept - initial).isNotEmpty(), "fixture has no uninstalled swept terrain")
+        service.start()
+        try {
+            initial.forEach { service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, it, emptyList())) }
+            service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, definition, terrainGuard = guard))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            service.submit(PhysicsCommand.SetTransform(dimension, body, target))
+            waitUntil { service.latestFrame(dimension).bodies[body]?.suspended == true }
+            assertTrue(kotlin.math.abs(service.latestFrame(dimension).bodies.getValue(body).transform.rotation.w) > 0.99,
+                "rotation reached uninstalled terrain")
+            (swept - initial).forEach { service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, it, emptyList())) }
+            service.submit(PhysicsCommand.ResumeBody(dimension, body))
+            service.submit(PhysicsCommand.SetTransform(dimension, body, target))
+            waitUntil { service.latestFrame(dimension).bodies[body]?.transform?.rotation?.w?.let { kotlin.math.abs(it) < 0.01 } == true }
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun `global terrain budget rotates access among guarded bodies`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:terrain-budget-fairness")
+        val box = PhysicsAabb(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))
+        val guard = AssemblyTerrainGuard(List(100) { box }, 0, 2)
+        val definition = bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(8.0, 8.0, 8.0)), motionType = PhysicsMotionType.KINEMATIC)
+        val coverage = requireNotNull(AssemblyTerrainCoverage.calculate(guard, definition.transform, PhysicsVector.ZERO, PhysicsVector.ZERO))
+        assertTrue(coverage.visits * 10 > 16_384, "fixture does not exceed the global budget")
+        service.start()
+        try {
+            coverage.sections.forEach { service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, it, emptyList())) }
+            repeat(10) { service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, definition, terrainGuard = guard)) }
+            val ids = mutableSetOf<PhysicsBodyId>()
+            waitUntil {
+                (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { ids += it.bodyId }
+                ids.size == 10
+            }
+            val observed = mutableSetOf<PhysicsBodyId>()
+            waitUntil {
+                val frame = service.latestFrame(dimension)
+                ids.forEach { id ->
+                    frame.bodies[id]?.let { snapshot ->
+                        if (snapshot.suspended) service.submit(PhysicsCommand.ResumeBody(dimension, id)) else observed += id
+                    }
+                }
+                observed.size == ids.size
+            }
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun `over-budget staged assembly keeps its connected peer parked`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:staged-budget")
+        val token = PhysicsRestoreToken()
+        val guard = AssemblyTerrainGuard(listOf(PhysicsAabb(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))), 0, 2)
+        val assembly = bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(8.0, 8.0, 8.0)), linearVelocity = PhysicsVector(1000.0, 0.0, 0.0))
+        val peer = bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(10.0, 8.0, 8.0)))
+        val bodies = listOf(RestoreBody(UUID.randomUUID(), UUID.randomUUID(), assembly, guard), RestoreBody(UUID.randomUUID(), UUID.randomUUID(), peer))
+        val frames = PhysicsJointFrames(PhysicsTransform(PhysicsVector(1.0, 0.0, 0.0)), PhysicsTransform(PhysicsVector(-1.0, 0.0, 0.0)))
+        service.start()
+        try {
+            val baseline = requireNotNull(AssemblyTerrainCoverage.sections(guard, assembly.transform, PhysicsVector.ZERO, PhysicsVector.ZERO))
+            baseline.forEach { service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, it, emptyList())) }
+            assertEquals(null, AssemblyTerrainCoverage.sections(guard, assembly.transform, assembly.linearVelocity, assembly.angularVelocity))
+            service.submit(PhysicsCommand.RestoreComponent(dimension, bodies, listOf(RestoredJoint(0, 1, PhysicsJointKind.WELD, frames)), token))
+            var staged: PhysicsAcknowledgement.ComponentStaged? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.ComponentStaged)?.let { staged = it }; staged != null }
+            assertTrue(requireNotNull(staged).success)
+            service.submit(PhysicsCommand.ActivateRestoredComponent(token))
+            var activated: PhysicsAcknowledgement.ComponentActivated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.ComponentActivated)?.let { activated = it }; activated != null }
+            assertFalse(requireNotNull(activated).success, "over-budget component was activated")
+            val peerId = requireNotNull(staged).bodies[1].bodyId
+            waitUntil { service.latestFrame(dimension).bodies.containsKey(peerId) }
+            assertEquals(peer.transform.position, service.latestFrame(dimension).bodies[peerId]?.transform?.position)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun `staged guarded component cannot activate before terrain is installed`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:staged-terrain-gate")
+        val token = PhysicsRestoreToken()
+        val section = PhysicsSectionPosition(0, 0, 0)
+        val guard = AssemblyTerrainGuard(listOf(PhysicsAabb(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))), 0, 2)
+        val definition = bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(8.0, 8.0, 8.0)), linearVelocity = PhysicsVector(6.0, 0.0, 0.0))
+        val body = RestoreBody(UUID.randomUUID(), UUID.randomUUID(), definition, guard)
+        service.start()
+        try {
+            service.submit(PhysicsCommand.RestoreComponent(dimension, listOf(body), emptyList(), token))
+            var staged: PhysicsAcknowledgement.ComponentStaged? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.ComponentStaged)?.let { staged = it }; staged != null }
+            assertTrue(requireNotNull(staged).success)
+            service.submit(PhysicsCommand.ActivateRestoredComponent(token))
+            var activated: PhysicsAcknowledgement.ComponentActivated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.ComponentActivated)?.let { activated = it }; activated != null }
+            assertFalse(requireNotNull(activated).success, "component activated without its terrain")
+            requireNotNull(AssemblyTerrainCoverage.sections(guard, definition.transform, definition.linearVelocity, definition.angularVelocity))
+                .forEach { service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, it, emptyList())) }
+            service.submit(PhysicsCommand.ActivateRestoredComponent(token))
+            activated = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.ComponentActivated)?.let { activated = it }; activated != null }
+            assertTrue(requireNotNull(activated).success, "component did not activate after terrain installation")
+            val id = requireNotNull(staged).bodies.single().bodyId
+            waitUntil { service.latestFrame(dimension).bodies[id]?.transform?.position?.x?.let { it > 8.1 } == true }
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun `guarded assembly waits for installed terrain and stops before invalidated terrain`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:terrain-gate")
+        val prop = UUID.randomUUID()
+        val section = PhysicsSectionPosition(0, 0, 0)
+        val guard = AssemblyTerrainGuard(listOf(PhysicsAabb(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))), 0, 2)
+        service.start()
+        try {
+            val definition = bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(8.0, 8.0, 8.0)), linearVelocity = PhysicsVector(6.0, 0.0, 0.0))
+            service.submit(PhysicsCommand.SpawnBody(prop, dimension, definition, terrainGuard = guard))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            waitUntil { service.latestFrame(dimension).bodies[body]?.suspended == true }
+            assertEquals(8.0, service.latestFrame(dimension).bodies[body]?.transform?.position?.x)
+            repeat(3000) { service.submit(PhysicsCommand.RemoveTerrainSection(dimension, PhysicsSectionPosition(1000 + it, 0, 0))) }
+            requireNotNull(AssemblyTerrainCoverage.sections(guard, definition.transform, definition.linearVelocity, definition.angularVelocity))
+                .forEach { service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, it, emptyList())) }
+            service.submit(PhysicsCommand.ResumeBody(dimension, body))
+            waitUntil { service.latestFrame(dimension).bodies[body]?.transform?.position?.x?.let { it > 8.1 } == true }
+            repeat(3000) { service.submit(PhysicsCommand.RemoveTerrainSection(dimension, PhysicsSectionPosition(1000 + it, 0, 0))) }
+            service.submit(PhysicsCommand.InvalidateTerrainSection(dimension, section))
+            val before = service.latestFrame(dimension)
+            waitUntil { service.latestFrame(dimension).physicsStep > before.physicsStep }
+            assertTrue(service.latestFrame(dimension).bodies[body]?.suspended == true, "body stepped into invalidated terrain")
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun `guarded body collides with terrain installed behind a backlog`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:guarded-collision")
+        val section = PhysicsSectionPosition(0, 0, 0)
+        val guard = AssemblyTerrainGuard(listOf(PhysicsAabb(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))), 0, 2)
+        service.start()
+        try {
+            service.submit(PhysicsCommand.ConfigureWorlds(0.0, 1f, 18f))
+            val definition = bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(8.0, 8.5, 8.5)), linearVelocity = PhysicsVector(6.0, 0.0, 0.0))
+            service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, definition, terrainGuard = guard))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            waitUntil { service.latestFrame(dimension).bodies[body]?.suspended == true }
+            repeat(3000) { service.submit(PhysicsCommand.RemoveTerrainSection(dimension, PhysicsSectionPosition(1000 + it, 0, 0))) }
+            val wall = TerrainBlockGeometry(PhysicsBlockPosition(12, 8, 8), listOf(
+                TerrainBox(PhysicsBox(PhysicsVector(12.0, 8.0, 8.0), PhysicsVector(13.0, 9.0, 9.0)))
+            ))
+            requireNotNull(AssemblyTerrainCoverage.sections(guard, definition.transform, definition.linearVelocity, definition.angularVelocity))
+                .forEach { service.submit(PhysicsCommand.ReplaceTerrainSection(dimension, it, if (it == section) listOf(wall) else emptyList())) }
+            service.submit(PhysicsCommand.ResumeBody(dimension, body))
+            val initialStep = service.latestFrame(dimension).physicsStep
+            waitUntil { service.latestFrame(dimension).physicsStep - initialStep >= 70 }
+            val snapshot = requireNotNull(service.latestFrame(dimension).bodies[body])
+            assertTrue(snapshot.transform.position.x in 8.5..11.6, "guarded body passed through the installed wall: ${snapshot.transform.position.x}")
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun `oversized sweep holds the body rather than using partial coverage`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:terrain-budget")
+        val bounds = PhysicsAabb(PhysicsVector(255.5, 255.5, 255.5), PhysicsVector(256.5, 256.5, 256.5))
+        val guard = AssemblyTerrainGuard(listOf(bounds), -4, 20)
+        val definition = bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(0.5, 80.0, 0.5)), angularVelocity = PhysicsVector(20.0, 20.0, 0.0))
+        assertEquals(null, AssemblyTerrainCoverage.sections(guard, definition.transform, definition.linearVelocity, definition.angularVelocity))
+        service.start()
+        try {
+            service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, definition, terrainGuard = guard))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            waitUntil { service.latestFrame(dimension).bodies[body]?.suspended == true }
+            assertEquals(definition.transform.position, service.latestFrame(dimension).bodies[body]?.transform?.position)
+        } finally {
+            service.close()
+        }
     }
 
     @Test

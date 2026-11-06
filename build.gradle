@@ -148,7 +148,9 @@ tasks.register('runProductionGameTest', net.fabricmc.loom.task.prod.ServerProduc
 tasks.register('runRecoveryLifecycleTests') {
     dependsOn tasks.named('runIsolatedClearGameTest'), tasks.named('runIsolatedShutdownGameTest')
 }
-tasks.named('runProductionGameTest') { finalizedBy tasks.named('runRecoveryLifecycleTests') }
+if (!providers.gradleProperty('tumbleSkipRecoveryLifecycle').map { it.toBoolean() }.getOrElse(false)) {
+    tasks.named('runProductionGameTest') { finalizedBy tasks.named('runRecoveryLifecycleTests') }
+}
 
 // Both processes use the same world. Only the prepare phase removes a previous run.
 ['prepare', 'verify'].each { phase ->
@@ -175,6 +177,30 @@ tasks.named('runProductionGameTest') { finalizedBy tasks.named('runRecoveryLifec
 tasks.named('runAssemblyRestartVerify') { mustRunAfter tasks.named('runAssemblyRestartPrepare') }
 tasks.register('runAssemblyRestartTest') {
     dependsOn tasks.named('runAssemblyRestartPrepare'), tasks.named('runAssemblyRestartVerify')
+}
+
+['prepare', 'verify'].each { phase ->
+    tasks.register("runAssemblyGraphRestart${phase.capitalize()}", net.fabricmc.loom.task.prod.ServerProductionRunTask) {
+        outputs.upToDateWhen { false }
+        installerVersion = '1.1.2'
+        runDir = layout.buildDirectory.dir('run/assemblyGraphRestart').get().asFile
+        jvmArgs.add('-Dfabric-api.gametest')
+        jvmArgs.add("-Dfabric-api.gametest.filter=tumble_test:assembly_graph_restart_game_tests_${phase}")
+        jvmArgs.add("-Dtumble.graph.phase=${phase}")
+        doFirst {
+            if (!providers.gradleProperty('acceptMinecraftEula').map { it.toBoolean() }.getOrElse(false)) {
+                throw new GradleException('Pass -PacceptMinecraftEula=true to accept the Minecraft EULA for tests')
+            }
+            def directory = runDir.get().asFile
+            directory.mkdirs()
+            if (phase == 'prepare') project.delete(new File(directory, 'world'), new File(directory, 'assembly-graph-restart-ids.txt'))
+            new File(directory, 'eula.txt').text = 'eula=true\n'
+        }
+    }
+}
+tasks.named('runAssemblyGraphRestartVerify') { mustRunAfter tasks.named('runAssemblyGraphRestartPrepare') }
+tasks.register('runAssemblyGraphRestartTest') {
+    dependsOn tasks.named('runAssemblyGraphRestartPrepare'), tasks.named('runAssemblyGraphRestartVerify')
 }
 
 ['crashBaseline', 'crashInject', 'crashVerify'].each { phase ->

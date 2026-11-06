@@ -1,5 +1,18 @@
 # Assembly conversion recovery
 
+Conversion is refused before any source blocks are removed if the initial
+conservative terrain sweep exceeds 2,048 section visits. Overlapping collision
+groups may count the same section more than once, so the limit depends on the
+structure's extent and shape as well as its block count. Select a smaller
+structure if this happens. A linked component stays parked while its required
+terrain is unloaded or its coverage exceeds the budget.
+
+Vanilla moving-piston and shulker-box animation progress invalidates the
+affected collision sections before it changes their shapes. Adjacent sections
+are invalidated for immediate-neighbor block updates. Mods that change collision
+shapes without block-state updates or these vanilla progress hooks, or use
+long-range shape dependencies, are not covered by this guarantee.
+
 Tumble writes a journal before converting an assembly and checkpoints the level before removing the journal. Recovery runs before normal server ticks. A missing dimension, unreadable journal, chunk I/O error, unexpected entity, or conflicting source block stops recovery and retains the journal.
 
 If startup stops during recovery:

@@ -8,6 +8,8 @@
     "fabric-gametest": [
       "cc.modlabs.tumble.PhysicsWorldGameTest",
       "cc.modlabs.tumble.TumbleAddonGameTest",
+      { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.GameTestInventory" },
+      { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyGraphRestartGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyRestartGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.ConnectionCrashGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.PlacementRestartGameTests" },

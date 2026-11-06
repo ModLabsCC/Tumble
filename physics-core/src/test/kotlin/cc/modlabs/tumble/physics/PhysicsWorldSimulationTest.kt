@@ -10,6 +10,23 @@ import kotlin.test.assertTrue
 
 class PhysicsWorldSimulationTest {
     @Test
+    fun `native step bounds extreme linear and angular velocity for dynamic and kinematic bodies`() {
+        for (motion in listOf(PhysicsMotionType.DYNAMIC, PhysicsMotionType.KINEMATIC)) {
+            PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+                val start = PhysicsVector(8.0, 8.0, 8.0)
+                val body = world.createBody(PhysicsBodyDefinition(PhysicsTransform(start), motionType = motion,
+                    linearVelocity = PhysicsVector(50_000.0, 0.0, 0.0), angularVelocity = PhysicsVector(0.0, 50_000.0, 0.0)))
+                world.step()
+                val snapshot = assertNotNull(world.snapshot(body))
+                val distance = (snapshot.transform.position - start).length()
+                val angle = 2.0 * kotlin.math.acos(kotlin.math.abs(snapshot.transform.rotation.normalized().w).coerceIn(0.0, 1.0))
+                assertTrue(distance <= PhysicsWorldConfig.MAX_TERRAIN_STEP_TRANSLATION, "$motion traveled $distance in one step")
+                assertTrue(angle <= PhysicsWorldConfig.MAX_TERRAIN_STEP_ROTATION, "$motion rotated $angle in one step")
+            }
+        }
+    }
+
+    @Test
     fun `combined step snapshots match independent reads for moving and static bodies`() = PhysicsWorld().use { world ->
         val moving = world.createBody(bodyAt(0.0, 4.0, 0.0))
         val stationary = world.createBody(bodyAt(4.0, 0.0, 0.0).copy(motionType = PhysicsMotionType.STATIC))

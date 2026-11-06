@@ -8,6 +8,8 @@
     "LevelChunkMixin",
     "MinecraftServerMixin",
     "PistonBaseBlockMixin",
+    "PistonMovingBlockEntityMixin",
+    "ShulkerBoxBlockEntityMixin",
     "ServerExplosionMixin"
   ],
   "injectors": {

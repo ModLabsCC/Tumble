@@ -136,6 +136,11 @@ data class PhysicsWorldConfig(
     val workerCount: Int = 1,
     val impactSpeedThreshold: Float = 18f
 ) {
+    companion object {
+        const val MAX_LINEAR_SPEED = 400f
+        const val MAX_TERRAIN_STEP_TRANSLATION = 6.668
+        const val MAX_TERRAIN_STEP_ROTATION = 0.786
+    }
     init {
         require(frequencyHz > 0) { "Simulation frequency must be positive" }
         require(substeps > 0) { "Simulation substep count must be positive" }

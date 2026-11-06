@@ -749,9 +749,11 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         return try {
             definition.workerCount(config.workerCount)
             definition.gravity(gravity)
+            definition.maximumLinearSpeed(PhysicsWorldConfig.MAX_LINEAR_SPEED)
             definition.enableContinuous(true)
             b3CreateWorld(definition).also {
                 check(b3World_IsValid(it)) { "Box3D failed to create a physics world" }
+                check(b3World_GetMaximumLinearSpeed(it) <= PhysicsWorldConfig.MAX_LINEAR_SPEED) { "Unexpected Box3D speed limit" }
                 b3World_SetHitEventThreshold(it, config.impactSpeedThreshold)
             }
         } finally {
@@ -768,6 +770,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         val angularVelocity = definition.angularVelocity.toNativeVector()
         val nativeBody = try {
             bodyDefinition.type(definition.motionType.nativeValue)
+            bodyDefinition.allowFastRotation(false)
             bodyDefinition._position(position)
             bodyDefinition.rotation(rotation)
             bodyDefinition.linearVelocity(linearVelocity)

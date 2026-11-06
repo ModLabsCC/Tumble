@@ -150,6 +150,10 @@ object PhysicsServices {
         }?.positions?.add(position.immutable())
     }
 
+    fun beforeTerrainChange(level: ServerLevel, position: BlockPos) {
+        runtimes[level.server]?.terrain?.markBlockChanged(level, position)
+    }
+
     fun beginBlockPlacement(level: ServerLevel, context: BlockPlaceContext): Boolean {
         if (placementCapture.get() != null) return false
         placementCapture.set(PlacementCapture(level, context))
