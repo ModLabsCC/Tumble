@@ -341,6 +341,8 @@ class PhysicsPropManager(
         return true
     }
 
+    fun assemblyConversionPending(id: UUID): Boolean = id in recoveryRecords
+
     private fun setConversionBlock(block: ConvertedBlock, state: BlockState, owner: UUID): Boolean {
         check(conversionWritePermit == null)
         conversionWritePermit = owner to (block.level.physicsDimensionId().value to block.position)

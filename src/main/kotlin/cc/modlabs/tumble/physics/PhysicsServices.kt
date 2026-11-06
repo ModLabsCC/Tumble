@@ -75,6 +75,9 @@ object PhysicsServices {
     fun conversionWriteBlocked(level: ServerLevel, position: BlockPos, state: BlockState): Boolean =
         runtimes[level.server]?.manager?.conversionWriteBlocked(level, position, state) ?: false
 
+    fun assemblyConversionPending(level: ServerLevel, id: UUID): Boolean =
+        runtimes[level.server]?.manager?.assemblyConversionPending(id) ?: false
+
     fun entityLoaded(entity: Entity, level: ServerLevel) {
         runtimes[level.server]?.manager?.let { manager ->
             if (entity is ItemEntity) manager.itemLoaded(entity, level)
