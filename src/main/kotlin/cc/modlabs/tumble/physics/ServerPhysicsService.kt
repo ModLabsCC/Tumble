@@ -11,10 +11,14 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import org.slf4j.Logger
 
 class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
     private val commands = ConcurrentLinkedQueue<PhysicsCommand>()
+    private val stepBoundary = ReentrantLock(true)
+    private val pendingSuspensions = AtomicInteger()
     private val acknowledgements = ConcurrentLinkedQueue<PhysicsAcknowledgement>()
     private val impacts = ConcurrentLinkedQueue<PhysicsImpactNotification>()
     private val impactCount = AtomicInteger()
@@ -42,8 +46,27 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
     fun isRunning() = state.get() == PhysicsServiceState.RUNNING
 
     fun submit(command: PhysicsCommand): Boolean {
-        if (state.get() != PhysicsServiceState.RUNNING) return false
-        commands += command
+        if (command is PhysicsCommand.SuspendBody || command is PhysicsCommand.SuspendProp) {
+            stepBoundary.withLock {
+                if (state.get() != PhysicsServiceState.RUNNING) return false
+                pendingSuspensions.incrementAndGet()
+                commands += command
+            }
+        } else {
+            if (state.get() != PhysicsServiceState.RUNNING) return false
+            commands += command
+        }
+        LockSupport.unpark(thread)
+        return true
+    }
+
+    fun submitSuspendedSpawn(command: PhysicsCommand.SpawnBody): Boolean {
+        stepBoundary.withLock {
+            if (state.get() != PhysicsServiceState.RUNNING) return false
+            commands += command
+            pendingSuspensions.incrementAndGet()
+            commands += PhysicsCommand.SuspendProp(command.dimension, command.propId)
+        }
         LockSupport.unpark(thread)
         return true
     }
@@ -79,19 +102,26 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
         try {
             while (state.get() == PhysicsServiceState.RUNNING) {
                 val remaining = nextStep - System.nanoTime()
-                if (remaining > 0) {
+                if (remaining > 0 && pendingSuspensions.get() == 0) {
                     LockSupport.parkNanos(remaining)
                     continue
                 }
                 val started = System.nanoTime()
                 drainCommands(worlds, bodies, terrain)
                 if (state.get() != PhysicsServiceState.RUNNING) break
-                step++
-                worlds.forEach { (dimension, world) ->
-                    frames.computeIfAbsent(dimension) { AtomicReference(PhysicsSnapshotFrame.EMPTY) }
-                        .set(PhysicsSnapshotFrame.of(step, world.stepAndSnapshots().associateBy { it.bodyId }))
-                    world.consumeImpactEvents().forEach { event -> publishImpact(PhysicsImpactNotification(dimension, event)) }
+                // Preserve FIFO ordering while preventing a step ahead of any queued suspension.
+                val stepped = stepBoundary.withLock {
+                    if (pendingSuspensions.get() != 0 || System.nanoTime() < nextStep) false else {
+                        step++
+                        worlds.forEach { (dimension, world) ->
+                            frames.computeIfAbsent(dimension) { AtomicReference(PhysicsSnapshotFrame.EMPTY) }
+                                .set(PhysicsSnapshotFrame.of(step, world.stepAndSnapshots().associateBy { it.bodyId }))
+                            world.consumeImpactEvents().forEach { event -> publishImpact(PhysicsImpactNotification(dimension, event)) }
+                        }
+                        true
+                    }
                 }
+                if (!stepped) continue
                 completedSteps.incrementAndGet()
                 workNanos.addAndGet(System.nanoTime() - started)
                 nextStep += interval
@@ -187,9 +217,15 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                     terrain[command.dimension]?.remove(command.section)
                 }
                 is PhysicsCommand.WakeBody -> worlds[command.dimension]?.wake(command.bodyId)
-                is PhysicsCommand.SuspendBody -> worlds[command.dimension]?.suspend(command.bodyId)
-                is PhysicsCommand.SuspendProp -> bodies[command.propId]?.takeIf { it.dimension == command.dimension }?.let {
-                    worlds[command.dimension]?.suspend(it.bodyId)
+                is PhysicsCommand.SuspendBody -> {
+                    worlds[command.dimension]?.suspend(command.bodyId)
+                    pendingSuspensions.decrementAndGet()
+                }
+                is PhysicsCommand.SuspendProp -> {
+                    bodies[command.propId]?.takeIf { it.dimension == command.dimension }?.let {
+                        worlds[command.dimension]?.suspend(it.bodyId)
+                    }
+                    pendingSuspensions.decrementAndGet()
                 }
                 is PhysicsCommand.ResumeBody -> worlds[command.dimension]?.resume(command.bodyId)
                 is PhysicsCommand.SetMotionType -> worlds[command.dimension]

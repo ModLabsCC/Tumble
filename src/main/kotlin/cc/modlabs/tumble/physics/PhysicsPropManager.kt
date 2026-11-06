@@ -1798,8 +1798,7 @@ class PhysicsPropManager(
                 part.copy(material = part.material.copy(density = part.material.density * scale))
             })
         }
-        val accepted = service.submit(
-            PhysicsCommand.SpawnBody(
+        val command = PhysicsCommand.SpawnBody(
                 entity.uuid,
                 level.physicsDimensionId(),
                 PhysicsBodyDefinition(
@@ -1826,11 +1825,8 @@ class PhysicsPropManager(
                 ),
                 requestId = associations.requestId(entity.uuid)
             )
-        )
+        val accepted = if (entity.uuid in terrainWaits) service.submitSuspendedSpawn(command) else service.submit(command)
         if (!accepted) entity.physicsPending = false
-        else if (entity.uuid in terrainWaits) {
-            service.submit(PhysicsCommand.SuspendProp(level.physicsDimensionId(), entity.uuid))
-        }
     }
 
     private fun drainAcknowledgements() {

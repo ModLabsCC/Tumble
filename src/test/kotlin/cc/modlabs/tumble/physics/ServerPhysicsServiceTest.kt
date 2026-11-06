@@ -35,6 +35,129 @@ class ServerPhysicsServiceTest {
     }
 
     @Test
+    fun `a queued spawn is suspended before its first published frame`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:spawn-before-suspend")
+        val prop = UUID.randomUUID()
+        service.start()
+        try {
+            repeat(5000) { service.submit(PhysicsCommand.RemoveTerrainSection(dimension, PhysicsSectionPosition(it, 0, 0))) }
+            service.submit(PhysicsCommand.SpawnBody(prop, dimension, bodyDefinition()))
+            service.submit(PhysicsCommand.SuspendProp(dimension, prop))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            waitUntil { service.latestFrame(dimension).bodies.containsKey(body) }
+            assertTrue(service.latestFrame(dimension).bodies[body]?.suspended == true,
+                "new body stepped before its queued suspension")
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun `a suspended spawn cannot publish a moving body without a backlog`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:atomic-suspended-spawn")
+        service.start()
+        try {
+            val prop = UUID.randomUUID()
+            assertTrue(service.submitSuspendedSpawn(PhysicsCommand.SpawnBody(prop, dimension, bodyDefinition())))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            waitUntil { service.latestFrame(dimension).bodies.containsKey(body) }
+            assertTrue(service.latestFrame(dimension).bodies[body]?.suspended == true,
+                "suspended spawn published a moving body")
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun `a later suspension stays after an earlier queued resume`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:resume-before-suspend")
+        service.start()
+        try {
+            service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, bodyDefinition()))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            service.submit(PhysicsCommand.SuspendBody(dimension, body))
+            waitUntil { service.latestFrame(dimension).bodies[body]?.suspended == true }
+            repeat(5000) { service.submit(PhysicsCommand.RemoveTerrainSection(dimension, PhysicsSectionPosition(it, 0, 0))) }
+            service.submit(PhysicsCommand.ResumeBody(dimension, body))
+            service.submit(PhysicsCommand.SuspendBody(dimension, body))
+            val step = service.latestFrame(dimension).physicsStep
+            waitUntil { service.latestFrame(dimension).physicsStep > step }
+            assertTrue(service.latestFrame(dimension).bodies[body]?.suspended == true, "an older resume cancelled the new suspension")
+            service.submit(PhysicsCommand.ResumeBody(dimension, body))
+            waitUntil { service.latestFrame(dimension).bodies[body]?.suspended == false }
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun `destroy and replacement remain ordered before a queued suspension`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:replace-before-suspend")
+        val prop = UUID.randomUUID()
+        service.start()
+        try {
+            service.submit(PhysicsCommand.SpawnBody(prop, dimension, bodyDefinition()))
+            var first: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { first = it }; first != null }
+            val oldBody = requireNotNull(first).bodyId
+            repeat(5000) { service.submit(PhysicsCommand.RemoveTerrainSection(dimension, PhysicsSectionPosition(it, 0, 0))) }
+            service.submit(PhysicsCommand.DestroyBody(dimension, oldBody))
+            service.submit(PhysicsCommand.SpawnBody(prop, dimension, bodyDefinition()))
+            service.submit(PhysicsCommand.SuspendProp(dimension, prop))
+            var replacement: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { replacement = it }; replacement != null }
+            val newBody = requireNotNull(replacement).bodyId
+            waitUntil { service.latestFrame(dimension).bodies.containsKey(newBody) }
+            assertTrue(service.latestFrame(dimension).bodies[newBody]?.suspended == true,
+                "replacement body stepped before its queued suspension")
+            service.submit(PhysicsCommand.DestroyBody(dimension, newBody))
+            service.submit(PhysicsCommand.SpawnBody(prop, dimension, bodyDefinition()))
+            var next: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { next = it }; next != null }
+            val nextBody = requireNotNull(next).bodyId
+            waitUntil { service.latestFrame(dimension).bodies[nextBody]?.suspended == false }
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun `suspension barriers do not advance the fixed clock`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:suspend-fixed-clock")
+        service.start()
+        try {
+            service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, bodyDefinition()))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            waitUntil { service.latestFrame(dimension).physicsStep > 0 }
+            val first = service.latestFrame(dimension).physicsStep
+            val start = System.nanoTime()
+            while (System.nanoTime() - start < 300_000_000L) {
+                service.submit(PhysicsCommand.SuspendBody(dimension, body))
+                service.submit(PhysicsCommand.ResumeBody(dimension, body))
+                Thread.sleep(1)
+            }
+            val elapsed = System.nanoTime() - start
+            val steps = service.latestFrame(dimension).physicsStep - first
+            assertTrue(steps <= elapsed / 1_000_000_000.0 * 60 + 10, "suspensions advanced the fixed clock")
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
     fun `connection acknowledgements report native success and missing bodies`() {
         val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
         val dimension = PhysicsDimensionId("test:connection-ack")
