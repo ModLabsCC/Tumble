@@ -9,6 +9,19 @@ import kotlin.test.assertTrue
 
 class AssemblyShapeTest {
     @Test
+    fun `a weld can be restored while both bodies are parked`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0)), motionType = PhysicsMotionType.STATIC))
+        val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)), motionType = PhysicsMotionType.STATIC))
+        assertTrue(world.createWeld(first, second))
+        assertEquals(1, world.weldCount())
+        assertTrue(world.setMotionType(first, PhysicsMotionType.DYNAMIC))
+        assertTrue(world.setMotionType(second, PhysicsMotionType.DYNAMIC))
+        assertTrue(world.setLinearVelocity(first, PhysicsVector(2.0, 0.0, 0.0)))
+        repeat(30) { world.step() }
+        assertTrue(assertNotNull(world.snapshot(second)).transform.position.x > 2.1)
+    }
+
+    @Test
     fun `unloading a suspended root does not release its connected body`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
         val root = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0))))
         val other = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)), linearVelocity = PhysicsVector(2.0, 0.0, 0.0)))

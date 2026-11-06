@@ -431,10 +431,20 @@ class PhysicsPropManager(
         val level = player.level() as? ServerLevel ?: return false
         val history = weldHistoryByPlayer[player.uuid] ?: return false
         while (history.isNotEmpty()) {
-            val key = history.removeLast()
-            if (!activeWelds.remove(key)) continue
-            val first = props[key.first]?.runtimeBodyId
-            val second = props[key.second]?.runtimeBodyId
+            val key = history.last()
+            if (key !in activeWelds) {
+                history.removeLast()
+                continue
+            }
+            val firstProp = props[key.first]
+            val secondProp = props[key.second]
+            if (firstProp != null && isTerrainPaused(firstProp, level) ||
+                secondProp != null && isTerrainPaused(secondProp, level)
+            ) return false
+            history.removeLast()
+            activeWelds.remove(key)
+            val first = firstProp?.runtimeBodyId
+            val second = secondProp?.runtimeBodyId
             val accepted = first != null && second != null &&
                 service.submit(PhysicsCommand.DestroyWeld(level.physicsDimensionId(), first, second))
             sendToolGunState(player)

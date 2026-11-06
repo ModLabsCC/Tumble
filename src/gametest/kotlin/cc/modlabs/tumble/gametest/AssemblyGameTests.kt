@@ -88,6 +88,7 @@ class AssemblyGameTests {
         var phase = 0
         var checkpoint = 0L
         var weldFailure = "none"
+        var undoWhilePaused: Boolean? = null
         fun reloadOther(step: Long) {
             val saved = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
             other.saveWithoutId(saved)
@@ -122,6 +123,8 @@ class AssemblyGameTests {
                 1 -> if (frame.physicsStep - checkpoint >= 10) {
                     PhysicsServices.chunkUnloaded(helper.level, remote.x shr 4, 0)
                     helper.assertTrue(TumbleApi.status(helper.level, assembly.uuid) == TumbleApi.PropStatus.PAUSED, "assembly did not enter terrain wait")
+                    if (undoWhilePaused == null) undoWhilePaused = runtime.manager.undoToolGunWeld(player)
+                    helper.assertTrue(undoWhilePaused == false, "undo broke a terrain-paused group")
                     checkpoint = frame.physicsStep
                     if (immediate) reloadOther(frame.physicsStep) else phase = 2
                 }
@@ -352,6 +355,10 @@ class AssemblyGameTests {
             val step = runtime.service.latestFrame(dimension).physicsStep
             when (phase) {
                 0 -> {
+                    val start = PhysicsVector(origin.x + 0.5, 200.5, origin.z + 0.5)
+                    entity.setPos(start.x, start.y, start.z)
+                    runtime.service.submit(PhysicsCommand.SetTransform(dimension, snapshot.bodyId, PhysicsTransform(start)))
+                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, snapshot.bodyId, PhysicsVector(2.0, 0.0, 0.0)))
                     PhysicsServices.chunkUnloaded(helper.level, remote.x shr 4, 0)
                     helper.assertTrue(TumbleApi.status(helper.level, entity.uuid) == TumbleApi.PropStatus.PAUSED, "unavailable terrain did not pause the API")
                     helper.assertTrue(!TumbleApi.applyImpulse(helper.level, entity.uuid, net.minecraft.world.phys.Vec3(1.0, 0.0, 0.0)), "paused assembly accepted an impulse")
