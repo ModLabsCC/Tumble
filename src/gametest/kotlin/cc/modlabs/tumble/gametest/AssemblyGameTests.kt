@@ -553,6 +553,50 @@ class AssemblyGameTests {
     }
 
     @GameTest
+    fun earlyChunkIoFailurePreventsJournalReplay(helper: GameTestHelper) {
+        val server = helper.level.server
+        val runtimesField = PhysicsServices.javaClass.getDeclaredField("runtimes").apply { isAccessible = true }
+        val failuresField = PhysicsServices.javaClass.getDeclaredField("chunkIoFailures").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val runtimes = runtimesField.get(PhysicsServices) as MutableMap<Any, Any>
+        @Suppress("UNCHECKED_CAST")
+        val failures = failuresField.get(PhysicsServices) as MutableMap<Any, Any>
+        val runtime = runtimes.remove(server) ?: return helper.fail("runtime missing")
+        val previousFailures = failures.remove(server)
+        val directory = Files.createTempDirectory("tumble-early-io-test")
+        val id = UUID.randomUUID()
+        val logger = LoggerFactory.getLogger("assembly-early-io-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        try {
+            PhysicsServices.chunkIoFailed(server)
+            runtimes[server] = runtime
+            val origin = BlockPos(50240, 4, 0)
+            val definition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, Blocks.STONE.defaultBlockState())))
+            val recordClass = Class.forName("cc.modlabs.tumble.physics.AssemblyRecoveryRecord")
+            val record = recordClass.getConstructor(String::class.java, BlockPos::class.java, AssemblyDefinition::class.java, Boolean::class.javaPrimitiveType)
+                .newInstance(helper.level.physicsDimensionId().value, origin, definition, true)
+            val payload = recordClass.getMethod("encode").invoke(record) as ByteArray
+            val journalClass = Class.forName("cc.modlabs.tumble.physics.AssemblyConversionJournal")
+            val journal = journalClass.getConstructor(java.nio.file.Path::class.java).newInstance(directory)
+            journalClass.getMethod("prepare", UUID::class.java, ByteArray::class.java).invoke(journal, id, payload)
+            val manager = PhysicsPropManager(server, service, TerrainSectionTracker(service), logger, TumbleTuning(), directory)
+            val recover = manager.javaClass.declaredMethods.single { it.name.startsWith("recoverConversions") }
+            val blocked = try { recover.invoke(manager); false } catch (error: java.lang.reflect.InvocationTargetException) {
+                error.cause is IllegalStateException
+            }
+            helper.assertTrue(blocked, "recovery ignored a chunk I/O failure reported before runtime registration")
+            helper.assertTrue(Files.exists(directory.resolve("$id.journal")), "failed recovery deleted the journal")
+        } finally {
+            runtimes[server] = runtime
+            if (previousFailures == null) failures.remove(server) else failures[server] = previousFailures
+            service.close()
+            Files.deleteIfExists(directory.resolve("$id.journal"))
+            Files.deleteIfExists(directory)
+        }
+        helper.succeed()
+    }
+
+    @GameTest
     fun journalWriteFailureDoesNotRemoveBlocks(helper: GameTestHelper) {
         val origin = BlockPos(2400, 4, 0)
         helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)

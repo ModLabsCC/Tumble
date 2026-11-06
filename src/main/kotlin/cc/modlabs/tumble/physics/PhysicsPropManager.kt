@@ -17,7 +17,6 @@ import cc.modlabs.tumble.physics.PhysicsShapeDefinition
 import cc.modlabs.tumble.physics.PhysicsTransform
 import cc.modlabs.tumble.physics.PhysicsVector
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicLong
 import java.nio.file.Path
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
@@ -106,7 +105,6 @@ class PhysicsPropManager(
     private val conversionJournal = AssemblyConversionJournal(journalDirectory)
     private val journalRecords = conversionJournal.pending().toMutableMap()
     private val recoveryRecords = journalRecords.mapValuesTo(mutableMapOf()) { AssemblyRecoveryRecord.decode(it.value.payload) }
-    private val chunkIoFailures = AtomicLong()
     private val journalFailureEpoch = recoveryRecords.keys.associateWithTo(mutableMapOf()) { 0L }
     private val conversionLocks = mutableMapOf<Pair<String, BlockPos>, UUID>()
     private var conversionWritePermit: Pair<UUID, Pair<String, BlockPos>>? = null
@@ -245,7 +243,7 @@ class PhysicsPropManager(
             return null
         }
         recoveryRecords[entity.uuid] = record
-        journalFailureEpoch[entity.uuid] = chunkIoFailures.get()
+        journalFailureEpoch[entity.uuid] = PhysicsServices.chunkIoFailureCount(server)
         lockConversion(entity.uuid, record)
         try {
             conversionJournal.markStarted(entity.uuid)
@@ -303,10 +301,6 @@ class PhysicsPropManager(
         }
     }
 
-    internal fun chunkIoFailed() {
-        chunkIoFailures.incrementAndGet()
-    }
-
     private fun lockConversion(id: UUID, record: AssemblyRecoveryRecord) {
         record.definition.blocks.forEach {
             val key = record.dimension to record.origin.offset(it.offset)
@@ -345,9 +339,9 @@ class PhysicsPropManager(
         if (id !in recoveryRecords) return
         try {
             val failures = journalFailureEpoch.getValue(id)
-            check(chunkIoFailures.get() == failures) { "A chunk I/O failure occurred during assembly conversion $id; journal retained" }
+            check(PhysicsServices.chunkIoFailureCount(server) == failures) { "A chunk I/O failure occurred during assembly conversion $id; journal retained" }
             level.save(null, true, false)
-            check(chunkIoFailures.get() == failures) { "Could not save assembly conversion $id; journal retained" }
+            check(PhysicsServices.chunkIoFailureCount(server) == failures) { "Could not save assembly conversion $id; journal retained" }
             conversionJournal.complete(id)
             recoveryRecords.remove(id)?.let { unlockConversion(id, it) }
             journalRecords.remove(id)
@@ -362,7 +356,7 @@ class PhysicsPropManager(
         for ((id, record) in recoveryRecords.toMap()) {
             val level = server.allLevels.firstOrNull { it.physicsDimensionId().value == record.dimension }
                 ?: error("Missing dimension for assembly conversion $id")
-            val failures = chunkIoFailures.get()
+            val failures = PhysicsServices.chunkIoFailureCount(server)
             check(failures == 0L) { "A chunk I/O failure occurred before assembly recovery $id" }
             val chunks = record.definition.blocks.map {
                 val position = record.origin.offset(it.offset)
@@ -375,7 +369,7 @@ class PhysicsPropManager(
                     level.getChunk(chunk.x, chunk.z)
                 }
                 level.waitForEntities(ChunkPos(record.origin.x shr 4, record.origin.z shr 4), 0)
-                check(chunkIoFailures.get() == failures) { "Could not load chunks for assembly conversion $id" }
+                check(PhysicsServices.chunkIoFailureCount(server) == failures) { "Could not load chunks for assembly conversion $id" }
                 val found = level.getEntityInAnyDimension(id)
                 if (journalRecords.getValue(id).started.not()) {
                     check(found == null && record.definition.blocks.all {

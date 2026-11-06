@@ -3,6 +3,7 @@ package cc.modlabs.tumble.physics
 
 import java.util.IdentityHashMap
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicLong
 import java.util.UUID
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.core.BlockPos
@@ -24,6 +25,7 @@ import org.slf4j.Logger
 
 object PhysicsServices {
     private val runtimes = Collections.synchronizedMap(IdentityHashMap<MinecraftServer, Runtime>())
+    private val chunkIoFailures = Collections.synchronizedMap(IdentityHashMap<MinecraftServer, AtomicLong>())
     private val placementCapture = ThreadLocal<PlacementCapture?>()
     private val pistonCapture = ThreadLocal<PistonCapture?>()
 
@@ -46,6 +48,7 @@ object PhysicsServices {
             it.publisher.close()
             it.service.close()
         }
+        chunkIoFailures.remove(server)
     }
 
     fun levelLoaded(server: MinecraftServer, level: ServerLevel) {
@@ -61,8 +64,10 @@ object PhysicsServices {
     }
 
     fun chunkIoFailed(server: MinecraftServer) {
-        runtimes[server]?.manager?.chunkIoFailed()
+        synchronized(chunkIoFailures) { chunkIoFailures.getOrPut(server) { AtomicLong() } }.incrementAndGet()
     }
+
+    internal fun chunkIoFailureCount(server: MinecraftServer): Long = chunkIoFailures[server]?.get() ?: 0L
 
     fun conversionWriteBlocked(level: ServerLevel, position: BlockPos, state: BlockState): Boolean =
         runtimes[level.server]?.manager?.conversionWriteBlocked(level, position, state) ?: false
