@@ -4,6 +4,7 @@ package cc.modlabs.tumble.gametest
 import cc.modlabs.tumble.item.TumbleItems
 import cc.modlabs.tumble.api.TumbleApi
 import cc.modlabs.tumble.TumbleGameRules
+import cc.modlabs.tumble.TumbleMod
 import cc.modlabs.tumble.entity.PhysicsPropEntity
 import cc.modlabs.tumble.entity.TumbleEntities
 import cc.modlabs.tumble.physics.MinecraftTerrainAdapter
@@ -25,6 +26,10 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import net.fabricmc.fabric.api.gametest.v1.GameTest
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
+import net.minecraft.core.registries.Registries
+import net.minecraft.core.registries.BuiltInRegistries
+import net.minecraft.resources.ResourceKey
+import net.minecraft.server.permissions.LevelBasedPermissionSet
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.world.entity.EquipmentSlot
 import net.minecraft.world.entity.Entity
@@ -33,6 +38,9 @@ import net.minecraft.world.entity.EntityTypes
 import net.minecraft.world.entity.item.ItemEntity
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
+import net.minecraft.world.item.CreativeModeTab
+import net.minecraft.world.flag.FeatureFlags
+import net.minecraft.world.InteractionHand
 import net.minecraft.world.level.GameType
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.entity.PersistentEntitySectionManager
@@ -509,7 +517,7 @@ class TumbleGameTests {
             helper.level, PhysicsVector(baseX + 2.5, 1.5, 1.5), Blocks.OAK_LOG.defaultBlockState(),
             angularVelocity = PhysicsVector.ZERO
         ) ?: return helper.fail("second prop did not spawn")
-        val player = helper.makeMockServerPlayer(GameType.CREATIVE).apply {
+        val player = helper.makeMockPlayer(GameType.CREATIVE).apply {
             setPos(baseX + 1.5, 1.0, 4.0)
             setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
         }
@@ -526,7 +534,38 @@ class TumbleGameTests {
                 manager.useToolGunWeld(player, second) == ToolGunWeldResult.WELDED,
                 "second prop was not welded"
             )
+            TumbleItems.TOOL_GUN.use(helper.level, player, InteractionHand.MAIN_HAND)
+            helper.assertTrue(!manager.undoToolGunWeld(player), "using the Tool Gun did not undo the weld")
         }
+    }
+
+    @GameTest
+    fun developerToolsHaveNoDefaultRecipesOrAdvancements(helper: GameTestHelper) {
+        val server = helper.level.server
+        for (name in listOf("gravity_gun", "physics_gun", "tool_gun")) {
+            val recipe = ResourceKey.create(Registries.RECIPE, TumbleMod.id(name))
+            helper.assertTrue(server.recipeManager.byKey(recipe).isEmpty, "$name is still craftable")
+            helper.assertTrue(server.advancements.get(TumbleMod.id("recipes/$name")) == null, "$name recipe unlock still exists")
+        }
+        for (name in listOf("root", "gravity_gun", "physics_gun", "first_prop", "first_weld", "living_grab", "tool_mode", "tool_action")) {
+            helper.assertTrue(server.advancements.get(TumbleMod.id(name)) == null, "$name advancement still exists")
+        }
+        helper.succeed()
+    }
+
+    @GameTest
+    fun developerToolsRemainAvailableToCreatorsAndOperators(helper: GameTestHelper) {
+        val tab = BuiltInRegistries.CREATIVE_MODE_TAB.getValue(TumbleMod.id("main"))
+            ?: return helper.fail("Tumble creative tab is missing")
+        tab.buildContents(CreativeModeTab.ItemDisplayParameters(FeatureFlags.DEFAULT_FLAGS, true, helper.level.registryAccess()))
+        val player = helper.makeMockServerPlayer(GameType.SURVIVAL) as net.minecraft.server.level.ServerPlayer
+        val source = player.createCommandSourceStack().withPermission(LevelBasedPermissionSet.GAMEMASTER).withSuppressedOutput()
+        for ((name, item) in listOf("gravitygun" to TumbleItems.GRAVITY_GUN, "physicsgun" to TumbleItems.PHYSICS_GUN, "toolgun" to TumbleItems.TOOL_GUN)) {
+            helper.assertTrue(tab.contains(ItemStack(item)), "$name is missing from the creative tab")
+            helper.level.server.commands.dispatcher.execute("tumble $name", source)
+            helper.assertTrue(player.inventory.contains(ItemStack(item)), "$name operator command did not grant the item")
+        }
+        helper.succeed()
     }
 
     @GameTest

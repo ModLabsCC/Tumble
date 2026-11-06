@@ -2,7 +2,6 @@
 package cc.modlabs.tumble.item
 
 import cc.modlabs.tumble.TumbleMod
-import cc.modlabs.tumble.TumbleAdvancements
 import cc.modlabs.tumble.physics.PhysicsServices
 import net.minecraft.core.Registry
 import net.minecraft.core.registries.BuiltInRegistries
@@ -68,10 +67,6 @@ object TumbleItems {
 private class ToolGunItem(properties: Properties) : Item(properties) {
     override fun use(level: Level, player: Player, hand: InteractionHand): InteractionResult {
         if (level.isClientSide) return InteractionResult.SUCCESS
-        if (!TumbleAdvancements.completed(player, "tool_mode")) {
-            player.sendOverlayMessage(Component.translatable("tutorial.tumble.tool_gun.change_mode"))
-            return InteractionResult.SUCCESS_SERVER
-        }
         val undone = PhysicsServices.undoToolGunWeld(player)
         player.sendOverlayMessage(Component.translatable(
             if (undone) "message.tumble.tool_gun.undo" else "message.tumble.tool_gun.nothing_to_undo"

@@ -2,7 +2,6 @@
 package cc.modlabs.tumble.physics
 
 import cc.modlabs.tumble.TumbleGameRules
-import cc.modlabs.tumble.TumbleAdvancements
 import cc.modlabs.tumble.entity.PhysicsPropEntity
 import cc.modlabs.tumble.entity.ToolPhysicsPreset
 import cc.modlabs.tumble.entity.TumbleEntities
@@ -298,10 +297,6 @@ class PhysicsPropManager(
         toolModeByPlayer[player.uuid] = toolGunMode(player).cycle(delta)
         weldSelectionByPlayer.remove(player.uuid)
         sendToolGunState(player)
-        TumbleAdvancements.award(player, "tool_mode")
-        if (!TumbleAdvancements.completed(player, "first_weld")) {
-            player.sendOverlayMessage(net.minecraft.network.chat.Component.translatable("tutorial.tumble.tool_gun.use_mode"))
-        }
     }
 
     fun toolGunMode(player: Player) = toolModeByPlayer[player.uuid] ?: ToolGunMode.WELD
@@ -311,10 +306,7 @@ class PhysicsPropManager(
         if (mode == ToolGunMode.WELD) {
             return when (useToolGunWeld(player, prop)) {
                 ToolGunWeldResult.SELECTED -> ToolGunResult.SELECTED
-                ToolGunWeldResult.WELDED -> {
-                    TumbleAdvancements.award(player, "first_weld")
-                    ToolGunResult.APPLIED
-                }
+                ToolGunWeldResult.WELDED -> ToolGunResult.APPLIED
                 ToolGunWeldResult.CANCELLED -> ToolGunResult.CANCELLED
                 ToolGunWeldResult.FAILED -> ToolGunResult.FAILED
             }
@@ -329,13 +321,11 @@ class PhysicsPropManager(
         if (mode == ToolGunMode.REMOVER) {
             entityUnloaded(prop, level)
             prop.discard()
-            TumbleAdvancements.award(player, "tool_action")
             return ToolGunResult.APPLIED
         }
         if (mode == ToolGunMode.WEIGHT_BUOYANCY) {
             prop.toolPhysicsPreset = prop.toolPhysicsPreset.next()
             return if (recreateBody(prop, level)) {
-                TumbleAdvancements.award(player, "tool_action")
                 ToolGunResult.APPLIED
             } else ToolGunResult.FAILED
         }
@@ -369,7 +359,6 @@ class PhysicsPropManager(
         }
         if (accepted) toolConnections += WeldKey.of(first.uuid, prop.uuid)
         sendToolGunState(player)
-        if (accepted) TumbleAdvancements.award(player, "tool_action")
         return if (accepted) ToolGunResult.APPLIED else ToolGunResult.FAILED
     }
 
@@ -1436,7 +1425,6 @@ class PhysicsPropManager(
         heldLivingByPlayer[player.uuid] = entity
         heldLivingEntities += entity.uuid
         entity.fallDistance = 0.0
-        TumbleAdvancements.award(player, "living_grab")
         return true
     }
 
@@ -1636,8 +1624,8 @@ class PhysicsPropManager(
                             if (player != null && player.isAlive && !player.isSpectator &&
                                 player.level() === entity.level() && player.isHolding { it.item === TumbleItems.PHYSICS_GUN } &&
                                 player.distanceToSqr(entity) <= PHYSICS_GUN_REACH_SQUARED &&
-                                playerId !in heldByPlayer && playerId !in heldLivingByPlayer && hold(player, entity, true)
-                            ) TumbleAdvancements.award(player, "first_prop")
+                                playerId !in heldByPlayer && playerId !in heldLivingByPlayer
+                            ) hold(player, entity, true)
                         }
                     }
                 }

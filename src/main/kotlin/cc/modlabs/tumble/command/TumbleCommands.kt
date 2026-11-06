@@ -50,6 +50,7 @@ object TumbleCommands {
                 .then(assemblyNode())
                 .then(Commands.literal("gravitygun").executes { gravityGun(it.source) })
                 .then(Commands.literal("physicsgun").executes { physicsGun(it.source) })
+                .then(Commands.literal("toolgun").executes { giveGun(it.source, TumbleItems.TOOL_GUN, "item.tumble.tool_gun") })
                 .then(tuningNode())
         )
     }
