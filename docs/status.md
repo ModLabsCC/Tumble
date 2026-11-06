@@ -11,6 +11,8 @@ Tumble is an early development build. It has single-block props, tools, a server
 
 An assembly prototype lives on the `codex/tumble-assemblies` branch. It is not ready for normal play: terrain-unload handling, connected-body persistence and recovery still have known gaps.
 
+The `codex/tumble-assembly-recovery` branch reproduces a case where a linked prop saved before an assembly unloads can restart while its terrain is missing. Its GameTest currently fails. Durable connections and crash-safe recovery remain unfinished.
+
 ## Reliability and compatibility
 
 - Exercise real chunk unload and disk reload, multiplayer latency and reconnects, protection mods, and terrain with mixed materials and partial shapes. Automated tests cover some of these paths, but not all combinations.
