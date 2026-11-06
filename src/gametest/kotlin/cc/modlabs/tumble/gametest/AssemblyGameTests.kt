@@ -50,6 +50,7 @@ import net.minecraft.server.level.ServerPlayer
 import net.minecraft.server.players.NameAndId
 import net.minecraft.world.level.storage.TagValueInput
 import net.minecraft.world.level.storage.TagValueOutput
+import net.minecraft.world.level.storage.LevelResource
 
 class AssemblyGameTests {
     @GameTest(maxTicks = 400)
@@ -705,7 +706,13 @@ class AssemblyGameTests {
         restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), saved.buildResult()))
         val recovery = restored.javaClass.getDeclaredField("recoveryOrigin").apply { isAccessible = true }
         helper.assertTrue(recovery.get(restored) == origin, "pending assembly did not save its recovery origin")
-        helper.succeed()
+        val journal = helper.level.server.getWorldPath(LevelResource.ROOT).resolve("tumble-assembly-journal").resolve("$id.journal")
+        helper.assertTrue(Files.exists(journal), "pending assembly did not write its journal")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
+            helper.assertTrue(!Files.exists(journal), "completed assembly kept its journal")
+        }
     }
 
     @GameTest
