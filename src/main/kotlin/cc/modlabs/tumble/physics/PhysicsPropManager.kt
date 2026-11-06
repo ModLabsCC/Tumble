@@ -320,6 +320,7 @@ class PhysicsPropManager(
     }
 
     fun conversionWriteBlocked(level: ServerLevel, position: BlockPos, state: BlockState): Boolean {
+        if (conversionLocks.isEmpty()) return false
         val key = level.physicsDimensionId().value to position
         val owner = conversionLocks[key] ?: return false
         if (conversionWritePermit == (owner to key)) {
