@@ -56,6 +56,43 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         return id
     }
 
+    /** Stages a component without advancing physics and rolls back every body if a joint fails. */
+    fun restoreComponent(definitions: List<PhysicsBodyDefinition>, joints: List<RestoredJoint>): List<PhysicsBodyId>? {
+        checkUsable()
+        if (definitions.isEmpty() || joints.any { joint ->
+            joint.first !in definitions.indices || joint.second !in definitions.indices || joint.first == joint.second ||
+                (joint.kind == PhysicsJointKind.WELD || joint.kind == PhysicsJointKind.AXIS) && joint.frames == null ||
+                joint.kind == PhysicsJointKind.ROPE && (!joint.ropeLength.isFinite() || joint.ropeLength <= 0f)
+        }) return null
+        val created = mutableListOf<PhysicsBodyId>()
+        var complete = false
+        try {
+            definitions.forEach { created += createBody(it.copy(motionType = PhysicsMotionType.STATIC)) }
+            for (joint in joints) {
+                val first = created[joint.first]
+                val second = created[joint.second]
+                val success = when (joint.kind) {
+                    PhysicsJointKind.WELD -> createWeld(first, second, joint.frames)
+                    PhysicsJointKind.ROPE -> createRope(first, second, joint.ropeLength)
+                    PhysicsJointKind.AXIS -> createAxis(first, second, joint.frames)
+                    PhysicsJointKind.NO_COLLIDE -> createNoCollide(first, second)
+                }
+                if (!success) return null
+            }
+            definitions.forEachIndexed { index, definition ->
+                setMotionType(created[index], definition.motionType)
+                if (definition.motionType != PhysicsMotionType.STATIC) {
+                    setLinearVelocity(created[index], definition.linearVelocity)
+                    setAngularVelocity(created[index], definition.angularVelocity)
+                }
+            }
+            complete = true
+            return created
+        } finally {
+            if (!complete) created.forEach(::destroyBody)
+        }
+    }
+
     /** Owning physics thread only. Returns false when the body is already absent. */
     @JvmName("destroyBody")
     fun destroyBody(bodyId: PhysicsBodyId): Boolean {
@@ -80,18 +117,17 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. Welds two bodies without changing their current relative transform. */
+    @JvmOverloads
     @JvmName("createWeld")
-    fun createWeld(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
+    fun createWeld(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, frames: PhysicsJointFrames? = null): Boolean {
         checkUsable()
         if (bodyA == bodyB || welds.any { it.connects(bodyA, bodyB) }) return false
         val first = bodies[bodyA] ?: return false
         val second = bodies[bodyB] ?: return false
         if (first.suspended != null || second.suspended != null) return false
-        val transformA = snapshotOf(bodyA, first).transform
-        val transformB = snapshotOf(bodyB, second).transform
-        val anchor = (transformA.position + transformB.position) * 0.5
-        val frameA = localJointFrame(transformA, anchor, transformA.rotation)
-        val frameB = localJointFrame(transformB, anchor, transformA.rotation)
+        val jointFrames = frames ?: captureJointFrames(bodyA, bodyB) ?: return false
+        val frameA = jointFrames.first.toNativeJointTransform()
+        val frameB = jointFrames.second.toNativeJointTransform()
         val definition = b3DefaultWeldJointDef()
         return try {
             definition.base()
@@ -113,6 +149,19 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
             frameB.close()
             frameA.close()
         }
+    }
+
+    fun captureJointFrames(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): PhysicsJointFrames? {
+        checkUsable()
+        val first = bodies[bodyA] ?: return null
+        val second = bodies[bodyB] ?: return null
+        val transformA = snapshotOf(bodyA, first).transform
+        val transformB = snapshotOf(bodyB, second).transform
+        val anchor = (transformA.position + transformB.position) * 0.5
+        return PhysicsJointFrames(
+            localJointFrameData(transformA, anchor, transformA.rotation),
+            localJointFrameData(transformB, anchor, transformA.rotation)
+        )
     }
 
     /** Owning physics thread only. */
@@ -170,17 +219,16 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         }
     }
 
+    @JvmOverloads
     @JvmName("createAxis")
-    fun createAxis(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
+    fun createAxis(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, frames: PhysicsJointFrames? = null): Boolean {
         checkUsable()
         val first = bodies[bodyA] ?: return false
         val second = bodies[bodyB] ?: return false
         if (first.suspended != null || second.suspended != null) return false
-        val transformA = snapshotOf(bodyA, first).transform
-        val transformB = snapshotOf(bodyB, second).transform
-        val anchor = (transformA.position + transformB.position) * 0.5
-        val frameA = localJointFrame(transformA, anchor, transformA.rotation)
-        val frameB = localJointFrame(transformB, anchor, transformA.rotation)
+        val jointFrames = frames ?: captureJointFrames(bodyA, bodyB) ?: return false
+        val frameA = jointFrames.first.toNativeJointTransform()
+        val frameB = jointFrames.second.toNativeJointTransform()
         val definition = b3DefaultRevoluteJointDef()
         return try {
             definition.base().bodyIdA(first.nativeId).bodyIdB(second.nativeId)
@@ -1040,11 +1088,17 @@ private fun localJointFrame(
     worldPosition: PhysicsVector,
     worldRotation: PhysicsRotation
 ): b3Transform {
+    return localJointFrameData(body, worldPosition, worldRotation).toNativeJointTransform()
+}
+
+private fun localJointFrameData(body: PhysicsTransform, worldPosition: PhysicsVector, worldRotation: PhysicsRotation): PhysicsTransform {
     val inverse = body.rotation.normalized().let { PhysicsRotation(-it.x, -it.y, -it.z, it.w) }
-    val localPosition = inverse.rotate(worldPosition - body.position)
-    val localRotation = inverse.multiply(worldRotation.normalized()).normalized()
-    val nativePosition = localPosition.toNativeVector()
-    val nativeRotation = localRotation.toNativeRotation()
+    return PhysicsTransform(inverse.rotate(worldPosition - body.position), inverse.multiply(worldRotation.normalized()).normalized())
+}
+
+private fun PhysicsTransform.toNativeJointTransform(): b3Transform {
+    val nativePosition = position.toNativeVector()
+    val nativeRotation = rotation.toNativeRotation()
     return try {
         b3Transform().p(nativePosition).q(nativeRotation)
     } finally {

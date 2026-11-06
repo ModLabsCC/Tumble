@@ -9,6 +9,77 @@ import kotlin.test.assertTrue
 
 class AssemblyShapeTest {
     @Test
+    fun `restored weld retains its original frames when saved bodies diverge`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0)), motionType = PhysicsMotionType.STATIC))
+        val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)), motionType = PhysicsMotionType.STATIC))
+        val frames = assertNotNull(world.captureJointFrames(first, second))
+        assertTrue(world.setTransform(second, PhysicsTransform(PhysicsVector(4.0, 10.0, 0.0))))
+        assertTrue(world.createWeld(first, second, frames))
+        assertTrue(world.setMotionType(first, PhysicsMotionType.DYNAMIC))
+        assertTrue(world.setMotionType(second, PhysicsMotionType.DYNAMIC))
+        repeat(180) { world.step() }
+        val separation = assertNotNull(world.snapshot(second)).transform.position - assertNotNull(world.snapshot(first)).transform.position
+        assertEquals(2.0, separation.length(), 0.1)
+    }
+
+    @Test
+    fun `restored axis retains its original anchor when saved bodies diverge`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0)), motionType = PhysicsMotionType.STATIC))
+        val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)), motionType = PhysicsMotionType.STATIC))
+        val frames = assertNotNull(world.captureJointFrames(first, second))
+        assertTrue(world.setTransform(second, PhysicsTransform(PhysicsVector(4.0, 10.0, 0.0))))
+        assertTrue(world.createAxis(first, second, frames))
+        assertTrue(world.setMotionType(first, PhysicsMotionType.DYNAMIC))
+        assertTrue(world.setMotionType(second, PhysicsMotionType.DYNAMIC))
+        repeat(180) { world.step() }
+        val separation = assertNotNull(world.snapshot(second)).transform.position - assertNotNull(world.snapshot(first)).transform.position
+        assertEquals(2.0, separation.length(), 0.1)
+    }
+
+    @Test
+    fun `tool joints can be restored while both bodies are parked`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0)), motionType = PhysicsMotionType.STATIC))
+        val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)), motionType = PhysicsMotionType.STATIC))
+        assertTrue(world.createRope(first, second, 2f))
+        assertTrue(world.createAxis(first, second))
+        assertTrue(world.createNoCollide(first, second))
+        assertTrue(world.setMotionType(first, PhysicsMotionType.DYNAMIC))
+        assertTrue(world.setMotionType(second, PhysicsMotionType.DYNAMIC))
+        assertTrue(world.applyCentralImpulse(first, PhysicsVector(4.0, 0.0, 0.0)))
+        repeat(30) { world.step() }
+        assertTrue(assertNotNull(world.snapshot(second)).transform.position.x > 2.1)
+        assertEquals(3, world.destroyToolConstraints(first))
+    }
+
+    @Test
+    fun `restoring a component rolls back all bodies if any joint fails`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val frames = PhysicsJointFrames(PhysicsTransform(PhysicsVector(1.0, 0.0, 0.0)), PhysicsTransform(PhysicsVector(-1.0, 0.0, 0.0)))
+        val definitions = listOf(
+            PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0))),
+            PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)))
+        )
+        val weld = RestoredJoint(0, 1, PhysicsJointKind.WELD, frames)
+        assertEquals(null, world.restoreComponent(definitions, listOf(weld, weld)))
+        assertTrue(world.snapshots().isEmpty(), "failed restore left partial bodies")
+        assertEquals(0, world.weldCount())
+    }
+
+    @Test
+    fun `restoring a component activates linked bodies only after all joints exist`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val frames = PhysicsJointFrames(PhysicsTransform(PhysicsVector(1.0, 0.0, 0.0)), PhysicsTransform(PhysicsVector(-1.0, 0.0, 0.0)))
+        val definitions = listOf(
+            PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0)), linearVelocity = PhysicsVector(2.0, 0.0, 0.0)),
+            PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(4.0, 10.0, 0.0)), linearVelocity = PhysicsVector(2.0, 0.0, 0.0))
+        )
+        val ids = assertNotNull(world.restoreComponent(definitions, listOf(RestoredJoint(0, 1, PhysicsJointKind.WELD, frames))))
+        repeat(180) { world.step() }
+        val first = assertNotNull(world.snapshot(ids[0]))
+        val second = assertNotNull(world.snapshot(ids[1]))
+        assertEquals(2.0, (second.transform.position - first.transform.position).length(), 0.1)
+        assertTrue(first.transform.position.x > 1.0, "saved velocity was not restored")
+    }
+
+    @Test
     fun `a weld can be restored while both bodies are parked`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
         val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0)), motionType = PhysicsMotionType.STATIC))
         val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)), motionType = PhysicsMotionType.STATIC))
