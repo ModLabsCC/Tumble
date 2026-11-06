@@ -104,8 +104,8 @@ object PhysicsServices {
 
     fun entityUnloaded(entity: Entity, level: ServerLevel) {
         runtimes[level.server]?.let {
-            if (entity is cc.modlabs.tumble.entity.PhysicsPropEntity) it.publisher.propRemoved(entity.uuid)
-            it.manager.entityUnloaded(entity, level, visibilityEvent = true)
+            if (it.manager.entityUnloaded(entity, level, visibilityEvent = true) &&
+                entity is cc.modlabs.tumble.entity.PhysicsPropEntity) it.publisher.propRemoved(entity.uuid)
         }
     }
 
@@ -320,13 +320,22 @@ object PhysicsServices {
 
     fun trackingStarted(entity: Entity, player: ServerPlayer) {
         if (entity is cc.modlabs.tumble.entity.PhysicsPropEntity) {
-            runtimes[player.level().server]?.publisher?.startTracking(entity, player)
+            runtimes[player.level().server]?.let { runtime ->
+                val current = runtime.manager.findProp(entity.uuid)
+                if (!entity.isRemoved && (current == null || current === entity ||
+                        current.removalReason == Entity.RemovalReason.UNLOADED_TO_CHUNK)) {
+                    runtime.publisher.startTracking(entity, player)
+                }
+            }
         }
     }
 
     fun trackingStopped(entity: Entity, player: ServerPlayer) {
         if (entity is cc.modlabs.tumble.entity.PhysicsPropEntity) {
-            runtimes[player.level().server]?.publisher?.stopTracking(entity, player)
+            runtimes[player.level().server]?.let { runtime ->
+                val current = runtime.manager.findProp(entity.uuid)
+                if (current == null || current === entity) runtime.publisher.stopTracking(entity, player)
+            }
         }
     }
 

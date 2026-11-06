@@ -1840,6 +1840,203 @@ class AssemblyGameTests {
         }
     }
 
+    @GameTest
+    fun reloadedPropReplacesOnlyRemovedStaleInstance(helper: GameTestHelper) {
+        val level = helper.level
+        val logger = LoggerFactory.getLogger("stale-prop-instance-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        val manager = PhysicsPropManager(level.server, service, TerrainSectionTracker(service), logger, TumbleTuning())
+        val directory = Files.createTempDirectory("tumble-stale-instance")
+        val path = directory.resolve("connections.dat")
+        val old = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level)
+        val peer = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level)
+        val replacement = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply { setUUID(old.uuid) }
+        val origin = helper.absolutePos(BlockPos(1, 3, 1))
+        listOf(old, peer, replacement).forEach { it.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 0.5) }
+        val journalClass = Class.forName("cc.modlabs.tumble.physics.DurableConnectionJournal")
+        val journal = journalClass.getConstructor(java.nio.file.Path::class.java).newInstance(path)
+        val recordClass = Class.forName("cc.modlabs.tumble.physics.DurableConnection")
+        val record = recordClass.getConstructor(UUID::class.java, String::class.java, UUID::class.java, UUID::class.java,
+            UUID::class.java, cc.modlabs.tumble.physics.PhysicsJointKind::class.java,
+            cc.modlabs.tumble.physics.PhysicsJointFrames::class.java, Float::class.javaPrimitiveType,
+            Boolean::class.javaPrimitiveType, List::class.java, Boolean::class.javaPrimitiveType)
+            .newInstance(UUID.randomUUID(), level.physicsDimensionId().value, old.uuid, peer.uuid,
+                UUID.randomUUID(), cc.modlabs.tumble.physics.PhysicsJointKind.NO_COLLIDE, null, 0f, false, emptyList<Any>(), true)
+        journalClass.getMethod("put", recordClass).invoke(journal, record)
+        manager.javaClass.getDeclaredField("journal").apply { isAccessible = true }.set(manager, journal)
+        val propsField = manager.javaClass.getDeclaredField("props").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val props = propsField.get(manager) as Map<UUID, PhysicsPropEntity>
+        try {
+            manager.entityLoaded(old, level)
+            manager.entityLoaded(replacement, level)
+            helper.assertTrue(props[old.uuid] === old, "live entity was displaced by a duplicate UUID")
+            old.remove(net.minecraft.world.entity.Entity.RemovalReason.UNLOADED_TO_CHUNK)
+            helper.assertTrue(old.isRemoved, "old prop did not enter the unloaded state")
+            manager.entityLoaded(replacement, level)
+            helper.assertTrue(props[old.uuid] === replacement, "reloaded prop did not replace stale unloaded instance")
+            helper.assertTrue(!manager.entityUnloaded(old, level, visibilityEvent = true), "late unload matched replacement")
+            helper.assertTrue(props[old.uuid] === replacement, "late unload removed replacement")
+            helper.assertTrue((journalClass.getMethod("records").invoke(journal) as List<*>).size == 1,
+                "visibility replacement deleted the durable connection")
+
+            val stone = Blocks.STONE.defaultBlockState()
+            val expected = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone)))
+            val different = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, Blocks.DIRT.defaultBlockState())))
+            fun captured(definition: AssemblyDefinition) = AssemblyStructure.of(definition, listOf(
+                AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5)))
+            ))
+            val originalAssembly = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
+                setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 0.5)
+                initializeAssembly(captured(expected))
+            }
+            val wrongAssembly = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
+                setUUID(originalAssembly.uuid)
+                setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 0.5)
+                initializeAssembly(captured(different))
+            }
+            val recoveryType = Class.forName("cc.modlabs.tumble.physics.AssemblyRecoveryRecord")
+            val recovery = recoveryType.getConstructor(String::class.java, BlockPos::class.java, AssemblyDefinition::class.java,
+                Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+                .newInstance(level.physicsDimensionId().value, origin, expected, true, true)
+            @Suppress("UNCHECKED_CAST")
+            val recoveries = manager.javaClass.getDeclaredField("recoveryRecords").apply { isAccessible = true }.get(manager) as MutableMap<UUID, Any>
+            recoveries[originalAssembly.uuid] = recovery
+            manager.entityLoaded(originalAssembly, level)
+            originalAssembly.remove(net.minecraft.world.entity.Entity.RemovalReason.UNLOADED_TO_CHUNK)
+            manager.entityLoaded(wrongAssembly, level)
+            helper.assertTrue(props[originalAssembly.uuid] === originalAssembly && originalAssembly.uuid in recoveries,
+                "mismatched reload displaced the retained conversion journal")
+            manager.entityUnloaded(originalAssembly, level, visibilityEvent = true)
+            recoveries.remove(originalAssembly.uuid)
+        } finally {
+            manager.entityUnloaded(replacement, level, visibilityEvent = true)
+            service.close()
+            Files.deleteIfExists(path)
+            Files.deleteIfExists(directory)
+        }
+        helper.succeed()
+    }
+
+    @GameTest(maxTicks = 400)
+    fun lateBodyCreationAcknowledgementDoesNotAttachToReloadedProp(helper: GameTestHelper) {
+        val level = helper.level
+        val logger = LoggerFactory.getLogger("stale-prop-ack-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        val manager = PhysicsPropManager(level.server, service, TerrainSectionTracker(service), logger, TumbleTuning())
+        val origin = helper.absolutePos(BlockPos(1, 3, 1))
+        val old = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
+            setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 0.5)
+            initialize(Blocks.STONE.defaultBlockState(), PhysicsVector.ZERO)
+        }
+        val replacement = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
+            setUUID(old.uuid)
+            setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 0.5)
+            initialize(Blocks.STONE.defaultBlockState(), PhysicsVector.ZERO)
+        }
+        val queueField = service.javaClass.getDeclaredField("acknowledgements").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val acknowledgements = queueField.get(service) as ConcurrentLinkedQueue<PhysicsAcknowledgement>
+        manager.entityLoaded(old, level)
+        val deadline = System.nanoTime() + 5_000_000_000L
+        while (acknowledgements.none { it is PhysicsAcknowledgement.BodyCreated && it.propId == old.uuid } && System.nanoTime() < deadline) Thread.sleep(1)
+        val stale = acknowledgements.filterIsInstance<PhysicsAcknowledgement.BodyCreated>().firstOrNull { it.propId == old.uuid }
+            ?: return helper.fail("old body acknowledgement was not produced")
+        old.remove(net.minecraft.world.entity.Entity.RemovalReason.UNLOADED_TO_CHUNK)
+        manager.entityLoaded(replacement, level)
+        helper.succeedWhen {
+            Thread.sleep(5)
+            manager.tick()
+            val active = manager.networkProps().singleOrNull { it.propId == replacement.uuid }
+                ?: return@succeedWhen helper.assertTrue(false, "replacement body is not ready")
+            helper.assertTrue(active.bodyId != stale.bodyId, "stale acknowledgement attached the old body")
+            val frame = service.latestFrame(level.physicsDimensionId())
+            helper.assertTrue(active.bodyId in frame.bodies && stale.bodyId !in frame.bodies, "stale body was not destroyed")
+            manager.entityUnloaded(replacement, level, visibilityEvent = true)
+            service.close()
+        }
+    }
+
+    @GameTest
+    fun lateUnloadDoesNotClearReplacementTracking(helper: GameTestHelper) {
+        val level = helper.level
+        val runtime = PhysicsServices.runtime(level.server)!!
+        val origin = helper.absolutePos(BlockPos(1, 3, 1))
+        val old = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
+            setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 0.5)
+            initialize(Blocks.STONE.defaultBlockState(), PhysicsVector.ZERO)
+        }
+        val replacement = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
+            setUUID(old.uuid)
+            setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 0.5)
+            initialize(Blocks.STONE.defaultBlockState(), PhysicsVector.ZERO)
+        }
+        val field = runtime.publisher.javaClass.getDeclaredField("tracking").apply { isAccessible = true }
+        val tracking = field.get(runtime.publisher) as cc.modlabs.tumble.network.PhysicsTrackingManager
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        val playerId = player.uuid
+        try {
+            runtime.manager.entityLoaded(old, level)
+            old.remove(net.minecraft.world.entity.Entity.RemovalReason.UNLOADED_TO_CHUNK)
+            runtime.manager.entityLoaded(replacement, level)
+            tracking.startTracking(replacement.uuid, playerId)
+            PhysicsServices.entityUnloaded(old, level)
+            helper.assertTrue(tracking.isTracking(replacement.uuid, playerId), "late old unload erased replacement tracking")
+            PhysicsServices.trackingStopped(old, player)
+            helper.assertTrue(tracking.isTracking(replacement.uuid, playerId), "late old stop-tracking erased replacement tracking")
+        } finally {
+            tracking.stopTracking(replacement.uuid, playerId)
+            runtime.manager.entityUnloaded(replacement, level, visibilityEvent = true)
+        }
+        helper.succeed()
+    }
+
+    @GameTest(maxTicks = 1200)
+    fun conversionInNontickingChunkRegistersActualReload(helper: GameTestHelper) {
+        val level = helper.level
+        val origin = BlockPos(61008, 80, 0)
+        val chunk = net.minecraft.world.level.ChunkPos(origin.x shr 4, origin.z shr 4)
+        level.getChunkAt(origin)
+        helper.assertTrue(!level.areEntitiesActuallyLoadedAndTicking(chunk), "test source unexpectedly entity-ticking")
+        level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val id = TumbleApi.convertAssembly(level, listOf(origin), player)
+            ?: return helper.fail("conversion in loaded non-ticking chunk did not start")
+        val manager = PhysicsServices.runtime(level.server)!!.manager
+        val propsField = manager.javaClass.getDeclaredField("props").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val props = propsField.get(manager) as Map<UUID, PhysicsPropEntity>
+        val original = props[id] ?: return helper.fail("original entity not registered")
+        var replacement: PhysicsPropEntity? = null
+        var managedAtLoad = false
+        net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents.ENTITY_LOAD.register { loaded, eventLevel ->
+            if (eventLevel === level && loaded.uuid == id && loaded !== original && loaded is PhysicsPropEntity) {
+                replacement = loaded
+                managedAtLoad = props[id] === loaded
+            }
+        }
+        // Flush the entity storage while the source has no ticking ticket, then let vanilla unload it.
+        level.save(null, true, false)
+        var requestedReload = false
+        helper.succeedWhen {
+            Thread.sleep(5)
+            if (!requestedReload) {
+                helper.assertTrue(original.removalReason == net.minecraft.world.entity.Entity.RemovalReason.UNLOADED_TO_CHUNK,
+                    "original has not been unloaded: ${original.removalReason}")
+                level.setChunkForced(chunk.x, chunk.z, true)
+                level.getChunkAt(origin)
+                requestedReload = true
+                return@succeedWhen helper.assertTrue(false, "waiting for actual entity reload")
+            }
+            helper.assertTrue(replacement != null, "world did not reload a replacement entity")
+            helper.assertTrue(managedAtLoad, "actual replacement was visible but not managed")
+            val current = requireNotNull(replacement)
+            helper.assertTrue(props[id] === current || current.isRemoved && level.getBlockState(origin).`is`(Blocks.STONE),
+                "reloaded conversion was neither managed nor safely restored")
+        }
+    }
+
     @GameTest(maxTicks = 400)
     fun mutableInputPositionsCannotChangeTheCapturedSource(helper: GameTestHelper) {
         val origin = BlockPos(50304, 4, 0)
@@ -1853,13 +2050,18 @@ class AssemblyGameTests {
         }
         val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
         player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
-        val id = TumbleApi.convertAssembly(helper.level, listOf(mutable), player)
-            ?: return helper.fail("mutable input changed the conversion")
-        helper.assertTrue(helper.level.getBlockState(origin).isAir, "conversion removed the wrong source")
-        loadSingleBlockAssemblyTerrain(helper, origin)
+        var id: UUID? = null
         helper.succeedWhen {
             Thread.sleep(5)
-            helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
+            if (id == null) {
+                helper.assertTrue(helper.level.areEntitiesActuallyLoadedAndTicking(net.minecraft.world.level.ChunkPos(origin.x shr 4, origin.z shr 4)),
+                    "source chunk entities are not ticking")
+                id = TumbleApi.convertAssembly(helper.level, listOf(mutable), player)
+                    ?: return@succeedWhen helper.fail("mutable input changed the conversion")
+                helper.assertTrue(helper.level.getBlockState(origin).isAir, "conversion removed the wrong source")
+                loadSingleBlockAssemblyTerrain(helper, origin)
+            }
+            helper.assertTrue(TumbleApi.status(helper.level, requireNotNull(id)) == TumbleApi.PropStatus.READY, "assembly did not become ready")
             helper.assertTrue(helper.level.setBlock(origin, Blocks.DIRT.defaultBlockState(), 3), "mutable input left a stale source fence")
         }
     }

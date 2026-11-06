@@ -1237,7 +1237,23 @@ class PhysicsPropManager(
     }
 
     fun entityLoaded(entity: Entity, level: ServerLevel) {
-        if (entity !is PhysicsPropEntity || props.putIfAbsent(entity.uuid, entity) != null) return
+        if (entity !is PhysicsPropEntity || entity.isRemoved) return
+        val previous = props[entity.uuid]
+        if (previous === entity) return
+        if (previous != null) {
+            // An entity created before its chunk became visible can unload without a Fabric unload event.
+            // Retire only that proven unloaded instance; never displace a live duplicate or a removal in progress.
+            if (previous.removalReason != Entity.RemovalReason.UNLOADED_TO_CHUNK) return
+            val recovery = recoveryRecords[entity.uuid]
+            if (recovery != null && (level.physicsDimensionId().value != recovery.dimension ||
+                    entity.assembly?.definition?.blocks != recovery.definition.blocks)) {
+                logger.error("Reloaded assembly {} does not match its retained conversion journal", entity.uuid)
+                return
+            }
+            val previousLevel = previous.level() as? ServerLevel ?: return
+            if (!entityUnloaded(previous, previousLevel, visibilityEvent = true)) return
+        }
+        if (props.putIfAbsent(entity.uuid, entity) != null) return
         unloadedTerrainWaits.filter { it.level === level && it.propId == entity.uuid }.forEach {
             it.observedUnload = true
             if (terrain.coverageWithinBudget(entity)) it.coverageUnknown = false
