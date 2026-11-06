@@ -1908,6 +1908,18 @@ class AssemblyGameTests {
             helper.assertTrue(props[originalAssembly.uuid] === originalAssembly && originalAssembly.uuid in recoveries,
                 "mismatched reload displaced the retained conversion journal")
             manager.entityUnloaded(originalAssembly, level, visibilityEvent = true)
+            helper.assertTrue(props[originalAssembly.uuid] == null, "old assembly was not unloaded")
+            manager.entityLoaded(wrongAssembly, level)
+            helper.assertTrue(props[originalAssembly.uuid] == null && originalAssembly.uuid in recoveries,
+                "mismatched reload without an old instance bypassed the retained journal")
+            val nonAssembly = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
+                setUUID(originalAssembly.uuid)
+                setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 0.5)
+                initialize(stone, PhysicsVector.ZERO)
+            }
+            manager.entityLoaded(nonAssembly, level)
+            helper.assertTrue(props[originalAssembly.uuid] == null && originalAssembly.uuid in recoveries,
+                "non-assembly reload bypassed the retained conversion journal")
             recoveries.remove(originalAssembly.uuid)
         } finally {
             manager.entityUnloaded(replacement, level, visibilityEvent = true)
@@ -1975,17 +1987,34 @@ class AssemblyGameTests {
         val tracking = field.get(runtime.publisher) as cc.modlabs.tumble.network.PhysicsTrackingManager
         val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
         val playerId = player.uuid
+        val oldOnly = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
         try {
             runtime.manager.entityLoaded(old, level)
+            PhysicsServices.trackingStarted(old, player)
+            PhysicsServices.trackingStarted(old, oldOnly)
+            helper.assertTrue(tracking.isTracking(old.uuid, playerId) && tracking.isTracking(old.uuid, oldOnly.uuid), "old prop was not tracked")
             old.remove(net.minecraft.world.entity.Entity.RemovalReason.UNLOADED_TO_CHUNK)
-            runtime.manager.entityLoaded(replacement, level)
-            tracking.startTracking(replacement.uuid, playerId)
+            // Vanilla can emit START_TRACKING before the replacement's ENTITY_LOAD callback.
+            PhysicsServices.trackingStarted(replacement, player)
+            PhysicsServices.trackingStopped(old, player)
+            helper.assertTrue(!tracking.isTracking(old.uuid, playerId), "old stop-tracking left old tracking active")
+            @Suppress("UNCHECKED_CAST")
+            val pending = runtime.publisher.javaClass.getDeclaredField("pendingTracking").apply { isAccessible = true }.get(runtime.publisher) as Map<Any, Any>
+            val pendingReplacement = pending.values.single { entry ->
+                entry.javaClass.getDeclaredField("entity").apply { isAccessible = true }.get(entry) === replacement
+            }
+            helper.assertTrue(pendingReplacement.javaClass.getDeclaredField("deferredDespawn").apply { isAccessible = true }.getBoolean(pendingReplacement),
+                "old despawn was not deferred until replacement validation")
+            PhysicsServices.entityLoaded(replacement, level)
+            helper.assertTrue(tracking.isTracking(replacement.uuid, playerId), "accepted replacement did not resolve deferred tracking")
+            helper.assertTrue(!tracking.isTracking(replacement.uuid, oldOnly.uuid), "old-only watcher remained subscribed after replacement")
             PhysicsServices.entityUnloaded(old, level)
             helper.assertTrue(tracking.isTracking(replacement.uuid, playerId), "late old unload erased replacement tracking")
             PhysicsServices.trackingStopped(old, player)
             helper.assertTrue(tracking.isTracking(replacement.uuid, playerId), "late old stop-tracking erased replacement tracking")
         } finally {
-            tracking.stopTracking(replacement.uuid, playerId)
+            PhysicsServices.trackingStopped(replacement, player)
+            PhysicsServices.trackingStopped(old, oldOnly)
             runtime.manager.entityUnloaded(replacement, level, visibilityEvent = true)
         }
         helper.succeed()
@@ -2035,6 +2064,46 @@ class AssemblyGameTests {
             helper.assertTrue(props[id] === current || current.isRemoved && level.getBlockState(origin).`is`(Blocks.STONE),
                 "reloaded conversion was neither managed nor safely restored")
         }
+    }
+
+    @GameTest
+    fun rejectedJournalMismatchIsNeverPublished(helper: GameTestHelper) {
+        val level = helper.level
+        val runtime = PhysicsServices.runtime(level.server)!!
+        val origin = helper.absolutePos(BlockPos(1, 3, 1))
+        val expected = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, Blocks.STONE.defaultBlockState())))
+        val different = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, Blocks.DIRT.defaultBlockState())))
+        val wrong = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
+            setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 0.5)
+            initializeAssembly(AssemblyStructure.of(different, listOf(
+                AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5)))
+            )))
+        }
+        val recoveryType = Class.forName("cc.modlabs.tumble.physics.AssemblyRecoveryRecord")
+        val recovery = recoveryType.getConstructor(String::class.java, BlockPos::class.java, AssemblyDefinition::class.java,
+            Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+            .newInstance(level.physicsDimensionId().value, origin, expected, true, true)
+        @Suppress("UNCHECKED_CAST")
+        val recoveries = runtime.manager.javaClass.getDeclaredField("recoveryRecords").apply { isAccessible = true }.get(runtime.manager) as MutableMap<UUID, Any>
+        val field = runtime.publisher.javaClass.getDeclaredField("tracking").apply { isAccessible = true }
+        val tracking = field.get(runtime.publisher) as cc.modlabs.tumble.network.PhysicsTrackingManager
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        recoveries[wrong.uuid] = recovery
+        try {
+            PhysicsServices.trackingStarted(wrong, player)
+            helper.assertTrue(!tracking.isTracking(wrong.uuid, player.uuid), "unvalidated assembly was published")
+            PhysicsServices.entityLoaded(wrong, level)
+            helper.assertTrue(!tracking.isTracking(wrong.uuid, player.uuid), "rejected assembly was published")
+            @Suppress("UNCHECKED_CAST")
+            val pending = runtime.publisher.javaClass.getDeclaredField("pendingTracking").apply { isAccessible = true }.get(runtime.publisher) as Map<Any, Any>
+            helper.assertTrue(pending.values.none { entry ->
+                entry.javaClass.getDeclaredField("entity").apply { isAccessible = true }.get(entry) === wrong
+            }, "rejected assembly left a deferred tracking entry")
+        } finally {
+            PhysicsServices.trackingStopped(wrong, player)
+            recoveries.remove(wrong.uuid)
+        }
+        helper.succeed()
     }
 
     @GameTest(maxTicks = 400)

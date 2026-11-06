@@ -96,16 +96,22 @@ object PhysicsServices {
         runtimes[level.server]?.manager?.assemblyConversionPending(id) ?: false
 
     fun entityLoaded(entity: Entity, level: ServerLevel) {
-        runtimes[level.server]?.manager?.let { manager ->
-            if (entity is ItemEntity) manager.itemLoaded(entity, level)
-            manager.entityLoaded(entity, level)
+        runtimes[level.server]?.let { runtime ->
+            if (entity is ItemEntity) runtime.manager.itemLoaded(entity, level)
+            val previous = if (entity is cc.modlabs.tumble.entity.PhysicsPropEntity) runtime.manager.findProp(entity.uuid) else null
+            runtime.manager.entityLoaded(entity, level)
+            if (entity is cc.modlabs.tumble.entity.PhysicsPropEntity) {
+                val accepted = runtime.manager.findProp(entity.uuid) === entity
+                if (accepted && previous != null && previous !== entity) runtime.publisher.retireTracking(previous)
+                runtime.publisher.resolveTracking(entity, accepted)
+            }
         }
     }
 
     fun entityUnloaded(entity: Entity, level: ServerLevel) {
         runtimes[level.server]?.let {
             if (it.manager.entityUnloaded(entity, level, visibilityEvent = true) &&
-                entity is cc.modlabs.tumble.entity.PhysicsPropEntity) it.publisher.propRemoved(entity.uuid)
+                entity is cc.modlabs.tumble.entity.PhysicsPropEntity) it.publisher.propRemoved(entity)
         }
     }
 
@@ -319,23 +325,17 @@ object PhysicsServices {
     }
 
     fun trackingStarted(entity: Entity, player: ServerPlayer) {
-        if (entity is cc.modlabs.tumble.entity.PhysicsPropEntity) {
+        if (entity is cc.modlabs.tumble.entity.PhysicsPropEntity && !entity.isRemoved) {
             runtimes[player.level().server]?.let { runtime ->
-                val current = runtime.manager.findProp(entity.uuid)
-                if (!entity.isRemoved && (current == null || current === entity ||
-                        current.removalReason == Entity.RemovalReason.UNLOADED_TO_CHUNK)) {
-                    runtime.publisher.startTracking(entity, player)
-                }
+                if (runtime.manager.findProp(entity.uuid) === entity) runtime.publisher.startTracking(entity, player)
+                else runtime.publisher.deferTracking(entity, player)
             }
         }
     }
 
     fun trackingStopped(entity: Entity, player: ServerPlayer) {
         if (entity is cc.modlabs.tumble.entity.PhysicsPropEntity) {
-            runtimes[player.level().server]?.let { runtime ->
-                val current = runtime.manager.findProp(entity.uuid)
-                if (current == null || current === entity) runtime.publisher.stopTracking(entity, player)
-            }
+            runtimes[player.level().server]?.publisher?.stopTracking(entity, player)
         }
     }
 

@@ -33,6 +33,10 @@ class ServerPhysicsSnapshotPublisher(
     private val manager: PhysicsPropManager
 ) {
     private val tracking = PhysicsTrackingManager()
+    private data class TrackingKey(val propId: UUID, val playerId: UUID)
+    private data class PendingTracking(val entity: PhysicsPropEntity, val player: ServerPlayer, var deferredDespawn: Boolean = false)
+    private val trackingInstances = mutableMapOf<TrackingKey, PhysicsPropEntity>()
+    private val pendingTracking = mutableMapOf<TrackingKey, PendingTracking>()
     private var publicationSequence = 0L
     private var lastPublishedTick = -1L
     private var latestPhysicsStep = 0L
@@ -44,8 +48,27 @@ class ServerPhysicsSnapshotPublisher(
     private val debugPlayers = mutableSetOf<UUID>()
     private val assemblyRequests = mutableMapOf<UUID, AssemblyRequestBudget>()
 
+    fun deferTracking(entity: PhysicsPropEntity, player: ServerPlayer) {
+        val key = TrackingKey(entity.uuid, player.uuid)
+        pendingTracking[key] = PendingTracking(entity, player, pendingTracking[key]?.deferredDespawn == true)
+    }
+
+    fun resolveTracking(entity: PhysicsPropEntity, accepted: Boolean) {
+        val matching = pendingTracking.filterValues { it.entity === entity }.toList()
+        matching.forEach { (key, pending) ->
+            pendingTracking.remove(key)
+            if (accepted && !entity.isRemoved && !pending.player.isRemoved && pending.player.level() === entity.level()) {
+                startTracking(entity, pending.player)
+            } else sendDeferredDespawn(key, pending)
+        }
+    }
+
     fun startTracking(entity: PhysicsPropEntity, player: ServerPlayer) {
+        val key = TrackingKey(entity.uuid, player.uuid)
+        if (pendingTracking[key]?.entity === entity) pendingTracking.remove(key)
+        trackingInstances[key] = entity
         tracking.startTracking(entity.uuid, player.uuid)
+        if (player.connection == null) return
         entity.assembly?.let { structure ->
             if (ServerPlayNetworking.canSend(player, AssemblyPayload.TYPE)) {
                 ServerPlayNetworking.send(player, AssemblyPayload(entity.uuid, (entity.level() as net.minecraft.server.level.ServerLevel).physicsDimensionId(), structure))
@@ -54,21 +77,54 @@ class ServerPhysicsSnapshotPublisher(
         publish(player, setOf(entity.uuid), server.tickCount.toLong())
     }
 
-    fun stopTracking(entity: PhysicsPropEntity, player: ServerPlayer) {
-        if (tracking.stopTracking(entity.uuid, player.uuid) && ServerPlayNetworking.canSend(player, PhysicsDespawnPayload.TYPE)) {
-            ServerPlayNetworking.send(player, PhysicsDespawnPayload(entity.uuid))
+    private fun sendDespawn(player: ServerPlayer, propId: UUID) {
+        if (player.connection != null && ServerPlayNetworking.canSend(player, PhysicsDespawnPayload.TYPE)) {
+            ServerPlayNetworking.send(player, PhysicsDespawnPayload(propId))
         }
     }
 
-    fun propRemoved(propId: UUID) {
-        tracking.removeProp(propId).forEach { playerId ->
-            server.playerList.getPlayer(playerId)?.takeIf { ServerPlayNetworking.canSend(it, PhysicsDespawnPayload.TYPE) }
-                ?.let { ServerPlayNetworking.send(it, PhysicsDespawnPayload(propId)) }
+    private fun sendDeferredDespawn(key: TrackingKey, pending: PendingTracking) {
+        if (pending.deferredDespawn && trackingInstances[key] == null && pendingTracking[key] == null) {
+            sendDespawn(pending.player, key.propId)
         }
     }
+
+    private fun stopActiveTracking(key: TrackingKey, entity: PhysicsPropEntity, player: ServerPlayer?) {
+        if (trackingInstances[key] !== entity) return
+        trackingInstances.remove(key)
+        if (!tracking.stopTracking(key.propId, key.playerId)) return
+        val pending = pendingTracking[key]
+        if (pending != null && pending.entity !== entity) pending.deferredDespawn = true
+        else if (player != null) sendDespawn(player, key.propId)
+    }
+
+    fun stopTracking(entity: PhysicsPropEntity, player: ServerPlayer) {
+        val key = TrackingKey(entity.uuid, player.uuid)
+        val pending = pendingTracking[key]
+        if (pending?.entity === entity) {
+            pendingTracking.remove(key)
+            sendDeferredDespawn(key, pending)
+        }
+        stopActiveTracking(key, entity, player)
+    }
+
+    fun retireTracking(entity: PhysicsPropEntity) {
+        val pendingForEntity = pendingTracking.filterValues { it.entity === entity }.toList()
+        pendingForEntity.forEach { (key, pending) ->
+            pendingTracking.remove(key)
+            sendDeferredDespawn(key, pending)
+        }
+        trackingInstances.filterValues { it === entity }.keys.toList().forEach { key ->
+            stopActiveTracking(key, entity, server.playerList.getPlayer(key.playerId))
+        }
+    }
+
+    fun propRemoved(entity: PhysicsPropEntity) = retireTracking(entity)
 
     fun playerDisconnected(playerId: UUID) {
         tracking.clearPlayer(playerId)
+        trackingInstances.keys.removeIf { it.playerId == playerId }
+        pendingTracking.keys.removeIf { it.playerId == playerId }
         debugPlayers.remove(playerId)
         assemblyRequests.remove(playerId)
     }
@@ -115,6 +171,8 @@ class ServerPhysicsSnapshotPublisher(
 
     fun close() {
         tracking.clear()
+        trackingInstances.clear()
+        pendingTracking.clear()
         debugPlayers.clear()
         assemblyRequests.clear()
     }

@@ -25,6 +25,7 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking
 
 object ClientPhysicsNetworking {
+    private val trackedEntities = ClientEntityInstances<PhysicsPropEntity>()
     fun cycleToolGunMode(delta: Int) {
         if (ClientPlayNetworking.canSend(ToolGunModePayload.TYPE)) {
             ClientPlayNetworking.send(ToolGunModePayload(delta))
@@ -70,17 +71,22 @@ object ClientPhysicsNetworking {
         }
         ClientEntityEvents.ENTITY_LOAD.register { entity, _ ->
             if (entity is PhysicsPropEntity) {
+                if (trackedEntities.track(entity.uuid, entity)) {
+                    ClientPhysicsState.untrack(entity.uuid)
+                    ClientAssemblyState.untrack(entity.uuid)
+                }
                 ClientPhysicsState.track(entity.uuid)
                 ClientAssemblyState.track(entity)
             }
         }
         ClientEntityEvents.ENTITY_UNLOAD.register { entity, _ ->
-            if (entity is PhysicsPropEntity) {
+            if (entity is PhysicsPropEntity && trackedEntities.untrack(entity.uuid, entity)) {
                 ClientPhysicsState.untrack(entity.uuid)
                 ClientAssemblyState.untrack(entity.uuid)
             }
         }
         ClientLevelEvents.AFTER_CLIENT_LEVEL_CHANGE.register { _, level ->
+            trackedEntities.clear()
             ClientPhysicsState.changeDimension(PhysicsDimensionId(level.dimension().identifier().toString()))
             ClientAssemblyState.changeDimension(PhysicsDimensionId(level.dimension().identifier().toString()))
         }
@@ -92,6 +98,7 @@ object ClientPhysicsNetworking {
             }
         }
         ClientPlayConnectionEvents.DISCONNECT.register { _, _ ->
+            trackedEntities.clear()
             ClientPhysicsState.disconnect()
             ClientAssemblyState.changeDimension(null)
             ClientToolGunState.clear()
