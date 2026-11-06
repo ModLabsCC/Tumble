@@ -21,6 +21,10 @@ abstract class RemovalManagerCrashMixin {
         try { java.nio.file.Files.writeString(java.nio.file.Path.of("removal-ticket-probe-reached.txt"), "ticking and retained"); }
         catch (java.io.IOException error) { throw new java.io.UncheckedIOException(error); }
     }
+    @Inject(method = "drainImpactEvents", at = @At("RETURN"), remap = false)
+    private void tumble$afterExplosion(CallbackInfo ci) throws Exception {
+        RemovalCrashHook.crash("exploded", null);
+    }
     @Inject(method = "checkpointRemoval", at = @At("HEAD"), remap = false)
     private void tumble$beforeRemovalCheckpoint(UUID id, ServerLevel level, CallbackInfo ci) throws Exception {
         if ("verify".equals(System.getProperty("tumble.removal.phase")) && Boolean.getBoolean("tumble.removal.replayCrash")) {

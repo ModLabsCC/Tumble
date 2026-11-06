@@ -69,6 +69,7 @@ class RemovalRestartGameTests {
                     player.setPos(pos.x + 0.5, pos.y.toDouble(), pos.z + 2.0)
                     Files.writeString(idFile, "${first.uuid}\n${second.uuid}\n${pos.x} ${pos.y} ${pos.z}\n")
                     for (dx in -1..1) for (dz in -1..1) level.setChunkForced((origin.x shr 4) + dx, (origin.z shr 4) + dz, false)
+                    if (System.getProperty("tumble.removal.stage") == "exploded") level.setBlock(pos, Blocks.GLASS.defaultBlockState(), 3)
                     RemovalCrashHook.level = level
                     when (System.getProperty("tumble.removal.action", "api")) {
                         "api" -> TumbleApi.remove(level, first.uuid)
@@ -127,8 +128,9 @@ class RemovalRestartGameTests {
                 origin.x - 32.0, origin.y - 80.0, origin.z - 32.0,
                 origin.x + 32.0, origin.y + 32.0, origin.z + 32.0))
             val ids = props.mapTo(mutableSetOf()) { it.uuid }
-            val committed = System.getProperty("tumble.removal.stage") in setOf("started", "removed", "checkpointed")
+            val committed = System.getProperty("tumble.removal.stage") in setOf("started", "removed", "checkpointed", "exploded")
             helper.assertTrue(second in ids, "peer was lost: $ids")
+            if (System.getProperty("tumble.removal.stage") == "exploded") helper.assertTrue(level.getBlockState(pos).isAir, "explosion block damage was not persisted")
             helper.assertTrue(if (committed) first !in ids else first in ids, "removal did not recover as expected: $ids")
             val manager = PhysicsServices.runtime(level.server)!!.manager
             val journal = manager.javaClass.getDeclaredField("journal").apply { isAccessible = true }.get(manager)
