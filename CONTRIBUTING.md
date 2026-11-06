@@ -14,3 +14,6 @@ For a local physics baseline, run `./gradlew :physics-core:benchmark`. It measur
 You are welcome to use coding agents or other AI tools. Review and test their changes as you would any other contribution: the person submitting the pull request is responsible for its correctness, security and licensing.
 
 New source files should include `SPDX-License-Identifier: MPL-2.0`. Only contribute code and assets you have the right to share, and retain any required third-party notices.
+# Assembly restart test
+
+Run `./gradlew runAssemblyRestartTest -PacceptMinecraftEula=true` with Java 25 to test a converted assembly across two production server processes and an orderly disk save. The task removes only its dedicated `build/run/assemblyRestart/world` test world. This does not simulate crashes or independent chunk/entity save ordering.
