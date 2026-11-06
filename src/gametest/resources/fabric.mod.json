@@ -8,12 +8,15 @@
     "fabric-gametest": [
       "cc.modlabs.tumble.PhysicsWorldGameTest",
       "cc.modlabs.tumble.TumbleAddonGameTest",
+      { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.GameTestInventory" },
+      { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyGraphRestartGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyRestartGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.ConnectionCrashGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.PlacementRestartGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.RemovalRestartGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyGameTests" },
       { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.AssemblyTerrainGameTests" },
+      { "adapter": "kotlin", "value": "cc.modlabs.tumble.gametest.PistonLoadGameTests" },
       {
         "adapter": "kotlin",
         "value": "cc.modlabs.tumble.gametest.TumbleGameTests"

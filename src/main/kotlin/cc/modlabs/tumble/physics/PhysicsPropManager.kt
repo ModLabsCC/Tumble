@@ -264,6 +264,11 @@ class PhysicsPropManager(
             initializeAssembly(structure)
             recoveryOrigin = origin
         }
+        if (!terrain.coverageWithinBudget(entity)) {
+            if (player.connection != null)
+                player.sendSystemMessage(net.minecraft.network.chat.Component.translatable("message.tumble.assembly.terrain_budget"))
+            return null
+        }
         val record = AssemblyRecoveryRecord(level.physicsDimensionId().value, origin, structure.definition, fenced = true, passengerSafe = true)
         try {
             conversionJournal.prepare(entity.uuid, record.encode())
@@ -1217,7 +1222,7 @@ class PhysicsPropManager(
                 val state = checkpoint.getValue(prop.uuid)
                 RestoreBody(prop.uuid, requests.getValue(prop.uuid), bodyDefinition(prop, level).copy(
                     transform = state.transform, linearVelocity = state.linearVelocity, angularVelocity = state.angularVelocity
-                ))
+                ), terrainGuard(prop, level))
             }
             val token = PhysicsRestoreToken()
             if (!service.submit(PhysicsCommand.RestoreComponent(level.physicsDimensionId(), bodies, joints, token))) {
@@ -1233,7 +1238,10 @@ class PhysicsPropManager(
 
     fun entityLoaded(entity: Entity, level: ServerLevel) {
         if (entity !is PhysicsPropEntity || props.putIfAbsent(entity.uuid, entity) != null) return
-        unloadedTerrainWaits.filter { it.level === level && it.propId == entity.uuid }.forEach { it.observedUnload = true }
+        unloadedTerrainWaits.filter { it.level === level && it.propId == entity.uuid }.forEach {
+            it.observedUnload = true
+            if (terrain.coverageWithinBudget(entity)) it.coverageUnknown = false
+        }
         if (entity.assembly != null) assemblies[entity.uuid] = entity
         associations.register(entity.uuid)
         if (entity.uuid in placementRecords || entity.uuid in removalRecords) {
@@ -1279,7 +1287,7 @@ class PhysicsPropManager(
         val skipPrime = skipTerrainPrime.remove(entity.uuid)
         if (entity.assembly != null) {
             if (!service.isRunning()) return
-            if (!terrain.primeForAssembly(level, entity)) {
+            if (!terrain.primeForAssembly(level, entity, allowQueued = true)) {
                 if (!service.isRunning()) return
                 entity.physicsPending = true
                 deferredAssemblies.addLast(entity.uuid)
@@ -1338,7 +1346,7 @@ class PhysicsPropManager(
             if (terrainWait != null || isVisibilityUnload && service.submit(PhysicsCommand.SuspendBody(dimension, bodyId))) {
                 unloadedTerrainWaits += UnloadedTerrainWait(
                     level, entity.uuid, bodyId, terrainWait ?: mutableSetOf(), terrain.coveredChunks(entity),
-                    terrainWait != null, service.latestFrame(dimension).physicsStep
+                    terrainWait != null, service.latestFrame(dimension).physicsStep, !terrain.coverageWithinBudget(entity)
                 )
             }
             bodyOwners.remove(RuntimeBodyKey(dimension, bodyId))
@@ -1361,13 +1369,13 @@ class PhysicsPropManager(
             prop.level() === level &&
                 kotlin.math.abs(Math.floorDiv(prop.blockX, 16) - chunkX) <= 1 &&
                 kotlin.math.abs(Math.floorDiv(prop.blockZ, 16) - chunkZ) <= 1
-        } || assemblies.values.any { it.level() === level && chunk in terrain.coveredChunks(it) }
+        } || assemblies.values.any { it.level() === level && (!terrain.coverageWithinBudget(it) || chunk in terrain.coveredChunks(it)) }
         if (needed) terrain.chunkLoaded(level, chunkX, chunkZ)
     }
 
     fun chunkUnloaded(level: ServerLevel, chunkX: Int, chunkZ: Int) {
         val chunk = ChunkPos.pack(chunkX, chunkZ)
-        val affected = assemblies.values.filter { it.level() === level && chunk in terrain.coveredChunks(it) }
+        val affected = assemblies.values.filter { it.level() === level && (!terrain.coverageWithinBudget(it) || chunk in terrain.coveredChunks(it)) }
         val unloaded = unloadedTerrainWaits.filter { it.level === level && chunk in it.watchedChunks }
         if (affected.isNotEmpty() || unloaded.isNotEmpty()) unavailableTerrain.getOrPut(level, ::mutableSetOf).add(chunk)
         unloaded.forEach {
@@ -1609,7 +1617,7 @@ class PhysicsPropManager(
             val entity = props[id] ?: return@repeat
             val level = entity.level() as? ServerLevel ?: return@repeat
             val waiting = entity.terrainBlockers.any { terrainBlocked(level, it) }
-            if (waiting || !service.isRunning() || !terrain.primeForAssembly(level, entity)) {
+            if (waiting || !service.isRunning() || !terrain.primeForAssembly(level, entity, allowQueued = true)) {
                 deferredTerrainProps.addLast(id)
             } else {
                 entity.terrainBlockers = emptyList()
@@ -1630,7 +1638,7 @@ class PhysicsPropManager(
                 else retainFailedAssembly(entity)
                 return@repeat
             }
-            if (!terrain.primeForAssembly(level, entity)) {
+            if (!terrain.primeForAssembly(level, entity, allowQueued = true)) {
                 if (service.isRunning()) deferredAssemblies.addLast(id) else {
                     entity.physicsPending = false
                     if (rollbackPendingConversion(id)) {
@@ -1647,7 +1655,7 @@ class PhysicsPropManager(
         convertPendingPlacedBlocks()
         convertPendingDroppedItems()
         unloadedTerrainWaits.removeIf { wait ->
-            if (!wait.observedUnload || wait.chunks.isNotEmpty() || !service.isRunning()) return@removeIf false
+            if (wait.coverageUnknown || !wait.observedUnload || wait.chunks.isNotEmpty() || !service.isRunning()) return@removeIf false
             val frame = service.latestFrame(wait.level.physicsDimensionId())
             if (frame.physicsStep <= wait.unloadStep || wait.bodyId in frame.bodies) return@removeIf false
             val affected = props.values.filter { prop ->
@@ -1662,7 +1670,7 @@ class PhysicsPropManager(
             val missing = terrain.coveredChunks(prop).filterTo(mutableSetOf()) {
                 !level.chunkSource.hasChunk(ChunkPos.getX(it), ChunkPos.getZ(it))
             }
-            if (missing.isNotEmpty()) pauseForTerrain(prop, level, missing)
+            if (missing.isNotEmpty() || !terrain.assemblyTerrainReady(level, prop)) pauseForTerrain(prop, level, missing)
             val waiting = terrainWaits[prop.uuid]
             val body = prop.runtimeBodyId
             if (waiting != null && waiting.isEmpty() && body != null && terrain.primeForAssembly(level, prop) &&
@@ -2417,11 +2425,14 @@ class PhysicsPropManager(
         )
     }
 
+    private fun terrainGuard(entity: PhysicsPropEntity, level: ServerLevel) =
+        entity.assembly?.let { AssemblyTerrainGuard(it.coverageBounds, level.minSectionY, level.maxSectionY) }
+
     private fun queueBodyCreation(entity: PhysicsPropEntity, level: ServerLevel) {
         if (entity.physicsPending || entity.runtimeBodyId != null) return
         entity.physicsPending = true
         val command = PhysicsCommand.SpawnBody(
-            entity.uuid, level.physicsDimensionId(), bodyDefinition(entity, level), associations.requestId(entity.uuid)
+            entity.uuid, level.physicsDimensionId(), bodyDefinition(entity, level), associations.requestId(entity.uuid), terrainGuard(entity, level)
         )
         val accepted = if (entity.uuid in terrainWaits) service.submitSuspendedSpawn(command) else service.submit(command)
         if (!accepted) entity.physicsPending = false
@@ -2463,6 +2474,19 @@ class PhysicsPropManager(
                     prepared.chunks.all { prepared.level.areEntitiesActuallyLoadedAndTicking(it) }
             }
             when (val acknowledgement = ready?.acknowledgement ?: service.pollAcknowledgement() ?: return) {
+                is PhysicsAcknowledgement.AssemblyTerrainBlocked -> {
+                    val entity = props[acknowledgement.propId] ?: continue
+                    val level = entity.level() as? ServerLevel ?: continue
+                    if (entity.runtimeBodyId != acknowledgement.bodyId || level.physicsDimensionId() != acknowledgement.dimension) continue
+                    val members = componentFor(level, entity.uuid)
+                    if (members.size > 1) parkForRecovery(level, members)
+                    else {
+                        val missing = terrain.coveredChunks(entity).filterTo(mutableSetOf()) {
+                            !level.chunkSource.hasChunk(ChunkPos.getX(it), ChunkPos.getZ(it))
+                        }
+                        pauseForTerrain(entity, level, missing)
+                    }
+                }
                 is PhysicsAcknowledgement.ComponentStaged -> {
                     val group = restoreGroups[acknowledgement.token] ?: continue
                     group.bodies = acknowledgement.bodies
@@ -2477,6 +2501,7 @@ class PhysicsPropManager(
                         prop != null && !prop.isRemoved && prop.level() === group.level &&
                             associations.isCurrent(id, group.requests.getValue(id)) &&
                             prop.terrainBlockers.none { terrainBlocked(group.level, it) } &&
+                            (prop.assembly == null || terrain.assemblyTerrainReady(group.level, prop)) &&
                             terrain.coveredChunks(prop).none { terrainBlocked(group.level, it) }
                     } && componentFor(group.level, group.members.first()) == group.members
                     if (!ready || !service.submit(PhysicsCommand.ActivateRestoredComponent(acknowledgement.token))) {
@@ -2487,7 +2512,8 @@ class PhysicsPropManager(
                     val group = restoreGroups[acknowledgement.token] ?: continue
                     if (!acknowledgement.success || !acknowledgement.token.valid || group.members.any { id ->
                             val prop = props[id]
-                            prop == null || prop.isRemoved || !associations.isCurrent(id, group.requests.getValue(id))
+                            prop == null || prop.isRemoved || !associations.isCurrent(id, group.requests.getValue(id)) ||
+                                (prop.assembly != null && !terrain.assemblyTerrainReady(group.level, prop))
                         } || componentFor(group.level, group.members.first()) != group.members) {
                         if (parkingGroups.values.none { parked -> parked.members.any { it in group.members } }) parkStaged(acknowledgement.token, group)
                         continue
@@ -2651,6 +2677,13 @@ class PhysicsPropManager(
                         bodyOwners[RuntimeBodyKey(acknowledgement.dimension, acknowledgement.bodyId)] =
                             acknowledgement.propId
                         bodyGenerations.nextGeneration(acknowledgement.propId)
+                        if (acknowledgement.terrainBlocked) {
+                            val level = entity.level() as ServerLevel
+                            val missing = terrain.coveredChunks(entity).filterTo(mutableSetOf()) {
+                                !level.chunkSource.hasChunk(ChunkPos.getX(it), ChunkPos.getZ(it))
+                            }
+                            pauseForTerrain(entity, level, missing)
+                        }
                         converted?.forEach(::notifyConvertedBlock)
                         pendingPhysicsGunHolds.remove(acknowledgement.propId)?.let { playerId ->
                             val player = server.playerList.getPlayer(playerId)
@@ -2725,7 +2758,8 @@ private data class UnloadedTerrainWait(
     val chunks: MutableSet<Long>,
     val watchedChunks: Set<Long>,
     var observedUnload: Boolean,
-    val unloadStep: Long
+    val unloadStep: Long,
+    var coverageUnknown: Boolean
 )
 
 object ExplosionMotion {

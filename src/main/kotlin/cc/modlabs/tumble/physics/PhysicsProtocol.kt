@@ -21,7 +21,7 @@ class PhysicsRestoreToken {
     @Volatile internal var valid = true
 }
 
-data class RestoreBody(val propId: UUID, val requestId: UUID, val definition: PhysicsBodyDefinition)
+data class RestoreBody(val propId: UUID, val requestId: UUID, val definition: PhysicsBodyDefinition, val terrainGuard: AssemblyTerrainGuard? = null)
 data class ParkBody(val propId: UUID, val bodyId: PhysicsBodyId)
 
 sealed interface PhysicsCommand {
@@ -31,7 +31,8 @@ sealed interface PhysicsCommand {
         val propId: UUID,
         val dimension: PhysicsDimensionId,
         val definition: PhysicsBodyDefinition,
-        val requestId: UUID = UUID.randomUUID()
+        val requestId: UUID = UUID.randomUUID(),
+        val terrainGuard: AssemblyTerrainGuard? = null
     ) : PhysicsCommand
     data class ParkComponent(val dimension: PhysicsDimensionId, val bodies: List<ParkBody>, val requestId: UUID) : PhysicsCommand
     data class RestoreComponent(
@@ -83,12 +84,14 @@ sealed interface PhysicsCommand {
     data class ReplaceTerrainSection(
         val dimension: PhysicsDimensionId,
         val section: PhysicsSectionPosition,
-        val geometry: List<TerrainBlockGeometry>
+        val geometry: List<TerrainBlockGeometry>,
+        val revision: Long = 0
     ) : PhysicsCommand
     data class RemoveTerrainSection(
         val dimension: PhysicsDimensionId,
         val section: PhysicsSectionPosition
     ) : PhysicsCommand
+    data class InvalidateTerrainSection(val dimension: PhysicsDimensionId, val section: PhysicsSectionPosition) : PhysicsCommand
     data class WakeBody(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId) : PhysicsCommand
     data class SuspendBody(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId) : PhysicsCommand
     data class SuspendProp(val dimension: PhysicsDimensionId, val propId: UUID) : PhysicsCommand
@@ -139,6 +142,7 @@ sealed interface PhysicsCommand {
 }
 
 sealed interface PhysicsAcknowledgement {
+    data class AssemblyTerrainBlocked(val propId: UUID, val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId) : PhysicsAcknowledgement
     data class ConnectionCreated(val requestId: UUID, val success: Boolean) : PhysicsAcknowledgement
     data class ConnectionPrepared(
         val requestId: UUID, val frames: PhysicsJointFrames?, val snapshots: Map<UUID, PhysicsBodySnapshot> = emptyMap()
@@ -151,7 +155,8 @@ sealed interface PhysicsAcknowledgement {
         val propId: UUID,
         val dimension: PhysicsDimensionId,
         val bodyId: PhysicsBodyId,
-        val requestId: UUID
+        val requestId: UUID,
+        val terrainBlocked: Boolean = false
     ) : PhysicsAcknowledgement
 
     data class BodyCreationFailed(val propId: UUID, val message: String, val requestId: UUID) : PhysicsAcknowledgement

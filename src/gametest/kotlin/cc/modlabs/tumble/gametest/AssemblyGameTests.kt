@@ -397,6 +397,31 @@ class AssemblyGameTests {
         }
     }
 
+    private fun loadAssemblyNeighborhood(helper: GameTestHelper, first: BlockPos, last: BlockPos) {
+        for (x in ((minOf(first.x, last.x) - 48) shr 4)..((maxOf(first.x, last.x) + 48) shr 4)) for (z in -3..3) {
+            helper.level.setChunkForced(x, z, true)
+            helper.level.getChunkAt(BlockPos(x shl 4, first.y, z shl 4))
+        }
+    }
+
+    private fun loadSingleBlockAssemblyTerrain(helper: GameTestHelper, origin: BlockPos) {
+        val stone = Blocks.STONE.defaultBlockState()
+        val structure = AssemblyStructure.of(AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone))), listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5)))
+        ))
+        val entity = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level).apply {
+            setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+            initializeAssembly(structure)
+        }
+        val tracker = PhysicsServices.runtime(helper.level.server)!!.terrain
+        helper.assertTrue(tracker.coverageWithinBudget(entity), "single-block coverage exceeded the budget")
+        tracker.coveredChunks(entity).forEach { packed ->
+            val x = net.minecraft.world.level.ChunkPos.getX(packed)
+            val z = net.minecraft.world.level.ChunkPos.getZ(packed)
+            helper.level.setChunkForced(x, z, true)
+            helper.level.getChunkAt(BlockPos(x shl 4, origin.y, z shl 4))
+        }
+    }
     @GameTest(maxTicks = 400)
     fun failedNativeWeldCanBeRetried(helper: GameTestHelper) {
         val runtime = PhysicsServices.runtime(helper.level.server)!!
@@ -653,8 +678,10 @@ class AssemblyGameTests {
                 }
                 2 -> if (frame.physicsStep - step >= 40) {
                     val bodies = runtime.manager.networkProps().associateBy { it.propId }
-                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, bodies.getValue(root.uuid).bodyId, PhysicsVector.ZERO))
-                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, bodies.getValue(peer.uuid).bodyId, PhysicsVector.ZERO))
+                    val rootBody = bodies[root.uuid] ?: return@succeedWhen helper.assertTrue(false, "moving assembly parked before checkpoint")
+                    val peerBody = bodies[peer.uuid] ?: return@succeedWhen helper.assertTrue(false, "moving peer parked before checkpoint")
+                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, rootBody.bodyId, PhysicsVector.ZERO))
+                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, peerBody.bodyId, PhysicsVector.ZERO))
                     step = frame.physicsStep
                     phase = 5
                 }
@@ -703,11 +730,17 @@ class AssemblyGameTests {
     }
 
     @GameTest(maxTicks = 1600)
-    fun reopenedManagerWaitsForBothJournaledEndpoints(helper: GameTestHelper) {
+    fun reopenedManagerWaitsForBothJournaledEndpoints(helper: GameTestHelper) = checkReopenedManager(helper, false)
+
+    @GameTest(maxTicks = 1600)
+    fun reopenedManagerKeepsOverBudgetComponentParked(helper: GameTestHelper) = checkReopenedManager(helper, true)
+
+    private fun checkReopenedManager(helper: GameTestHelper, oversized: Boolean) {
         val runtime = PhysicsServices.runtime(helper.level.server)!!
-        val origin = BlockPos(5504, 50, 0)
+        val origin = BlockPos(if (oversized) 5632 else 5504, 50, 0)
         helper.level.setChunkForced(origin.x shr 4, 0, true)
         helper.level.getChunkAt(origin)
+        loadSingleBlockAssemblyTerrain(helper, origin)
         for (x in 0..4) for (z in 0..2) helper.level.setBlock(origin.offset(x, -1, z), Blocks.STONE.defaultBlockState(), 3)
         val stone = Blocks.STONE.defaultBlockState()
         val structure = AssemblyStructure.of(AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone))), listOf(
@@ -734,6 +767,8 @@ class AssemblyGameTests {
         var restoredPeer: PhysicsPropEntity? = null
         var beforeX = 0.0
         var checkpointX = 0.0
+        var budgetReleased = !oversized
+        var reportedMissing = false
         helper.succeedWhen {
             Thread.sleep(5)
             val frame = runtime.service.latestFrame(dimension)
@@ -742,6 +777,7 @@ class AssemblyGameTests {
                 0 -> {
                     val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
                     if (assembly.uuid !in ready || peer.uuid !in ready) return@succeedWhen helper.assertTrue(false, "original bodies not ready")
+                    helper.assertTrue(TumbleApi.status(helper.level, assembly.uuid) == TumbleApi.PropStatus.READY, "assembly terrain not ready")
                     helper.assertTrue(runtime.manager.useToolGunWeld(player, assembly) == ToolGunWeldResult.SELECTED, "weld selection failed")
                     helper.assertTrue(runtime.manager.useToolGunWeld(player, peer) == ToolGunWeldResult.WELDED, "weld creation failed")
                     phase = 1
@@ -750,22 +786,81 @@ class AssemblyGameTests {
                     if (TumbleApi.status(helper.level, assembly.uuid) != TumbleApi.PropStatus.READY ||
                         TumbleApi.status(helper.level, peer.uuid) != TumbleApi.PropStatus.READY)
                         return@succeedWhen helper.assertTrue(false, "original weld not installed")
-                    val peerBody = runtime.manager.networkProps().first { it.propId == peer.uuid }
+                    val peerBody = runtime.manager.networkProps().firstOrNull { it.propId == peer.uuid }
+                        ?: return@succeedWhen helper.assertTrue(false, "peer became unavailable before velocity injection")
                     runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, peerBody.bodyId, PhysicsVector(20.0, 0.0, 0.0)))
                     checkpoint = frame.physicsStep
                     phase = 5
+                    if (java.lang.Boolean.getBoolean("tumble.test.checkpointStall")) {
+                        Thread.sleep(4000)
+                        val field = runtime.service.javaClass.getDeclaredField("acknowledgements").apply { isAccessible = true }
+                        val queue = field.get(runtime.service) as ConcurrentLinkedQueue<*>
+                        val blocked = queue.filterIsInstance<PhysicsAcknowledgement.AssemblyTerrainBlocked>().firstOrNull { it.propId == assembly.uuid }
+                            ?: return@succeedWhen helper.assertTrue(false, "worker did not block the moving assembly during the server-thread stall")
+                        val snapshot = runtime.service.latestFrame(dimension).bodies[blocked.bodyId]
+                            ?: return@succeedWhen helper.assertTrue(false, "blocked native snapshot is unavailable")
+                        val guard = cc.modlabs.tumble.physics.AssemblyTerrainGuard(requireNotNull(assembly.assembly).coverageBounds,
+                            helper.level.minSectionY, helper.level.maxSectionY)
+                        val coverageClass = Class.forName("cc.modlabs.tumble.physics.AssemblyTerrainCoverage")
+                        val coverage = coverageClass.getField("INSTANCE").get(null)
+                        val method = coverageClass.getMethod("sections", cc.modlabs.tumble.physics.AssemblyTerrainGuard::class.java,
+                            PhysicsTransform::class.java, PhysicsVector::class.java, PhysicsVector::class.java,
+                            Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                        @Suppress("UNCHECKED_CAST")
+                        val needed = method.invoke(coverage, guard, snapshot.transform, snapshot.linearVelocity, snapshot.angularVelocity, 0, 0, 1) as? Set<PhysicsSectionPosition>
+                        @Suppress("UNCHECKED_CAST")
+                        val synced = runtime.terrain.javaClass.getDeclaredField("synced").apply { isAccessible = true }.get(runtime.terrain) as Set<TerrainSectionKey>
+                        val missing = needed?.filter { TerrainSectionKey(dimension, it) !in synced }
+                        val unloaded = needed?.filter { !helper.level.chunkSource.hasChunk(it.x, it.z) }
+                        LoggerFactory.getLogger("tumble-test-checkpoint").warn("blocked native position={} velocity={} needed={} missing={} unloaded={} sample={}",
+                            snapshot.transform.position, snapshot.linearVelocity, needed?.size, missing?.size, unloaded?.size, missing?.take(12))
+                    }
                 }
                 5 -> if (frame.physicsStep - checkpoint >= 20) {
                     val bodies = runtime.manager.networkProps().associateBy { it.propId }
-                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, bodies.getValue(assembly.uuid).bodyId, PhysicsVector.ZERO))
-                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, bodies.getValue(peer.uuid).bodyId, PhysicsVector.ZERO))
+                    if ((assembly.uuid !in bodies || peer.uuid !in bodies) && !reportedMissing) {
+                        val fields = listOf("pendingRestores", "parkingGroups", "terrainWaits", "pendingConnections").associateWith { name ->
+                            runtime.manager.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(runtime.manager).toString()
+                        }
+                        val required = mutableSetOf<PhysicsSectionPosition>()
+                        val collector: (PhysicsSectionPosition) -> Unit = { required += it }
+                        val coverage = runtime.terrain.javaClass.getDeclaredMethod("forEachCoveredSection", PhysicsPropEntity::class.java,
+                            Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, kotlin.jvm.functions.Function1::class.java)
+                            .apply { isAccessible = true }.invoke(runtime.terrain, assembly, 0, 0, 1, collector) as Boolean
+                        @Suppress("UNCHECKED_CAST")
+                        val synced = runtime.terrain.javaClass.getDeclaredField("synced").apply { isAccessible = true }.get(runtime.terrain) as Set<TerrainSectionKey>
+                        @Suppress("UNCHECKED_CAST")
+                        val revisions = runtime.terrain.javaClass.getDeclaredField("terrainRevisions").apply { isAccessible = true }.get(runtime.terrain) as Map<TerrainSectionKey, Long>
+                        val dirty = runtime.terrain.javaClass.getDeclaredField("dirty").apply { isAccessible = true }.get(runtime.terrain) as cc.modlabs.tumble.physics.DirtySectionQueue
+                        val missingChunks = required.filter { !helper.level.chunkSource.hasChunk(it.x, it.z) }
+                        val missingSections = required.map { TerrainSectionKey(dimension, it) }.filter { it !in synced || dirty.contains(it) ||
+                            (revisions[it] ?: Long.MAX_VALUE) > runtime.service.appliedTerrainRevision() }
+                        LoggerFactory.getLogger("tumble-test-checkpoint").warn(
+                            "original body missing: oversized={} assembly={} status={} loaded={} removed={} pos={} chunkLoaded={} peer={} status={} loaded={} removed={} pos={} chunkLoaded={} frame={} states={} service={} coverageBounded={} requiredSections={} missingChunkSections={} missingSections={} sample={}",
+                            oversized, assembly.uuid, TumbleApi.status(helper.level, assembly.uuid), helper.level.getEntity(assembly.uuid) === assembly,
+                            assembly.removalReason, assembly.position(), helper.level.chunkSource.hasChunk(assembly.blockX shr 4, assembly.blockZ shr 4),
+                            peer.uuid, TumbleApi.status(helper.level, peer.uuid), helper.level.getEntity(peer.uuid) === peer,
+                            peer.removalReason, peer.position(), helper.level.chunkSource.hasChunk(peer.blockX shr 4, peer.blockZ shr 4),
+                            frame.physicsStep, fields, runtime.service.debugState(), coverage, required.size, missingChunks.size,
+                            missingSections.size, missingSections.take(12)
+                        )
+                        reportedMissing = true
+                    }
+                    val assemblyBody = bodies[assembly.uuid] ?: return@succeedWhen helper.assertTrue(false, "original assembly vanished before checkpoint")
+                    val peerBody = bodies[peer.uuid] ?: return@succeedWhen helper.assertTrue(false, "original peer vanished before checkpoint")
+                    if (reportedMissing) LoggerFactory.getLogger("tumble-test-checkpoint").info("original component recovered at worker step {} after checkpoint step {}", frame.physicsStep, checkpoint)
+                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, assemblyBody.bodyId, PhysicsVector.ZERO))
+                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, peerBody.bodyId, PhysicsVector.ZERO))
                     checkpoint = frame.physicsStep
                     phase = 6
                 }
                 6 -> if (frame.physicsStep - checkpoint >= 5) {
                     helper.assertTrue(helper.level.server.saveEverything(false, true, false), "normal server save failed")
-                    val rootBody = runtime.manager.networkProps().first { it.propId == assembly.uuid }
-                    checkpointX = requireNotNull(runtime.service.latestFrame(dimension).bodies[rootBody.bodyId]).transform.position.x
+                    val rootBody = runtime.manager.networkProps().firstOrNull { it.propId == assembly.uuid }
+                        ?: return@succeedWhen helper.assertTrue(false, "assembly became unavailable during checkpoint save")
+                    val rootSnapshot = runtime.service.latestFrame(dimension).bodies[rootBody.bodyId]
+                        ?: return@succeedWhen helper.assertTrue(false, "assembly snapshot became unavailable during checkpoint save")
+                    checkpointX = rootSnapshot.transform.position.x
                     helper.assertTrue(checkpointX > origin.x + 0.6, "component did not move before its checkpoint")
                     fun copy(prop: PhysicsPropEntity): PhysicsPropEntity {
                         val output = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
@@ -776,6 +871,15 @@ class AssemblyGameTests {
                     }
                     restoredAssembly = copy(assembly).also { it.setPos(it.x - 32.0, it.y, it.z) }
                     restoredPeer = copy(peer).also { it.setPos(it.x + 32.0, it.y, it.z) }
+                    if (oversized) {
+                        val distant = listOf(BlockPos(-32, -32, -32), BlockPos(32, 32, 32))
+                        requireNotNull(restoredAssembly).initializeAssembly(AssemblyStructure.of(
+                            AssemblyDefinition.of(distant.map { AssemblyBlock(it, stone) }),
+                            distant.mapIndexed { index, p -> AssemblyCollisionBox(index, PhysicsBox(
+                                PhysicsVector(p.x - 0.5, p.y - 0.5, p.z - 0.5), PhysicsVector(p.x + 0.5, p.y + 0.5, p.z + 0.5)
+                            )) }
+                        ))
+                    }
                     val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-reopen-test")).also { it.start() }
                     reopenedService = service
                     service.submit(PhysicsCommand.CreateDimension(dimension))
@@ -791,10 +895,19 @@ class AssemblyGameTests {
                     if (service.latestFrame(dimension).physicsStep - checkpoint < 20) return@succeedWhen helper.assertTrue(false, "waiting for missing endpoint")
                     helper.assertTrue(requireNotNull(reopenedManager).networkProps().none { it.propId == peer.uuid }, "peer escaped the reopened journal gate")
                     requireNotNull(reopenedManager).entityLoaded(requireNotNull(restoredAssembly), helper.level)
+                    checkpoint = service.latestFrame(dimension).physicsStep
                     phase = 3
                 }
                 3 -> {
                     val manager = requireNotNull(reopenedManager)
+                    if (!budgetReleased) {
+                        if (requireNotNull(reopenedService).latestFrame(dimension).physicsStep - checkpoint < 30)
+                            return@succeedWhen helper.assertTrue(false, "waiting for over-budget gate")
+                        helper.assertTrue(manager.networkProps().none { it.propId == assembly.uuid || it.propId == peer.uuid },
+                            "over-budget assembly or linked peer escaped the journal gate")
+                        requireNotNull(restoredAssembly).initializeAssembly(structure)
+                        budgetReleased = true
+                    }
                     val bodies = manager.networkProps().associateBy { it.propId }
                     val peerBody = bodies[peer.uuid] ?: return@succeedWhen helper.assertTrue(false, "reopened peer not ready")
                     val rootBody = bodies[assembly.uuid] ?: return@succeedWhen helper.assertTrue(false, "reopened assembly not ready")
@@ -947,6 +1060,15 @@ class AssemblyGameTests {
     fun unloadBeforeInstallAcknowledgementRetainsConnection(helper: GameTestHelper) = checkLinkedReload(helper, 3)
 
     @GameTest(maxTicks = 1600)
+    fun unloadBeforeRopeInstallAcknowledgementRetainsConnection(helper: GameTestHelper) = checkLinkedReload(helper, 3, ToolGunMode.ROPE)
+
+    @GameTest(maxTicks = 1600)
+    fun unloadBeforeAxisInstallAcknowledgementRetainsConnection(helper: GameTestHelper) = checkLinkedReload(helper, 3, ToolGunMode.AXIS)
+
+    @GameTest(maxTicks = 1600)
+    fun unloadBeforeNoCollideInstallAcknowledgementRetainsConnection(helper: GameTestHelper) = checkLinkedReload(helper, 3, ToolGunMode.NO_COLLIDE)
+
+    @GameTest(maxTicks = 1600)
     fun ropeConnectionReturnsAfterReload(helper: GameTestHelper) = checkLinkedReload(helper, 2, ToolGunMode.ROPE)
 
     @GameTest(maxTicks = 1600)
@@ -958,6 +1080,7 @@ class AssemblyGameTests {
     private fun checkLinkedReload(helper: GameTestHelper, ordering: Int, mode: ToolGunMode = ToolGunMode.WELD) {
         val origin = BlockPos(3104 + ordering * 128 + mode.ordinal * 512, 50, 0)
         val remote = origin.offset(32, 0, 0)
+        loadAssemblyNeighborhood(helper, origin, remote)
         for (position in listOf(origin, remote)) {
             helper.level.setChunkForced(position.x shr 4, 0, true)
             helper.level.getChunkAt(position)
@@ -1026,6 +1149,8 @@ class AssemblyGameTests {
                         TumbleApi.status(helper.level, assembly.uuid) == TumbleApi.PropStatus.READY &&
                         TumbleApi.status(helper.level, other.uuid) == TumbleApi.PropStatus.READY, "physics bodies are not ready")
                     player.setPos(assembly.x, assembly.y, assembly.z + 2.0)
+                    val pendingField = runtime.manager.javaClass.getDeclaredField("pendingConnections").apply { isAccessible = true }
+                    val previousRequests = (pendingField.get(runtime.manager) as Map<*, *>).keys.toSet()
                     val selected = runtime.manager.useToolGun(player, assembly)
                     player.setPos(other.x, other.y, other.z + 2.0)
                     val welded = runtime.manager.useToolGun(player, other)
@@ -1033,12 +1158,14 @@ class AssemblyGameTests {
                     if (selected != ToolGunResult.SELECTED || welded != ToolGunResult.APPLIED) phase = 5
                     helper.assertTrue(phase != 5, weldFailure)
                     if (ordering == 3) {
+                        val requestId = ((pendingField.get(runtime.manager) as Map<*, *>).keys - previousRequests).singleOrNull() as? UUID
+                            ?: return@succeedWhen helper.assertTrue(false, "could not identify the queued connection")
                         val queueField = runtime.service.javaClass.getDeclaredField("acknowledgements").apply { isAccessible = true }
                         @Suppress("UNCHECKED_CAST")
                         val queue = queueField.get(runtime.service) as ConcurrentLinkedQueue<PhysicsAcknowledgement>
                         val deadline = System.nanoTime() + 5_000_000_000L
-                        while (queue.none { it is PhysicsAcknowledgement.ConnectionPrepared } && System.nanoTime() < deadline) Thread.sleep(1)
-                        val prepared = queue.filterIsInstance<PhysicsAcknowledgement.ConnectionPrepared>().singleOrNull()
+                        while (queue.none { it is PhysicsAcknowledgement.ConnectionPrepared && it.requestId == requestId } && System.nanoTime() < deadline) Thread.sleep(1)
+                        val prepared = queue.filterIsInstance<PhysicsAcknowledgement.ConnectionPrepared>().singleOrNull { it.requestId == requestId }
                             ?: return@succeedWhen helper.assertTrue(false, "connection preparation not acknowledged")
                         val lockField = runtime.service.javaClass.getDeclaredField("stepBoundary").apply { isAccessible = true }
                         val lock = lockField.get(runtime.service) as java.util.concurrent.locks.ReentrantLock
@@ -1048,7 +1175,6 @@ class AssemblyGameTests {
                             while (!lock.hasQueuedThreads() && System.nanoTime() < lockDeadline) Thread.sleep(1)
                             helper.assertTrue(lock.hasQueuedThreads(), "physics worker did not reach the step boundary")
                             runtime.manager.tick()
-                            val pendingField = runtime.manager.javaClass.getDeclaredField("pendingConnections").apply { isAccessible = true }
                             val pending = (pendingField.get(runtime.manager) as Map<*, *>)[prepared.requestId]
                                 ?: return@succeedWhen helper.assertTrue(false, "installation was not pending")
                             val record = pending.javaClass.getDeclaredField("record").apply { isAccessible = true }.get(pending)
@@ -1064,6 +1190,16 @@ class AssemblyGameTests {
                     }
                 }
                 1 -> if (frame.physicsStep - checkpoint >= 10) {
+                    if (TumbleApi.status(helper.level, assembly.uuid) != TumbleApi.PropStatus.READY ||
+                        TumbleApi.status(helper.level, other.uuid) != TumbleApi.PropStatus.READY)
+                        return@succeedWhen helper.assertTrue(false, "native connection is not installed")
+                    val componentMethod = runtime.manager.javaClass.getDeclaredMethod("componentFor", net.minecraft.server.level.ServerLevel::class.java, UUID::class.java).apply { isAccessible = true }
+                    val component = componentMethod.invoke(runtime.manager, helper.level, assembly.uuid) as Set<*>
+                    if (other.uuid !in component) {
+                        weldFailure = "native connection failed or lost its durable edge: mode=$mode"
+                        phase = 5
+                        return@succeedWhen helper.assertTrue(false, weldFailure)
+                    }
                     if (ordering == 2) reloadOther(frame.physicsStep, otherFirst = true)
                     else {
                         PhysicsServices.chunkUnloaded(helper.level, remote.x shr 4, 0)
@@ -1165,6 +1301,7 @@ class AssemblyGameTests {
                 0 -> {
                     val root = runtime.manager.networkProps().firstOrNull { it.propId == assembly.uuid }
                         ?: return@succeedWhen helper.assertTrue(false, "assembly body is not ready")
+                    helper.assertTrue(TumbleApi.status(helper.level, assembly.uuid) == TumbleApi.PropStatus.READY, "assembly terrain is not ready")
                     val linked = runtime.manager.networkProps().first { it.propId == other.uuid }
                     runtime.service.submit(PhysicsCommand.CreateWeld(dimension, root.bodyId, linked.bodyId))
                     checkpoint = frame.physicsStep
@@ -1194,6 +1331,7 @@ class AssemblyGameTests {
     private fun checkLinkedUnload(helper: GameTestHelper, unloadFirst: Boolean) {
         val origin = BlockPos(if (unloadFirst) 2576 else 1728, 50, 0)
         val remote = origin.offset(32, 0, 0)
+        loadAssemblyNeighborhood(helper, origin, remote)
         for (position in listOf(origin, remote)) {
             helper.level.setChunkForced(position.x shr 4, 0, true)
             helper.level.getChunkAt(position)
@@ -1240,6 +1378,7 @@ class AssemblyGameTests {
                 0 -> {
                     val root = runtime.manager.networkProps().firstOrNull { it.propId == assembly.uuid }
                         ?: return@succeedWhen helper.assertTrue(false, "assembly body is not ready")
+                    helper.assertTrue(TumbleApi.status(helper.level, assembly.uuid) == TumbleApi.PropStatus.READY, "assembly terrain is not ready")
                     val linked = runtime.manager.networkProps().first { it.propId == other.uuid }
                     runtime.service.submit(PhysicsCommand.CreateWeld(dimension, root.bodyId, linked.bodyId))
                     checkpoint = frame.physicsStep
@@ -1282,6 +1421,7 @@ class AssemblyGameTests {
     fun assemblyPausesIfTerrainUnloadsBeforeBodyAcknowledgement(helper: GameTestHelper) {
         val origin = BlockPos(1664, 50, 0)
         val remote = origin.offset(32, 0, 0)
+        loadAssemblyNeighborhood(helper, origin, remote)
         for (position in listOf(origin, remote)) {
             helper.level.setChunkForced(position.x shr 4, 0, true)
             helper.level.getChunkAt(position)
@@ -1296,9 +1436,14 @@ class AssemblyGameTests {
         entity.setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
         entity.initializeAssembly(structure)
         entity.setDeltaMovement(2.0, 0.0, 0.0)
-        helper.assertTrue(helper.level.addFreshEntity(entity), "could not add assembly")
         val runtime = PhysicsServices.runtime(helper.level.server)!!
+        var primed = false
+        repeat(128) { if (!primed) primed = runtime.terrain.primeForAssembly(helper.level, entity, allowQueued = true) }
+        helper.assertTrue(primed, "could not prime the initial terrain")
+        helper.assertTrue(helper.level.addFreshEntity(entity), "could not add assembly")
         runtime.manager.entityLoaded(entity, helper.level)
+        helper.assertTrue(TumbleApi.status(helper.level, entity.uuid) == TumbleApi.PropStatus.PENDING,
+            "body was acknowledged before the unload")
         PhysicsServices.chunkUnloaded(helper.level, remote.x shr 4, 0)
         helper.assertTrue(TumbleApi.status(helper.level, entity.uuid) == TumbleApi.PropStatus.PAUSED, "creation lost the terrain pause")
         helper.succeedWhen {
@@ -1313,6 +1458,7 @@ class AssemblyGameTests {
     fun movingAssemblyPausesAndResumesAcrossTerrainUnload(helper: GameTestHelper) {
         val origin = BlockPos(1536, 50, 0)
         val remote = origin.offset(32, 0, 0)
+        loadAssemblyNeighborhood(helper, origin, remote)
         for (position in listOf(origin, remote)) {
             helper.level.setChunkForced(position.x shr 4, 0, true)
             helper.level.getChunkAt(position)
@@ -1666,7 +1812,7 @@ class AssemblyGameTests {
         helper.succeed()
     }
 
-    @GameTest
+    @GameTest(maxTicks = 400)
     fun pendingAssemblyCannotRideOrCarryAnotherEntity(helper: GameTestHelper) {
         val origin = BlockPos(50560, 4, 0)
         helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
@@ -1683,6 +1829,7 @@ class AssemblyGameTests {
         val other = net.minecraft.world.entity.item.ItemEntity(helper.level, origin.x.toDouble(), origin.y.toDouble(), origin.z.toDouble(), ItemStack(net.minecraft.world.item.Items.STONE))
         helper.assertTrue(!entity.startRiding(other, true, false), "pending assembly became a forced passenger")
         helper.assertTrue(!other.startRiding(entity, true, false), "pending assembly accepted a forced passenger")
+        loadSingleBlockAssemblyTerrain(helper, origin)
         helper.succeedWhen {
             Thread.sleep(5)
             helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
@@ -1693,7 +1840,7 @@ class AssemblyGameTests {
         }
     }
 
-    @GameTest
+    @GameTest(maxTicks = 400)
     fun mutableInputPositionsCannotChangeTheCapturedSource(helper: GameTestHelper) {
         val origin = BlockPos(50304, 4, 0)
         helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
@@ -1709,6 +1856,7 @@ class AssemblyGameTests {
         val id = TumbleApi.convertAssembly(helper.level, listOf(mutable), player)
             ?: return helper.fail("mutable input changed the conversion")
         helper.assertTrue(helper.level.getBlockState(origin).isAir, "conversion removed the wrong source")
+        loadSingleBlockAssemblyTerrain(helper, origin)
         helper.succeedWhen {
             Thread.sleep(5)
             helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
@@ -1741,7 +1889,7 @@ class AssemblyGameTests {
         helper.succeed()
     }
 
-    @GameTest
+    @GameTest(maxTicks = 400)
     fun pendingAssemblyProtectsItsSourceUntilCheckpoint(helper: GameTestHelper) {
         val origin = BlockPos(50000, 4, 0)
         helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
@@ -1754,6 +1902,7 @@ class AssemblyGameTests {
         helper.assertTrue(!helper.level.setBlock(origin, Blocks.DIRT.defaultBlockState(), 3), "pending source accepted a replacement")
         helper.assertTrue(!helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3), "pending source accepted an identical replacement")
         helper.assertTrue(helper.level.getBlockState(origin).isAir, "pending source was changed")
+        loadSingleBlockAssemblyTerrain(helper, origin)
         helper.succeedWhen {
             Thread.sleep(5)
             helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
@@ -1962,10 +2111,7 @@ class AssemblyGameTests {
     @GameTest(maxTicks = 3000)
     fun operatorCanConvertA250BlockStaircaseIntoOneBody(helper: GameTestHelper) {
         val origin = BlockPos(1280, 4, 0)
-        for (chunk in (origin.x shr 4)..((origin.x + 25) shr 4)) {
-            helper.level.setChunkForced(chunk, 0, true)
-            helper.level.getChunkAt(BlockPos(chunk shl 4, 4, 0))
-        }
+        loadAssemblyNeighborhood(helper, origin, origin.offset(25, 0, 0))
         val positions = (0 until 25).flatMap { step ->
             (0 until 5).flatMap { width -> listOf(origin.offset(step, step, width), origin.offset(step + 1, step, width)) }
         }
@@ -1991,7 +2137,42 @@ class AssemblyGameTests {
                 ?: return@succeedWhen helper.assertTrue(false, "assembly entity is not loaded")
             helper.assertTrue(prop.assembly?.definition?.blocks?.size == 250, "staircase block count changed")
             helper.assertTrue(TumbleApi.snapshot(helper.level, id) != null, "staircase body is not ready")
+            helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "staircase remained parked")
         }
+    }
+
+    @GameTest(maxTicks = 1200)
+    fun overBudgetConnectedAssemblyLeavesSourceBlocksUntouched(helper: GameTestHelper) {
+        val origin = BlockPos(6208, 20, 0)
+        val positions = (0..64).map { origin.offset(it, 0, 0) } +
+            (1..64).map { origin.offset(64, it, 0) } + (1..62).map { origin.offset(64, 64, it) }
+        positions.map { (it.x shr 4) to (it.z shr 4) }.distinct().forEach { (x, z) ->
+            helper.level.setChunkForced(x, z, true)
+            helper.level.getChunkAt(BlockPos(x shl 4, origin.y, z shl 4))
+        }
+        val stone = Blocks.STONE.defaultBlockState()
+        positions.forEach { helper.level.setBlock(it, stone, 3) }
+        val definition = AssemblyDefinition.of(positions.map { AssemblyBlock(it.subtract(origin), stone) })
+        val structure = AssemblyGeometry.capture(helper.level, origin, definition)
+        val fixture = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level).apply {
+            setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+            initializeAssembly(structure)
+        }
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        helper.assertTrue(!runtime.terrain.coverageWithinBudget(fixture), "fixture did not exceed the terrain budget")
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        helper.level.server.playerList.op(NameAndId(player.gameProfile),
+            java.util.Optional.of(net.minecraft.server.permissions.LevelBasedPermissionSet.GAMEMASTER), java.util.Optional.empty())
+        val bounds = net.minecraft.world.phys.AABB(origin.x - 100.0, origin.y - 100.0, origin.z - 100.0,
+            origin.x + 170.0, origin.y + 170.0, origin.z + 170.0)
+        val before = helper.level.getEntitiesOfClass(PhysicsPropEntity::class.java, bounds).map { it.uuid }.toSet()
+        val converted = TumbleApi.convertAssemblyAsOperator(helper.level, positions, player)
+        helper.assertTrue(converted == null, "over-budget assembly conversion was accepted")
+        helper.assertTrue(positions.all { helper.level.getBlockState(it) == stone }, "over-budget conversion removed source blocks")
+        helper.assertTrue(helper.level.getEntitiesOfClass(PhysicsPropEntity::class.java, bounds).map { it.uuid }.toSet() == before,
+            "over-budget conversion created a physics entity")
+        helper.succeed()
     }
 
     @GameTest(maxTicks = 1500)
@@ -2015,18 +2196,38 @@ class AssemblyGameTests {
         val restored = TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)
             ?: return helper.fail("could not restore assembly")
         restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), saved.buildResult()))
-        helper.assertTrue(helper.level.addFreshEntity(restored), "could not add restored assembly")
         val runtime = PhysicsServices.runtime(helper.level.server)!!
-        runtime.manager.entityLoaded(restored, helper.level)
         val dimension = helper.level.physicsDimensionId()
-        val start = runtime.service.latestFrame(dimension).physicsStep
+        val sourceChunk = net.minecraft.world.level.ChunkPos(origin.x shr 4, origin.z shr 4)
+        var registered = false
+        var start = 0L
         var loadedRemote = false
+        var remoteLoadedEarly = false
+        var unavailableDetails: String? = null
         helper.succeedWhen {
             Thread.sleep(5)
             if (!loadedRemote) {
+                if (helper.level.chunkSource.hasChunk(remote.x shr 4, 0)) remoteLoadedEarly = true
+                helper.assertTrue(!remoteLoadedEarly, "remote chunk loaded before the test released it")
+                if (!registered) {
+                    helper.assertTrue(helper.level.areEntitiesActuallyLoadedAndTicking(sourceChunk), "source entity chunk is not ticking")
+                    helper.assertTrue(helper.level.addFreshEntity(restored), "could not add restored assembly")
+                    runtime.manager.entityLoaded(restored, helper.level)
+                    start = runtime.service.latestFrame(dimension).physicsStep
+                    registered = true
+                }
+                val status = TumbleApi.status(helper.level, restored.uuid)
+                if (status == TumbleApi.PropStatus.UNAVAILABLE && unavailableDetails == null) {
+                    val tracked = runtime.manager.javaClass.getDeclaredField("props").apply { isAccessible = true }.get(runtime.manager) as Map<*, *>
+                    unavailableDetails = "removed=${restored.isRemoved}, reason=${restored.removalReason}, " +
+                        "worldEntity=${helper.level.getEntity(restored.uuid) === restored}, managerEntity=${tracked[restored.uuid] === restored}, " +
+                        "originLoaded=${helper.level.chunkSource.hasChunk(restored.blockX shr 4, restored.blockZ shr 4)}, position=${restored.position()}"
+                    LoggerFactory.getLogger("tumble-test-distant-terrain").warn("restored assembly became unavailable: {}", unavailableDetails)
+                }
                 helper.assertTrue(runtime.service.latestFrame(dimension).physicsStep - start >= 60, "waiting for physics")
-                helper.assertTrue(TumbleApi.status(helper.level, restored.uuid) == TumbleApi.PropStatus.PENDING,
-                    "assembly started before its distant chunk was loaded")
+                helper.assertTrue(status == TumbleApi.PropStatus.PENDING,
+                    "assembly started before its distant chunk was loaded: status=$status remoteLoaded=${helper.level.chunkSource.hasChunk(remote.x shr 4, 0)} coverage=${runtime.terrain.coverageWithinBudget(restored)} details=$unavailableDetails")
+                loadAssemblyNeighborhood(helper, origin, remote)
                 helper.level.setChunkForced(remote.x shr 4, 0, true)
                 helper.level.getChunkAt(remote)
                 helper.level.setBlock(remote.below(10), stone, 3)
@@ -2041,6 +2242,7 @@ class AssemblyGameTests {
     @GameTest(maxTicks = 1200)
     fun actorCollidesWithTheFarEndOfAnAssembly(helper: GameTestHelper) {
         val origin = BlockPos(832, 4, 0)
+        loadAssemblyNeighborhood(helper, origin, origin.offset(32, 0, 0))
         for (position in listOf(origin, origin.offset(32, 0, 0))) {
             helper.level.setChunkForced(position.x shr 4, 0, true)
             helper.level.getChunkAt(position)
@@ -2097,10 +2299,11 @@ class AssemblyGameTests {
         helper.succeed()
     }
 
-    @GameTest
+    @GameTest(maxTicks = 1200)
     fun terrainTrackingIncludesTheFarEndOfAnAssembly(helper: GameTestHelper) {
         val origin = BlockPos(768, 4, 0)
         val remote = origin.offset(32, 0, 0)
+        loadAssemblyNeighborhood(helper, origin, remote)
         for (position in listOf(origin, origin.offset(16, 0, 0), remote)) {
             helper.level.setChunkForced(position.x shr 4, 0, true)
             helper.level.getChunkAt(position)
@@ -2122,10 +2325,12 @@ class AssemblyGameTests {
         @Suppress("UNCHECKED_CAST")
         val synced = field.get(runtime.terrain) as Set<TerrainSectionKey>
         val remoteSection = TerrainSectionKey(helper.level.physicsDimensionId(), PhysicsSectionPosition(remote.x shr 4, remote.y shr 4, 0))
-        helper.assertTrue(remoteSection in synced, "remote terrain was not captured before body creation")
-        runtime.manager.tick()
-        helper.assertTrue(remoteSection in synced, "terrain at the far end was discarded")
-        helper.succeed()
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(remoteSection in synced, "remote terrain was not captured")
+            runtime.manager.tick()
+            helper.assertTrue(remoteSection in synced, "terrain at the far end was discarded")
+        }
     }
 
     @GameTest

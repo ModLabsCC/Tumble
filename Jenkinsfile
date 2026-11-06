@@ -4,14 +4,15 @@ pipeline {
     options {
         timestamps()
         disableConcurrentBuilds()
-        timeout(time: 30, unit: 'MINUTES')
+        timeout(time: 90, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '30'))
     }
     stages {
         stage('Build and GameTests') {
             steps {
                 sh 'chmod +x gradlew'
-                sh './gradlew clean build runGameTest -PacceptMinecraftEula=true --no-daemon --stacktrace'
+                sh './gradlew clean build --no-daemon --stacktrace'
+                sh 'python3 scripts/run_partitioned_gametests.py --mode development --skip-lifecycle'
             }
         }
         stage('Client GameTests') {
@@ -32,12 +33,12 @@ pipeline {
         }
         stage('Packaged server GameTests') {
             steps {
-                sh './gradlew runProductionGameTest -PacceptMinecraftEula=true --no-daemon --stacktrace'
+                sh 'python3 scripts/run_partitioned_gametests.py --mode production'
             }
         }
         stage('Assembly restart GameTests') {
             steps {
-                sh './gradlew runAssemblyRestartTest -PacceptMinecraftEula=true --no-daemon --stacktrace'
+                sh './gradlew runAssemblyRestartTest runAssemblyGraphRestartTest -PacceptMinecraftEula=true --no-daemon --stacktrace'
             }
         }
         stage('Assembly crash GameTests') {

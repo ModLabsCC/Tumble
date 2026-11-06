@@ -29,6 +29,7 @@
   "message.tumble.physics_gun.grabbed": "Physics prop grabbed",
   "message.tumble.physics_gun.released": "Physics prop released",
   "message.tumble.physics_gun.block": "Physics prop converted to block",
+  "message.tumble.assembly.terrain_budget": "This assembly is too large or spread out to safely track nearby terrain. Select a smaller structure.",
   "message.tumble.tool_gun.weld_selected": "First prop selected for weld",
   "message.tumble.tool_gun.welded": "Props welded",
   "message.tumble.tool_gun.cancelled": "Weld selection cancelled",

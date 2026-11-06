@@ -24,6 +24,8 @@ abstract class LevelChunkMixin {
         Level level = ((LevelChunk) (Object) this).getLevel();
         if (level instanceof ServerLevel serverLevel && PhysicsServices.INSTANCE.conversionWriteBlocked(serverLevel, position, newState)) {
             callback.setReturnValue(null);
+        } else if (level instanceof ServerLevel serverLevel && ((LevelChunk) (Object) this).getBlockState(position) != newState) {
+            PhysicsServices.INSTANCE.beforeTerrainChange(serverLevel, position);
         }
     }
 

@@ -29,6 +29,7 @@
   "message.tumble.physics_gun.grabbed": "Physik-Prop gegriffen",
   "message.tumble.physics_gun.released": "Physik-Prop losgelassen",
   "message.tumble.physics_gun.block": "Physik-Prop in Block umgewandelt",
+  "message.tumble.assembly.terrain_budget": "Diese Konstruktion ist zu groß oder zu weit verteilt, um das Gelände sicher zu erfassen. Wähle eine kleinere Konstruktion.",
   "message.tumble.tool_gun.weld_selected": "Erstes Prop für Weld ausgewählt",
   "message.tumble.tool_gun.welded": "Props verschweißt",
   "message.tumble.tool_gun.cancelled": "Weld-Auswahl abgebrochen",
