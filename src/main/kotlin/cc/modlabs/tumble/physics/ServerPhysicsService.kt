@@ -243,8 +243,17 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                     acknowledgements += PhysicsAcknowledgement.ComponentActivated(command.token, success)
                 }
                 is PhysicsCommand.PrepareConnection -> {
-                    val frames = worlds[command.dimension]?.prepareConnection(command.requestId, command.bodyA, command.bodyB)
-                    acknowledgements += PhysicsAcknowledgement.ConnectionPrepared(command.requestId, frames)
+                    val world = worlds[command.dimension]
+                    val frames = world?.prepareConnection(command.requestId, command.bodyA, command.bodyB)
+                    val snapshots = if (frames != null) world.preparedConnectionSnapshots(command.requestId).orEmpty() else emptyList()
+                    val owners = bodies.entries.filter { it.value.dimension == command.dimension }.associate { it.value.bodyId to it.key }
+                    if (frames != null && snapshots.any { it.bodyId !in owners }) {
+                        world.cancelConnectionPreparation(command.requestId)
+                        acknowledgements += PhysicsAcknowledgement.ConnectionPrepared(command.requestId, null)
+                    } else {
+                        acknowledgements += PhysicsAcknowledgement.ConnectionPrepared(command.requestId, frames,
+                            snapshots.associate { owners.getValue(it.bodyId) to it })
+                    }
                 }
                 is PhysicsCommand.InstallPreparedConnection -> {
                     val success = worlds[command.dimension]?.installPreparedConnection(

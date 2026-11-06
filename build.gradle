@@ -171,3 +171,27 @@ tasks.register('runAssemblyRestartTest') {
         }
     }
 }
+
+
+['inject', 'verify'].each { phase ->
+    tasks.register("runConnectionCrash${phase.capitalize()}", net.fabricmc.loom.task.prod.ServerProductionRunTask) {
+        outputs.upToDateWhen { false }
+        installerVersion = '1.1.2'
+        runDir = layout.buildDirectory.dir('run/connectionCrash').get().asFile
+        jvmArgs.add('-Dfabric-api.gametest')
+        jvmArgs.add("-Dfabric-api.gametest.filter=tumble_test:connection_crash_game_tests_${phase}")
+        jvmArgs.add("-Dtumble.connection.phase=${phase}")
+        if (phase == 'inject') jvmArgs.add('-Dtumble.connection.crash=true')
+        doFirst {
+            if (!providers.gradleProperty('acceptMinecraftEula').map { it.toBoolean() }.getOrElse(false)) {
+                throw new GradleException('Pass -PacceptMinecraftEula=true to accept the Minecraft EULA for tests')
+            }
+            def directory = runDir.get().asFile
+            directory.mkdirs()
+            if (phase == 'inject') {
+                project.delete(new File(directory, 'world'), new File(directory, 'connection-crash-reached.txt'), new File(directory, 'connection-crash-ids.txt'))
+            }
+            new File(directory, 'eula.txt').text = 'eula=true\n'
+        }
+    }
+}

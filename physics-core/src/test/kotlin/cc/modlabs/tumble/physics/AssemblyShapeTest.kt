@@ -95,6 +95,20 @@ class AssemblyShapeTest {
     }
 
     @Test
+    fun `connection preparation captures every body in both linked components`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
+        val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0)), linearVelocity = PhysicsVector(2.0, 0.0, 0.0)))
+        val middle = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0)), linearVelocity = PhysicsVector(2.0, 0.0, 0.0)))
+        val last = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(4.0, 10.0, 0.0))))
+        assertTrue(world.createWeld(first, middle))
+        val request = java.util.UUID.randomUUID()
+        assertNotNull(world.prepareConnection(request, middle, last))
+        val snapshots = assertNotNull(world.preparedConnectionSnapshots(request)).associateBy { it.bodyId }
+        assertEquals(setOf(first, middle, last), snapshots.keys)
+        assertTrue(snapshots.values.all { it.suspended })
+        assertEquals(2.0, snapshots.getValue(first).linearVelocity.x, 0.001)
+    }
+
+    @Test
     fun `connection preparation cannot release a concurrent terrain suspension`() = PhysicsWorld(PhysicsWorldConfig(gravity = PhysicsVector.ZERO)).use { world ->
         val first = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(0.0, 10.0, 0.0))))
         val second = world.createBody(PhysicsBodyDefinition(PhysicsTransform(PhysicsVector(2.0, 10.0, 0.0))))

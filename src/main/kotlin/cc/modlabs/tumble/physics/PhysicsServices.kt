@@ -44,10 +44,15 @@ object PhysicsServices {
     }
 
     fun stop(server: MinecraftServer) {
+        runtimes[server]?.manager?.checkpointConnections()
         runtimes.remove(server)?.let {
             it.publisher.close()
             it.service.close()
         }
+    }
+
+    fun checkpointConnections(server: MinecraftServer) {
+        runtimes[server]?.manager?.checkpointConnections()
     }
 
     fun stopped(server: MinecraftServer) {

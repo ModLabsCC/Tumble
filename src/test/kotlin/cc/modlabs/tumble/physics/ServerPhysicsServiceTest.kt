@@ -295,6 +295,7 @@ class ServerPhysicsServiceTest {
                 prepared != null
             }
             val frames = requireNotNull(prepared?.frames)
+            assertEquals(ids.toSet(), requireNotNull(prepared).snapshots.values.map { it.bodyId }.toSet())
             waitUntil { ids.all { service.latestFrame(dimension).bodies[it]?.suspended == true } }
             repeat(10) { Thread.sleep(5) }
             assertTrue(ids.all { service.latestFrame(dimension).bodies[it]?.suspended == true })

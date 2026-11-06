@@ -453,6 +453,12 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         }
     }
 
+    fun preparedConnectionSnapshots(requestId: java.util.UUID): List<PhysicsBodySnapshot>? {
+        checkUsable()
+        val seeds = connectionPreparations[requestId] ?: return null
+        return connectedBodies(seeds).map { id -> snapshotOf(id, bodies.getValue(id)) }
+    }
+
     /** Installs a prepared joint and only then releases its preparation suspension. */
     fun installPreparedConnection(
         requestId: java.util.UUID,

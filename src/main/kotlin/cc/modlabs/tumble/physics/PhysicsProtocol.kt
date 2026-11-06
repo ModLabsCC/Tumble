@@ -140,7 +140,9 @@ sealed interface PhysicsCommand {
 
 sealed interface PhysicsAcknowledgement {
     data class ConnectionCreated(val requestId: UUID, val success: Boolean) : PhysicsAcknowledgement
-    data class ConnectionPrepared(val requestId: UUID, val frames: PhysicsJointFrames?) : PhysicsAcknowledgement
+    data class ConnectionPrepared(
+        val requestId: UUID, val frames: PhysicsJointFrames?, val snapshots: Map<UUID, PhysicsBodySnapshot> = emptyMap()
+    ) : PhysicsAcknowledgement
     data class ComponentParked(val requestId: UUID, val snapshots: Map<UUID, PhysicsBodySnapshot>, val success: Boolean) : PhysicsAcknowledgement
     data class ComponentStaged(val token: PhysicsRestoreToken, val bodies: List<ParkBody>, val success: Boolean) : PhysicsAcknowledgement
     data class ComponentActivated(val token: PhysicsRestoreToken, val success: Boolean) : PhysicsAcknowledgement

@@ -700,6 +700,33 @@ class PhysicsPropManager(
         )
     }
 
+    fun checkpointConnections() {
+        val records = journal.records().filterNot { it.deleted }
+        if (records.isEmpty() || !service.isRunning()) return
+        val updates = mutableListOf<DurableConnection>()
+        val visited = mutableSetOf<UUID>()
+        records.forEach { record ->
+            if (record.first in visited) return@forEach
+            val level = server.allLevels.firstOrNull { it.physicsDimensionId().value == record.dimension } ?: return@forEach
+            val members = componentFor(level, record.first)
+            visited += members
+            if (parkingGroups.values.any { group -> group.members.any { it in members } } ||
+                pendingConnections.values.any { it.first in members || it.second in members }) return@forEach
+            val frame = service.latestFrame(level.physicsDimensionId())
+            val states = members.mapNotNull { id ->
+                val prop = props[id]?.takeIf { it.level() === level && !it.isRemoved } ?: return@mapNotNull null
+                val body = prop.runtimeBodyId ?: return@mapNotNull null
+                val group = memberRestoreTokens[id]?.let(restoreGroups::get)
+                if (group != null && (!group.activated || frame.physicsStep <= group.activationAfterStep)) return@mapNotNull null
+                frame.bodies[body]?.toDurableState(id)
+            }
+            if (states.size != members.size) return@forEach
+            updates += records.filter { it.dimension == record.dimension && it.first in members && it.second in members }
+                .map { it.copy(checkpoint = states) }
+        }
+        if (updates.isNotEmpty()) journal.putAll(updates)
+    }
+
     private fun activeConnections(level: ServerLevel): List<DurableConnection> =
         journal.records().filter { !it.deleted && it.dimension == level.physicsDimensionId().value }
 
@@ -758,13 +785,13 @@ class PhysicsPropManager(
             pendingRestores += prop.uuid
         }
         val request = UUID.randomUUID()
-        if (bodies.isNotEmpty()) parkingGroups[request] = ParkingGroup(members, snapshotMembers)
+        if (bodies.isNotEmpty()) parkingGroups[request] = ParkingGroup(level, members, snapshotMembers)
         service.invalidateRestores(tokens, level.physicsDimensionId(), bodies, request)
     }
 
     private fun parkStaged(token: PhysicsRestoreToken, group: RestoreGroup) {
         val request = UUID.randomUUID()
-        if (group.bodies.isNotEmpty()) parkingGroups[request] = ParkingGroup(group.members, emptySet())
+        if (group.bodies.isNotEmpty()) parkingGroups[request] = ParkingGroup(group.level, group.members, emptySet())
         service.invalidateRestore(token, group.level.physicsDimensionId(), group.bodies, request)
         if (group.bodies.isEmpty()) {
             restoreGroups.remove(token)
@@ -791,13 +818,26 @@ class PhysicsPropManager(
                 parkForRecovery(level, members)
                 return@repeat
             }
+            val records = activeConnections(level).filter { it.first in members && it.second in members }
+            val checkpoint = if (records.isEmpty()) emptyMap() else records.first().checkpoint
+                .filter { it.propId in members }.associateBy { it.propId }
+            if (records.isNotEmpty() && (checkpoint.keys != members || records.any { record ->
+                    record.checkpoint.filter { it.propId in members }.associateBy { it.propId } != checkpoint
+                })) {
+                logger.error("Cannot restore linked component {} without a coherent checkpoint", members)
+                pendingRestores += id
+                return@repeat
+            }
+            if (records.isNotEmpty()) loaded.forEach { prop ->
+                val state = checkpoint.getValue(prop.uuid)
+                prop.restoreCheckpoint(state.transform, state.linearVelocity, state.angularVelocity)
+            }
             if (loaded.any { prop -> prop.terrainBlockers.any { terrainBlocked(level, it) } ||
                     terrain.coveredChunks(prop).any { terrainBlocked(level, it) } || !terrain.primeForAssembly(level, prop) }) {
                 pendingRestores += id
                 return@repeat
             }
             loaded.forEach { it.terrainBlockers = emptyList() }
-            val records = activeConnections(level).filter { it.first in members && it.second in members }
             if (records.isEmpty()) {
                 entity.physicsPending = false
                 queueBodyCreation(entity, level)
@@ -808,7 +848,12 @@ class PhysicsPropManager(
                 RestoredJoint(indices.getValue(record.first), indices.getValue(record.second), record.kind, record.frames, record.ropeLength)
             }
             val requests = loaded.associate { it.uuid to associations.requestId(it.uuid) }
-            val bodies = loaded.map { RestoreBody(it.uuid, requests.getValue(it.uuid), bodyDefinition(it, level)) }
+            val bodies = loaded.map { prop ->
+                val state = checkpoint.getValue(prop.uuid)
+                RestoreBody(prop.uuid, requests.getValue(prop.uuid), bodyDefinition(prop, level).copy(
+                    transform = state.transform, linearVelocity = state.linearVelocity, angularVelocity = state.angularVelocity
+                ))
+            }
             val token = PhysicsRestoreToken()
             if (!service.submit(PhysicsCommand.RestoreComponent(level.physicsDimensionId(), bodies, joints, token))) {
                 pendingRestores += id
@@ -2074,14 +2119,27 @@ class PhysicsPropManager(
                         bodyGenerations.nextGeneration(body.propId)
                     }
                     group.activated = true
+                    group.activationAfterStep = service.latestFrame(group.level.physicsDimensionId()).physicsStep
                 }
                 is PhysicsAcknowledgement.ComponentParked -> {
-                    val parking = parkingGroups.remove(acknowledgement.requestId) ?: continue
+                    val parking = parkingGroups[acknowledgement.requestId] ?: continue
                     if (!acknowledgement.success) {
                         logger.error("Could not atomically park a linked component; stopping physics")
                         service.close()
                         continue
                     }
+                    val records = activeConnections(parking.level).filter { it.first in parking.members && it.second in parking.members }
+                    if (records.isNotEmpty() && acknowledgement.snapshots.keys == parking.members &&
+                        parking.snapshotMembers == parking.members) {
+                        val checkpoint = acknowledgement.snapshots.map { (id, snapshot) -> snapshot.toDurableState(id) }
+                        try {
+                            journal.putAll(records.map { it.copy(checkpoint = checkpoint) })
+                        } catch (error: Exception) {
+                            logger.error("Could not persist parked component checkpoint; keeping it parked", error)
+                            continue
+                        }
+                    }
+                    parkingGroups.remove(acknowledgement.requestId)
                     acknowledgement.snapshots.forEach { (id, snapshot) ->
                         if (id in parking.snapshotMembers) props[id]?.let { prop -> prop.applySnapshot(prop.lastAppliedStep + 1, snapshot) }
                     }
@@ -2101,13 +2159,36 @@ class PhysicsPropManager(
                         failConnection(acknowledgement.requestId, pending)
                         continue
                     }
+                    val first = props[pending.first]
+                    val level = first?.level() as? ServerLevel
+                    val members = if (level != null) componentFor(level, pending.first) + componentFor(level, pending.second) else emptySet()
+                    val snapshots = acknowledgement.snapshots
+                    if (level == null || snapshots.keys != members || members.any { id ->
+                            val prop = props[id]
+                            val snapshot = snapshots[id]
+                            prop == null || prop.isRemoved || prop.level() !== level || snapshot == null ||
+                                prop.runtimeBodyId != snapshot.bodyId
+                        }) {
+                        failConnection(acknowledgement.requestId, pending)
+                        continue
+                    }
+                    val checkpoint = snapshots.map { (id, snapshot) -> snapshot.toDurableState(id) }
                     val record = DurableConnection(acknowledgement.requestId, pending.dimension.value, pending.first,
-                        pending.second, pending.playerId, pending.kind, frames, pending.ropeLength, false)
+                        pending.second, pending.playerId, pending.kind, frames, pending.ropeLength, false, checkpoint)
                     try {
-                        journal.put(record)
+                        val failures = PhysicsServices.chunkIoFailureCount(server)
+                        check(failures == 0L) { "A chunk I/O failure occurred before connection checkpoint" }
+                        snapshots.forEach { (id, snapshot) -> props.getValue(id).let { it.applySnapshot(it.lastAppliedStep + 1, snapshot) } }
+                        level.save(null, true, false)
+                        check(PhysicsServices.chunkIoFailureCount(server) == failures) { "Connection endpoint checkpoint failed" }
+                        check(members.all { id -> props[id]?.let { !it.isRemoved && it.level() === level } == true }) {
+                            "Connection endpoint disappeared during checkpoint"
+                        }
+                        val previous = activeConnections(level).filter { it.first in members && it.second in members }
+                        journal.putAll(previous.map { it.copy(checkpoint = checkpoint) } + record)
                         pending.record = record
                     } catch (error: Exception) {
-                        logger.error("Could not persist connection intent; keeping bodies parked", error)
+                        logger.error("Could not persist connection endpoint checkpoint; keeping bodies parked", error)
                         continue
                     }
                     if (!service.submit(PhysicsCommand.InstallPreparedConnection(pending.dimension, pending.bodyA, pending.bodyB,
@@ -2279,15 +2360,19 @@ private data class PlatformMotion(
     val delta: PhysicsVector
 )
 
+private fun PhysicsBodySnapshot.toDurableState(propId: UUID) =
+    DurableBodyState(propId, transform, linearVelocity, angularVelocity)
+
 private data class RestoreGroup(
     val level: ServerLevel,
     val members: Set<UUID>,
     val requests: Map<UUID, UUID>,
     var bodies: List<ParkBody> = emptyList(),
-    var activated: Boolean = false
+    var activated: Boolean = false,
+    var activationAfterStep: Long = 0L
 )
 
-private data class ParkingGroup(val members: Set<UUID>, val snapshotMembers: Set<UUID>)
+private data class ParkingGroup(val level: ServerLevel, val members: Set<UUID>, val snapshotMembers: Set<UUID>)
 
 private data class PendingConnection(
     val key: WeldKey,

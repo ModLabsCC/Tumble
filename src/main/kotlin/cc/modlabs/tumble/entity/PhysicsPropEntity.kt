@@ -125,6 +125,14 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
         mass = snapshot.mass
     }
 
+    internal fun restoreCheckpoint(transform: cc.modlabs.tumble.physics.PhysicsTransform, linear: PhysicsVector, angular: PhysicsVector) {
+        val rotation = transform.rotation.normalized()
+        entityData.set(DATA_ROTATION, Quaternionf(rotation.x.toFloat(), rotation.y.toFloat(), rotation.z.toFloat(), rotation.w.toFloat()))
+        setPos(transform.position.x, transform.position.y, transform.position.z)
+        setDeltaMovement(linear.x, linear.y, linear.z)
+        angularVelocity = angular
+    }
+
     override fun tick() {
         super.tick()
         fallDistance = 0.0

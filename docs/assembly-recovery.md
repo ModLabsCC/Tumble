@@ -20,3 +20,12 @@ If startup stops during recovery:
 The journal and checkpoint target abrupt server-process termination on a local filesystem. Directory-entry durability after an operating-system crash or power loss is not guaranteed. A conversion performs a synchronous level save, which can briefly pause a large server. A pending assembly cannot ride another entity or carry passengers until its checkpoint completes. Other mods that directly modify chunk internals or teleport a pending assembly can bypass the normal recovery assumptions.
 
 If the server reports any chunk or entity storage I/O failure, Tumble refuses new assembly conversions for the rest of that server session. Investigate the reported storage error and restart after correcting it; a failed load may otherwise cause a conversion to capture substituted or incomplete world data. Other conversion paths are unaffected by this guard.
+
+
+## Connected props
+
+Tumble keeps connection records and coherent component checkpoints in the world's `data/tumble_connections.dat`. Back up this file with the rest of the world. A linked component stays parked until all of its recorded entities and terrain are available; a corrupt journal stops loading rather than silently dropping links. If a required entity cannot be found, retain the journal and restore a matching world backup before attempting manual repair.
+
+Before writing a new connection intent, Tumble parks the affected components and synchronously saves their entities. It also updates their shared checkpoint when they park and at normal server-save boundaries. After a crash, recovery restores that coherent checkpoint, so movement since the last checkpoint can be lost. A failed checkpoint can leave a component parked until storage is repaired. Connection creation and checkpoint writes are synchronous and can briefly pause the server.
+
+The connection journal uses an atomic replacement after forcing the new file contents. It targets abrupt server-process termination on a local filesystem; Windows directory-entry durability after an operating-system crash or power loss is not guaranteed. The production crash fixture exercises a forced halt immediately after an intent write, including an endpoint spawned after the preceding world save; it does not cover every filesystem failure or crash point.
