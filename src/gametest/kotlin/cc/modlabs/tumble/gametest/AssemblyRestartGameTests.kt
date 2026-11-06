@@ -7,6 +7,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.UUID
 import net.fabricmc.fabric.api.gametest.v1.GameTest
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents
 import net.minecraft.core.BlockPos
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.server.level.ServerPlayer
@@ -18,6 +19,58 @@ import net.minecraft.world.phys.AABB
 class AssemblyRestartGameTests {
     private val origin = BlockPos(4096, 80, 0)
     private val idFile = Path.of("assembly-restart-id.txt")
+
+    @GameTest(maxTicks = 1200)
+    fun crashBaseline(helper: GameTestHelper) {
+        if (System.getProperty("tumble.restart.phase") != "crashBaseline") return helper.succeed()
+        val level = helper.level
+        level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        level.getChunkAt(origin)
+        level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        level.setBlock(origin.east(), Blocks.OAK_STAIRS.defaultBlockState(), 3)
+        level.setBlock(origin.offset(3, 0, 0), Blocks.DIAMOND_BLOCK.defaultBlockState(), 3)
+        helper.succeed()
+    }
+
+    @GameTest(maxTicks = 1200)
+    fun crashInject(helper: GameTestHelper) {
+        if (System.getProperty("tumble.restart.phase") != "crashInject") return helper.succeed()
+        val level = helper.level
+        level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        level.getChunkAt(origin)
+        helper.assertTrue(level.getBlockState(origin).`is`(Blocks.STONE) &&
+            level.getBlockState(origin.east()).`is`(Blocks.OAK_STAIRS), "baseline blocks not loaded")
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        ServerEntityEvents.ENTITY_LOAD.register { entity, entityLevel ->
+            if (entityLevel === level && entity is PhysicsPropEntity && entity.blockPosition() == origin) {
+                Files.writeString(Path.of("assembly-crash-reached.txt"),
+                    "entity-load: ${level.getBlockState(origin)}, ${level.getBlockState(origin.east())}")
+                Runtime.getRuntime().halt(86)
+            }
+        }
+        TumbleApi.convertAssembly(level, listOf(origin, origin.east()), player)
+        helper.fail("conversion did not reach the injected crash")
+    }
+
+    @GameTest(maxTicks = 1200)
+    fun crashVerify(helper: GameTestHelper) {
+        if (System.getProperty("tumble.restart.phase") != "crashVerify") return helper.succeed()
+        val level = helper.level
+        level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        level.getChunkAt(origin)
+        helper.runAfterDelay(100) {
+            val props = level.getEntitiesOfClass(PhysicsPropEntity::class.java, AABB(
+                origin.x - 32.0, origin.y - 80.0, origin.z - 32.0,
+                origin.x + 32.0, origin.y + 32.0, origin.z + 32.0
+            ))
+            helper.assertTrue(props.isEmpty(), "unexpected persisted assembly after injected crash")
+            helper.assertTrue(level.getBlockState(origin) == Blocks.STONE.defaultBlockState() &&
+                level.getBlockState(origin.east()) == Blocks.OAK_STAIRS.defaultBlockState(), "crash lost or changed source blocks")
+            helper.assertTrue(level.getBlockState(origin.offset(3, 0, 0)).`is`(Blocks.DIAMOND_BLOCK), "baseline chunk was not persisted")
+            helper.succeed()
+        }
+    }
 
     @GameTest(maxTicks = 1200)
     fun prepare(helper: GameTestHelper) {

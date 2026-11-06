@@ -148,3 +148,25 @@ tasks.named('runAssemblyRestartVerify') { mustRunAfter tasks.named('runAssemblyR
 tasks.register('runAssemblyRestartTest') {
     dependsOn tasks.named('runAssemblyRestartPrepare'), tasks.named('runAssemblyRestartVerify')
 }
+
+['crashBaseline', 'crashInject', 'crashVerify'].each { phase ->
+    tasks.register("runAssembly${phase.capitalize()}", net.fabricmc.loom.task.prod.ServerProductionRunTask) {
+        outputs.upToDateWhen { false }
+        installerVersion = '1.1.2'
+        runDir = layout.buildDirectory.dir('run/assemblyCrash').get().asFile
+        jvmArgs.add('-Dfabric-api.gametest')
+        jvmArgs.add("-Dfabric-api.gametest.filter=tumble_test:assembly_restart_game_tests_${phase.replaceAll('([a-z])([A-Z])', '\$1_\$2').toLowerCase(Locale.ROOT)}")
+        jvmArgs.add("-Dtumble.restart.phase=${phase}")
+        doFirst {
+            if (!providers.gradleProperty('acceptMinecraftEula').map { it.toBoolean() }.getOrElse(false)) {
+                throw new GradleException('Pass -PacceptMinecraftEula=true to accept the Minecraft EULA for tests')
+            }
+            def directory = runDir.get().asFile
+            directory.mkdirs()
+            if (phase == 'crashBaseline') {
+                project.delete(new File(directory, 'world'), new File(directory, 'assembly-crash-reached.txt'))
+            }
+            new File(directory, 'eula.txt').text = 'eula=true\n'
+        }
+    }
+}
