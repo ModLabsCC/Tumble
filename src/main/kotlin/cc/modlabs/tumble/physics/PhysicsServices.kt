@@ -2,6 +2,7 @@
 package cc.modlabs.tumble.physics
 
 import java.util.IdentityHashMap
+import java.util.Collections
 import java.util.UUID
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.core.BlockPos
@@ -22,7 +23,7 @@ import net.minecraft.sounds.SoundSource
 import org.slf4j.Logger
 
 object PhysicsServices {
-    private val runtimes = IdentityHashMap<MinecraftServer, Runtime>()
+    private val runtimes = Collections.synchronizedMap(IdentityHashMap<MinecraftServer, Runtime>())
     private val placementCapture = ThreadLocal<PlacementCapture?>()
     private val pistonCapture = ThreadLocal<PistonCapture?>()
 
