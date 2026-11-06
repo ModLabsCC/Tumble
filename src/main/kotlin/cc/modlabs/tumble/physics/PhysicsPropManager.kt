@@ -172,12 +172,15 @@ class PhysicsPropManager(
 
     internal fun convertAssembly(level: ServerLevel, positions: List<BlockPos>, player: ServerPlayer, allowRemote: Boolean = false): PhysicsPropEntity? {
         if (!service.isRunning() || player.level() !== level || !player.isAlive || player.isSpectator || !player.mayBuild() || !canSpawn() ||
-            positions.isEmpty() || positions.size > AssemblyDefinition.MAX_BLOCKS || positions.toSet().size != positions.size
+            positions.isEmpty() || positions.size > AssemblyDefinition.MAX_BLOCKS
         ) return null
-        if (positions.any { (level.physicsDimensionId().value to it) in conversionLocks }) return null
-        val origin = positions.first().immutable()
+        val selected = positions.map { it.immutable() }
+        if (selected.isEmpty() || selected.size > AssemblyDefinition.MAX_BLOCKS || selected.toSet().size != selected.size ||
+            selected.any { (level.physicsDimensionId().value to it) in conversionLocks }
+        ) return null
+        val origin = selected.first()
         if (player.distanceToSqr(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5) > PHYSICS_GUN_REACH_SQUARED) return null
-        val remaining = positions.mapTo(mutableSetOf()) { it.immutable() }
+        val remaining = selected.toMutableSet()
         val queue = ArrayDeque<BlockPos>()
         queue.add(origin)
         remaining.remove(origin)
@@ -191,10 +194,10 @@ class PhysicsPropManager(
         if (remaining.isNotEmpty()) return null
 
         val conversionId = UUID.randomUUID()
-        val keys = positions.map { level.physicsDimensionId().value to it.immutable() }
+        val keys = selected.map { level.physicsDimensionId().value to it }
         keys.forEach { conversionLocks[it] = conversionId }
         return try {
-            convertAssemblyLocked(level, positions, player, allowRemote, origin, conversionId)
+            convertAssemblyLocked(level, selected, player, allowRemote, origin, conversionId)
         } finally {
             if (conversionId !in recoveryRecords) keys.forEach { conversionLocks.remove(it, conversionId) }
         }

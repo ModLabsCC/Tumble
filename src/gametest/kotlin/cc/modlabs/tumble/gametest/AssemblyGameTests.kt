@@ -741,6 +741,29 @@ class AssemblyGameTests {
     }
 
     @GameTest
+    fun mutableInputPositionsCannotChangeTheCapturedSource(helper: GameTestHelper) {
+        val origin = BlockPos(50304, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val mutable = BlockPos.MutableBlockPos(origin.x, origin.y, origin.z)
+        net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents.BEFORE.register { level, _, position, _, _ ->
+            if (level === helper.level && position == origin) mutable.set(origin.x + 8, origin.y, origin.z)
+            true
+        }
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val id = TumbleApi.convertAssembly(helper.level, listOf(mutable), player)
+            ?: return helper.fail("mutable input changed the conversion")
+        helper.assertTrue(helper.level.getBlockState(origin).isAir, "conversion removed the wrong source")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
+            helper.assertTrue(helper.level.setBlock(origin, Blocks.DIRT.defaultBlockState(), 3), "mutable input left a stale source fence")
+        }
+    }
+
+    @GameTest
     fun rejectedOrThrowingBreakCallbackReleasesSourceFence(helper: GameTestHelper) {
         val origin = BlockPos(50128, 4, 0)
         val throwing = origin.east(2)
