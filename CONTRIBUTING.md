@@ -22,3 +22,5 @@ Run `./gradlew runAssemblyRestartTest -PacceptMinecraftEula=true` with Java 25 t
 `python scripts/test_assembly_crash.py` saves source blocks, terminates a separate server during conversion, and verifies the saved world in a third process. Run it again with `--order prepare`, `--order block`, and `--order entity` to test a prepared journal and separately saved block and entity data. The injected server must exit with code 86. It uses a separate `build/run/assemblyCrash/world`.
 
 `python scripts/test_connection_crash.py` tests a linked component across a forced server stop and restart. It uses `build/run/connectionCrash/world`.
+
+`python scripts/test_placement_crash.py` and `python scripts/test_removal_crash.py` test linked-prop placement and removal across forced crashes, separate block and entity saves, and interrupted replay. They use dedicated test worlds under `build/run`.

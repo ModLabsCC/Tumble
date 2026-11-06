@@ -5,6 +5,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+sys.stdout.reconfigure(errors='backslashreplace')
+sys.stderr.reconfigure(errors='backslashreplace')
+
 ROOT = Path(__file__).resolve().parent.parent
 GRADLE = ['cmd', '/d', '/c', 'gradlew.bat'] if os.name == 'nt' else ['./gradlew']
 RUN_DIR = ROOT / 'build/run/removalCrash'

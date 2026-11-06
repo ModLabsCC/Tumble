@@ -53,6 +53,12 @@ pipeline {
                 sh 'python3 scripts/test_connection_crash.py'
             }
         }
+        stage('Placement and removal crash GameTests') {
+            steps {
+                sh 'python3 scripts/test_placement_crash.py'
+                sh 'python3 scripts/test_removal_crash.py'
+            }
+        }
         stage('Physics benchmark') {
             steps {
                 sh './gradlew :physics-core:benchmark --no-daemon --stacktrace'
