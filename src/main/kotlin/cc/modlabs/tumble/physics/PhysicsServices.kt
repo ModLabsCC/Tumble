@@ -100,6 +100,16 @@ object PhysicsServices {
         }
     }
 
+    fun beforePropRemoval(entity: cc.modlabs.tumble.entity.PhysicsPropEntity, level: ServerLevel): Boolean {
+        val manager = runtimes[level.server]?.manager ?: return true
+        if (manager.findProp(entity.uuid) !== entity) return true
+        if (manager.isBlockPlacementPending(entity.uuid)) return false
+        return manager.entityUnloaded(entity, level)
+    }
+
+    fun canTeleportProp(entity: cc.modlabs.tumble.entity.PhysicsPropEntity, level: ServerLevel, destination: ServerLevel): Boolean =
+        runtimes[level.server]?.manager?.canTeleportProp(entity, level, destination) ?: true
+
     fun requestAssembly(player: ServerPlayer, propId: UUID) {
         runtimes[player.level().server]?.publisher?.requestAssembly(player, propId)
     }

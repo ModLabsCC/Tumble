@@ -55,6 +55,189 @@ import net.minecraft.world.level.storage.TagValueOutput
 import net.minecraft.world.level.storage.LevelResource
 
 class AssemblyGameTests {
+    @GameTest
+    fun clearRetainsPropsWhenConnectionTombstonesFail(helper: GameTestHelper) {
+        val logger = LoggerFactory.getLogger("clear-connection-failure-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        val directory = Files.createTempDirectory("tumble-clear-failure")
+        val path = directory.resolve("connections.dat")
+        val blocked = directory.resolve("blocked")
+        Files.createDirectory(blocked)
+        Files.writeString(blocked.resolve("keep"), "keep")
+        try {
+            val first = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+            val second = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+            val journalClass = Class.forName("cc.modlabs.tumble.physics.DurableConnectionJournal")
+            val journal = journalClass.getConstructor(java.nio.file.Path::class.java).newInstance(path)
+            val recordClass = Class.forName("cc.modlabs.tumble.physics.DurableConnection")
+            val record = recordClass.constructors.single().newInstance(UUID.randomUUID(), helper.level.physicsDimensionId().value,
+                first.uuid, second.uuid, UUID.randomUUID(), cc.modlabs.tumble.physics.PhysicsJointKind.NO_COLLIDE, null, 0f, false)
+            journalClass.getMethod("put", recordClass).invoke(journal, record)
+            val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning())
+            manager.javaClass.getDeclaredField("journal").apply { isAccessible = true }.set(manager, journal)
+            manager.entityLoaded(first, helper.level)
+            manager.entityLoaded(second, helper.level)
+            val journalPath = journalClass.getDeclaredField("path").apply { isAccessible = true }
+            journalPath.set(journal, blocked)
+            helper.assertTrue(manager.clear(helper.level) == 0, "clear reported props removed after journal failure")
+            helper.assertTrue(!first.isRemoved && !second.isRemoved, "clear discarded props after journal failure")
+            journalPath.set(journal, path)
+            helper.assertTrue(manager.clear(helper.level) == 2, "clear did not remove props after journal recovered")
+        } finally {
+            service.close()
+            Files.deleteIfExists(path)
+            Files.deleteIfExists(blocked.resolve("keep"))
+            Files.deleteIfExists(blocked)
+            Files.deleteIfExists(directory)
+        }
+        helper.succeed()
+    }
+
+    @GameTest(maxTicks = 400)
+    fun deniedBlockPlacementKeepsExistingWeld(helper: GameTestHelper) {
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        val origin = helper.absolutePos(BlockPos(1, 3, 1))
+        val first = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn first prop")
+        val second = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 2.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn second prop")
+        val player = (helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer).apply {
+            setPos(origin.x + 1.5, origin.y.toDouble(), origin.z + 2.5)
+            setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
+        }
+        var phase = 0
+        var blocker: UUID? = null
+        helper.succeedWhen {
+            Thread.sleep(5)
+            when (phase) {
+                0 -> {
+                    val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
+                    helper.assertTrue(first.uuid in ready && second.uuid in ready, "bodies are not ready")
+                    helper.assertTrue(runtime.manager.useToolGunWeld(player, first) == ToolGunWeldResult.SELECTED, "weld selection failed")
+                    helper.assertTrue(runtime.manager.useToolGunWeld(player, second) == ToolGunWeldResult.WELDED, "weld creation failed")
+                    phase = 1
+                }
+                1 -> {
+                    helper.assertTrue(TumbleApi.status(helper.level, first.uuid) == TumbleApi.PropStatus.READY, "weld not installed")
+                    val position = first.blockPosition()
+                    player.setPos(position.x + 0.5, position.y.toDouble(), position.z + 2.0)
+                    helper.assertTrue(helper.level.setBlock(position, Blocks.STONE.defaultBlockState(), 3), "could not place fence source")
+                    blocker = TumbleApi.convertAssembly(helper.level, listOf(position), player)
+                        ?: return@succeedWhen helper.fail("could not fence placement target")
+                    helper.assertTrue(TumbleApi.status(helper.level, first.uuid) == TumbleApi.PropStatus.READY,
+                        "linked prop became unavailable before placement attempt")
+                    helper.assertTrue(!runtime.manager.usePhysicsGunSecondary(player, first, true), "protected block placement succeeded")
+                    helper.assertTrue(!first.isRemoved && helper.level.getBlockState(position).isAir, "failed placement consumed the prop")
+                    val journal = runtime.manager.javaClass.getDeclaredField("journal").apply { isAccessible = true }.get(runtime.manager)
+                    val records = journal.javaClass.getMethod("records").invoke(journal) as List<*>
+                    val retained = records.filterNotNull().any { record ->
+                        val type = record.javaClass
+                        val endpoints = setOf(type.getMethod("getFirst").invoke(record), type.getMethod("getSecond").invoke(record))
+                        endpoints == setOf(first.uuid, second.uuid) && type.getMethod("getDeleted").invoke(record) == false
+                    }
+                    helper.assertTrue(retained, "failed placement removed the durable weld")
+                    phase = 2
+                }
+                2 -> {
+                    val blockId = requireNotNull(blocker)
+                    helper.assertTrue(TumbleApi.status(helper.level, blockId) == TumbleApi.PropStatus.READY, "blocking conversion not complete")
+                    TumbleApi.remove(helper.level, blockId)
+                    runtime.manager.entityUnloaded(first, helper.level)
+                    runtime.manager.entityUnloaded(second, helper.level)
+                    first.discard()
+                    second.discard()
+                    return@succeedWhen
+                }
+            }
+            helper.assertTrue(false, "waiting for placement-denial test")
+        }
+    }
+
+    @GameTest(maxTicks = 400)
+    fun failedConnectionTombstoneDoesNotRemoveProp(helper: GameTestHelper) {
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        val origin = helper.absolutePos(BlockPos(1, 3, 1))
+        val first = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn first prop")
+        val second = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 2.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn second prop")
+        val player = (helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer).apply {
+            setPos(origin.x + 1.5, origin.y.toDouble(), origin.z + 2.5)
+            setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
+        }
+        var phase = 0
+        helper.succeedWhen {
+            Thread.sleep(5)
+            if (phase == 0) {
+                val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
+                helper.assertTrue(first.uuid in ready && second.uuid in ready, "bodies are not ready")
+                helper.assertTrue(runtime.manager.useToolGunWeld(player, first) == ToolGunWeldResult.SELECTED, "weld selection failed")
+                helper.assertTrue(runtime.manager.useToolGunWeld(player, second) == ToolGunWeldResult.WELDED, "weld creation failed")
+                phase = 1
+                return@succeedWhen helper.assertTrue(false, "waiting for weld")
+            }
+            helper.assertTrue(TumbleApi.status(helper.level, first.uuid) == TumbleApi.PropStatus.READY, "weld not installed")
+            val journal = runtime.manager.javaClass.getDeclaredField("journal").apply { isAccessible = true }.get(runtime.manager)
+            val path = journal.javaClass.getDeclaredField("path").apply { isAccessible = true }
+            val original = path.get(journal)
+            val directory = Files.createTempDirectory("tumble-removal-failure")
+            val obstruction = directory.resolve("journal")
+            Files.createDirectory(obstruction)
+            Files.writeString(obstruction.resolve("keep"), "keep")
+            try {
+                path.set(journal, obstruction)
+                helper.assertTrue(!TumbleApi.remove(helper.level, first.uuid), "API reported removal despite failed tombstone")
+                helper.assertTrue(!first.isRemoved && TumbleApi.status(helper.level, first.uuid) != TumbleApi.PropStatus.UNAVAILABLE,
+                    "failed tombstone removed prop")
+                val position = first.blockPosition()
+                helper.assertTrue(helper.level.getBlockState(position).isAir, "expected an empty block conversion target")
+                helper.assertTrue(!runtime.manager.usePhysicsGunSecondary(player, first, true), "block conversion ignored tombstone failure")
+                helper.assertTrue(helper.level.getBlockState(position).isAir && !first.isRemoved, "failed tombstone duplicated the prop as a block")
+                repeat(ToolGunMode.REMOVER.ordinal) { runtime.manager.cycleToolGunMode(player, 1) }
+                helper.assertTrue(runtime.manager.useToolGun(player, first) == ToolGunResult.FAILED, "secondary remover ignored tombstone failure")
+                helper.assertTrue(!runtime.manager.useToolGunPrimary(player, first), "primary remover ignored tombstone failure")
+                helper.assertTrue(!first.isRemoved, "failed remover discarded the prop")
+                val nether = helper.level.server.getLevel(net.minecraft.world.level.Level.NETHER)
+                    ?: return@succeedWhen helper.fail("nether not available")
+                val transition = net.minecraft.world.level.portal.TeleportTransition(nether,
+                    net.minecraft.world.phys.Vec3(0.5, 80.0, 0.5), net.minecraft.world.phys.Vec3.ZERO,
+                    0f, 0f, net.minecraft.world.level.portal.TeleportTransition.DO_NOTHING)
+                helper.assertTrue(first.teleport(transition) == null && !first.isRemoved && first.level() === helper.level,
+                    "cross-dimension teleport cloned a linked prop after failed tombstone")
+                first.discard()
+                helper.assertTrue(!first.isRemoved, "direct discard ignored tombstone failure")
+                first.initialize(Blocks.TNT.defaultBlockState(), PhysicsVector.ZERO)
+                val body = runtime.manager.networkProps().first { it.propId == first.uuid }.bodyId
+                val impacts = runtime.service.javaClass.getDeclaredField("impacts").apply { isAccessible = true }
+                @Suppress("UNCHECKED_CAST")
+                val queue = impacts.get(runtime.service) as ConcurrentLinkedQueue<cc.modlabs.tumble.physics.PhysicsImpactNotification>
+                val count = runtime.service.javaClass.getDeclaredField("impactCount").apply { isAccessible = true }
+                    .get(runtime.service) as java.util.concurrent.atomic.AtomicInteger
+                val rule = cc.modlabs.tumble.TumbleGameRules.EXPLODE_TNT_ON_IMPACT
+                val previous = helper.level.gameRules.get(rule)
+                try {
+                    helper.level.gameRules.set(rule, true, helper.level.server)
+                    count.incrementAndGet()
+                    queue.add(cc.modlabs.tumble.physics.PhysicsImpactNotification(helper.level.physicsDimensionId(),
+                        cc.modlabs.tumble.physics.PhysicsImpactEvent(body, null, PhysicsVector.ZERO, PhysicsVector(0.0, 1.0, 0.0), 30f)))
+                    runtime.manager.tick()
+                    helper.assertTrue(!first.isRemoved, "TNT detonation ignored tombstone failure")
+                } finally {
+                    helper.level.gameRules.set(rule, previous, helper.level.server)
+                }
+            } finally {
+                path.set(journal, original)
+                Files.deleteIfExists(obstruction.resolve("keep"))
+                Files.deleteIfExists(obstruction)
+                Files.deleteIfExists(directory)
+            }
+            runtime.manager.entityUnloaded(first, helper.level)
+            runtime.manager.entityUnloaded(second, helper.level)
+            first.discard()
+            second.discard()
+        }
+    }
+
     @GameTest(maxTicks = 400)
     fun failedNativeWeldCanBeRetried(helper: GameTestHelper) {
         val runtime = PhysicsServices.runtime(helper.level.server)!!

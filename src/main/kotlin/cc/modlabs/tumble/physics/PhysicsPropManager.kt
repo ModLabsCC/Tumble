@@ -103,6 +103,7 @@ class PhysicsPropManager(
     private val toolConnections = mutableSetOf<WeldKey>()
     private val confirmedToolConnections = mutableSetOf<WeldKey>()
     private val pendingConnections = mutableMapOf<UUID, PendingConnection>()
+    private val pendingBlockPlacements = mutableSetOf<UUID>()
     private val weldHistoryByPlayer = mutableMapOf<UUID, java.util.ArrayDeque<WeldKey>>()
     private val lastPhysicsGunControlTick = mutableMapOf<UUID, Long>()
     private val launchedProps = mutableMapOf<UUID, LaunchedProp>()
@@ -444,12 +445,31 @@ class PhysicsPropManager(
             val position = BlockPos.containing(prop.x, prop.y, prop.z)
             val actor = player as? ServerPlayer ?: return false
             if (!actor.mayBuild() || !actor.mayInteract(level, position) || !level.worldBorder.isWithinBounds(position) ||
-                !level.getBlockState(position).canBeReplaced() ||
-                !level.setBlock(position, prop.blockState, Block.UPDATE_ALL)
+                !level.getBlockState(position).canBeReplaced()
             ) return false
-            entityUnloaded(prop, level)
-            prop.discard()
-            return true
+            val component = componentFor(level, prop.uuid)
+            if (component.any { it in pendingBlockPlacements }) return false
+            pendingBlockPlacements.addAll(component)
+            try {
+                val connections = activeConnections(level).filter { it.first == prop.uuid || it.second == prop.uuid }
+                if (!tombstoneConnections(level) { it.first == prop.uuid || it.second == prop.uuid }) return false
+                val placed = try {
+                    level.setBlock(position, prop.blockState, Block.UPDATE_ALL)
+                } catch (error: Exception) {
+                    restoreConnectionsAfterFailedPlacement(connections)
+                    throw error
+                }
+                if (!placed) {
+                    restoreConnectionsAfterFailedPlacement(connections)
+                    return false
+                }
+                if (component.size > 1) parkForRecovery(level, component)
+                if (!entityUnloaded(prop, level)) return false
+                prop.discard()
+                return true
+            } finally {
+                pendingBlockPlacements.removeAll(component)
+            }
         }
         if (prop.frozen) return true
         releaseProp(prop.uuid)
@@ -459,6 +479,15 @@ class PhysicsPropManager(
         prop.setDeltaMovement(Vec3.ZERO)
         prop.angularVelocity = PhysicsVector.ZERO
         return true
+    }
+
+    private fun restoreConnectionsAfterFailedPlacement(connections: List<DurableConnection>) {
+        try {
+            if (connections.isNotEmpty()) journal.putAll(connections)
+        } catch (error: Exception) {
+            logger.error("Could not restore connections after failed block placement; stopping server", error)
+            server.halt(false)
+        }
     }
 
     fun useToolGunWeld(player: Player, prop: PhysicsPropEntity): ToolGunWeldResult {
@@ -528,7 +557,7 @@ class PhysicsPropManager(
         ) return ToolGunResult.FAILED
 
         if (mode == ToolGunMode.REMOVER) {
-            entityUnloaded(prop, level)
+            if (!entityUnloaded(prop, level)) return ToolGunResult.FAILED
             prop.discard()
             return ToolGunResult.APPLIED
         }
@@ -578,6 +607,7 @@ class PhysicsPropManager(
 
     fun useToolGunPrimary(player: Player, prop: PhysicsPropEntity): Boolean {
         val level = player.level() as? ServerLevel ?: return false
+        if (prop.uuid in pendingBlockPlacements) return false
         if (prop.level() !== level || player.distanceToSqr(prop) > TOOL_GUN_REACH_SQUARED) return false
         if (toolGunMode(player) == ToolGunMode.WELD) return removeToolGunWelds(player, prop)
         if (toolGunMode(player) in setOf(ToolGunMode.ROPE, ToolGunMode.AXIS, ToolGunMode.NO_COLLIDE)) return removeToolGunConstraints(player, prop)
@@ -591,7 +621,7 @@ class PhysicsPropManager(
                 recreateBody(prop, level)
             }
             ToolGunMode.REMOVER -> {
-                entityUnloaded(prop, level)
+                if (!entityUnloaded(prop, level)) return false
                 prop.discard()
                 true
             }
@@ -667,6 +697,7 @@ class PhysicsPropManager(
         val history = weldHistoryByPlayer[player.uuid] ?: return false
         while (history.isNotEmpty()) {
             val key = history.last()
+            if (key.first in pendingBlockPlacements || key.second in pendingBlockPlacements) return false
             if (key !in activeWelds) {
                 history.removeLast()
                 continue
@@ -743,6 +774,13 @@ class PhysicsPropManager(
     private fun activeConnections(level: ServerLevel): List<DurableConnection> =
         journal.records().filter { !it.deleted && it.dimension == level.physicsDimensionId().value }
 
+    fun canTeleportProp(entity: PhysicsPropEntity, level: ServerLevel, destination: ServerLevel): Boolean {
+        if (entity.uuid in pendingBlockPlacements || entity.uuid in recoveryRecords || entity.uuid in failedAssemblyConversions) return false
+        if (destination === level) return true
+        return activeConnections(level).none { it.first == entity.uuid || it.second == entity.uuid } &&
+            pendingConnections.values.none { it.key.contains(entity.uuid) }
+    }
+
     private fun componentFor(level: ServerLevel, root: UUID): Set<UUID> {
         val adjacency = mutableMapOf<UUID, MutableList<UUID>>()
         activeConnections(level).forEach { record ->
@@ -773,7 +811,7 @@ class PhysicsPropManager(
             journal.putAll(removed)
             true
         } catch (error: Exception) {
-            logger.error("Could not persist connection removal; keeping the component parked", error)
+            logger.error("Could not persist connection removal; retaining the connections", error)
             false
         }
     }
@@ -938,12 +976,13 @@ class PhysicsPropManager(
         queueBodyCreation(entity, level)
     }
 
-    fun entityUnloaded(entity: Entity, level: ServerLevel, visibilityEvent: Boolean = false) {
-        if (entity !is PhysicsPropEntity || props[entity.uuid] !== entity) return
+    fun entityUnloaded(entity: Entity, level: ServerLevel, visibilityEvent: Boolean = false): Boolean {
+        if (entity !is PhysicsPropEntity || props[entity.uuid] !== entity) return false
         val reason = entity.removalReason
         val visibilityUnload = visibilityEvent && reason != Entity.RemovalReason.KILLED &&
             reason != Entity.RemovalReason.DISCARDED && reason != Entity.RemovalReason.CHANGED_DIMENSION
         val component = componentFor(level, entity.uuid)
+        if (!visibilityUnload && !tombstoneConnections(level) { it.first == entity.uuid || it.second == entity.uuid }) return false
         if (component.size > 1) parkForRecovery(level, component)
         props.remove(entity.uuid)
         pendingRestores.remove(entity.uuid)
@@ -969,7 +1008,7 @@ class PhysicsPropManager(
         releaseProp(entity.uuid)
         launchedProps.remove(entity.uuid)
         weldSelectionByPlayer.entries.removeIf { it.value.propId == entity.uuid }
-        if (!visibilityUnload && tombstoneConnections(level) { it.first == entity.uuid || it.second == entity.uuid }) {
+        if (!visibilityUnload) {
             val removedWelds = activeWelds.filter { it.contains(entity.uuid) }
             activeWelds.removeAll(removedWelds.toSet())
             toolConnections.removeIf { it.contains(entity.uuid) }
@@ -994,6 +1033,7 @@ class PhysicsPropManager(
         }
         entity.runtimeBodyId = null
         entity.physicsPending = false
+        return true
     }
 
     fun chunkLoaded(level: ServerLevel, chunkX: Int, chunkZ: Int) {
@@ -1061,12 +1101,14 @@ class PhysicsPropManager(
     }
 
     internal fun isTerrainPaused(prop: PhysicsPropEntity, level: ServerLevel): Boolean {
-        if (prop.uuid in terrainWaits || prop.terrainBlockers.isNotEmpty() || prop.uuid in pendingRestores ||
+        if (prop.uuid in pendingBlockPlacements || prop.uuid in terrainWaits || prop.terrainBlockers.isNotEmpty() || prop.uuid in pendingRestores ||
             memberRestoreTokens[prop.uuid]?.let { restoreGroups[it]?.activated != true } == true ||
             pendingConnections.values.any { it.key.contains(prop.uuid) }) return true
         val body = prop.runtimeBodyId ?: return false
         return service.latestFrame(level.physicsDimensionId()).bodies[body]?.suspended == true
     }
+
+    internal fun isBlockPlacementPending(id: UUID): Boolean = id in pendingBlockPlacements
 
     private fun terrainBlocked(level: ServerLevel, chunk: Long): Boolean =
         chunk in unavailableTerrain[level].orEmpty() || !level.chunkSource.hasChunk(ChunkPos.getX(chunk), ChunkPos.getZ(chunk)) ||
@@ -1114,12 +1156,13 @@ class PhysicsPropManager(
     }
 
     fun clear(level: ServerLevel): Int {
-        val removed = props.values.filter { it.level() === level && it.uuid !in failedAssemblyConversions && !(it.assembly != null && it.physicsPending) }
-        removed.forEach { entity ->
-            entityUnloaded(entity, level)
-            entity.discard()
+        val removed = props.values.filter { it.level() === level && it.uuid !in pendingBlockPlacements && it.uuid !in failedAssemblyConversions && !(it.assembly != null && it.physicsPending) }
+        return removed.count { entity ->
+            if (!entityUnloaded(entity, level)) false else {
+                entity.discard()
+                true
+            }
         }
-        return removed.size
     }
 
     private fun convertPendingPlacedBlocks() {
@@ -1541,6 +1584,7 @@ class PhysicsPropManager(
     private fun flushActorImpulses() {
         pendingActorImpulses.forEach { (propId, impulse) ->
             val prop = props[propId] ?: return@forEach
+            if (prop.uuid in pendingBlockPlacements) return@forEach
             val bodyId = prop.runtimeBodyId ?: return@forEach
             val level = prop.level() as? ServerLevel ?: return@forEach
             if (isTerrainPaused(prop, level)) return@forEach
@@ -1992,7 +2036,7 @@ class PhysicsPropManager(
             val bodyId = prop.runtimeBodyId ?: return@forEach
             val position = service.latestFrame(level.physicsDimensionId()).bodies[bodyId]?.transform?.position
                 ?: PhysicsVector(prop.x, prop.y, prop.z)
-            entityUnloaded(prop, level)
+            if (!entityUnloaded(prop, level)) return@forEach
             prop.discard()
             level.explode(
                 null,

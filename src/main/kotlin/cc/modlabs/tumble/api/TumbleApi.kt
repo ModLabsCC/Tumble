@@ -106,8 +106,9 @@ object TumbleApi {
         check(level.server.isSameThread) { "Tumble API must be called on the server thread" }
         val manager = PhysicsServices.runtime(level.server)?.manager ?: return false
         val prop = manager.findProp(propId)?.takeIf { it.level() === level && !it.isRemoved } ?: return false
+        if (manager.isBlockPlacementPending(propId)) return false
         if (prop.assembly != null && (prop.physicsPending || manager.isRecoveringAssembly(propId))) return false
-        manager.entityUnloaded(prop, level)
+        if (!manager.entityUnloaded(prop, level)) return false
         prop.discard()
         return true
     }
