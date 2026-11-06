@@ -29,6 +29,7 @@ object TumbleMod : ModInitializer {
         CommandRegistrationCallback.EVENT.register { dispatcher, _, _ -> TumbleCommands.register(dispatcher) }
         ServerLifecycleEvents.SERVER_STARTING.register { PhysicsServices.start(it, logger) }
         ServerLifecycleEvents.SERVER_STARTED.register(PhysicsServices::recoverConversions)
+        ServerLifecycleEvents.BEFORE_SAVE.register { server, _, _ -> PhysicsServices.checkpointConnections(server) }
         ServerLifecycleEvents.SERVER_STOPPING.register(PhysicsServices::stop)
         ServerLifecycleEvents.SERVER_STOPPED.register(PhysicsServices::stopped)
         ServerLevelEvents.LOAD.register(PhysicsServices::levelLoaded)

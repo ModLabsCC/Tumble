@@ -72,9 +72,15 @@ class PhysicsPropManager(
     private val tuning: TumbleTuning,
     journalDirectory: Path = server.getWorldPath(LevelResource.ROOT).resolve("tumble-assembly-journal")
 ) {
+    private val journal = DurableConnectionJournal(server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT).resolve("data/tumble_connections.dat"))
     private val props = mutableMapOf<UUID, PhysicsPropEntity>()
     private val assemblies = mutableMapOf<UUID, PhysicsPropEntity>()
     private val terrainWaits = mutableMapOf<UUID, MutableSet<Long>>()
+    private val pendingRestores = linkedSetOf<UUID>()
+    private val loggedPassengerGates = mutableSetOf<UUID>()
+    private val restoreGroups = mutableMapOf<PhysicsRestoreToken, RestoreGroup>()
+    private val memberRestoreTokens = mutableMapOf<UUID, PhysicsRestoreToken>()
+    private val parkingGroups = mutableMapOf<UUID, ParkingGroup>()
     private val unavailableTerrain = mutableMapOf<ServerLevel, MutableSet<Long>>()
     private val unloadedTerrainWaits = mutableListOf<UnloadedTerrainWait>()
     private val deferredAssemblies = ArrayDeque<UUID>()
@@ -476,13 +482,15 @@ class PhysicsPropManager(
         val first = props[selected.propId]
         val firstBody = first?.runtimeBodyId
         val key = WeldKey.of(selected.propId, prop.uuid)
-        if (first == null || firstBody == null || first.level() !== level || isTerrainPaused(first, level) || key in activeWelds) {
+        if (first == null || firstBody == null || first.level() !== level || isTerrainPaused(first, level) || key in activeWelds ||
+            !canConnectWithoutPassengers(level, first.uuid, prop.uuid)) {
             sendToolGunState(player)
             return ToolGunWeldResult.FAILED
         }
         val requestId = UUID.randomUUID()
-        return if (service.submit(PhysicsCommand.CreateWeld(level.physicsDimensionId(), firstBody, bodyId, requestId))) {
-            pendingConnections[requestId] = PendingConnection(key, true, player.uuid)
+        val dimension = level.physicsDimensionId()
+        return if (service.submit(PhysicsCommand.PrepareConnection(dimension, firstBody, bodyId, requestId))) {
+            pendingConnections[requestId] = PendingConnection(key, first.uuid, prop.uuid, player.uuid, dimension, firstBody, bodyId, PhysicsJointKind.WELD, 0f)
             activeWelds += key
             weldHistoryByPlayer.getOrPut(player.uuid) { java.util.ArrayDeque() }.addLast(key)
             sendToolGunState(player)
@@ -544,24 +552,24 @@ class PhysicsPropManager(
         }
         val first = props[selected.propId]
         val firstBody = first?.runtimeBodyId
-        if (first == null || firstBody == null || first.level() !== level || isTerrainPaused(first, level)) {
+        if (first == null || firstBody == null || first.level() !== level || isTerrainPaused(first, level) ||
+            !canConnectWithoutPassengers(level, first.uuid, prop.uuid)) {
             sendToolGunState(player)
             return ToolGunResult.FAILED
         }
         val dimension = level.physicsDimensionId()
         val requestId = UUID.randomUUID()
-        val accepted = when (mode) {
-            ToolGunMode.ROPE -> {
-                val length = first.position().distanceTo(prop.position()).toFloat()
-                length.isFinite() && length > 0f &&
-                    service.submit(PhysicsCommand.CreateRope(dimension, firstBody, bodyId, length, requestId))
-            }
-            ToolGunMode.AXIS -> service.submit(PhysicsCommand.CreateAxis(dimension, firstBody, bodyId, requestId))
-            ToolGunMode.NO_COLLIDE -> service.submit(PhysicsCommand.CreateNoCollide(dimension, firstBody, bodyId, requestId))
+        val kind = when (mode) {
+            ToolGunMode.ROPE -> PhysicsJointKind.ROPE
+            ToolGunMode.AXIS -> PhysicsJointKind.AXIS
+            ToolGunMode.NO_COLLIDE -> PhysicsJointKind.NO_COLLIDE
         }
+        val length = if (kind == PhysicsJointKind.ROPE) first.position().distanceTo(prop.position()).toFloat() else 0f
+        val accepted = length.isFinite() && (kind != PhysicsJointKind.ROPE || length > 0f) &&
+            service.submit(PhysicsCommand.PrepareConnection(dimension, firstBody, bodyId, requestId))
         if (accepted) {
             val key = WeldKey.of(first.uuid, prop.uuid)
-            pendingConnections[requestId] = PendingConnection(key, false, player.uuid)
+            pendingConnections[requestId] = PendingConnection(key, first.uuid, prop.uuid, player.uuid, dimension, firstBody, bodyId, kind, length)
             toolConnections += key
         }
         sendToolGunState(player)
@@ -570,23 +578,14 @@ class PhysicsPropManager(
 
     fun useToolGunPrimary(player: Player, prop: PhysicsPropEntity): Boolean {
         val level = player.level() as? ServerLevel ?: return false
+        if (prop.level() !== level || player.distanceToSqr(prop) > TOOL_GUN_REACH_SQUARED) return false
+        if (toolGunMode(player) == ToolGunMode.WELD) return removeToolGunWelds(player, prop)
+        if (toolGunMode(player) in setOf(ToolGunMode.ROPE, ToolGunMode.AXIS, ToolGunMode.NO_COLLIDE)) return removeToolGunConstraints(player, prop)
         if (isTerrainPaused(prop, level)) return false
         val bodyId = prop.runtimeBodyId ?: return false
-        if (prop.level() !== level || player.distanceToSqr(prop) > TOOL_GUN_REACH_SQUARED) return false
         return when (toolGunMode(player)) {
             ToolGunMode.WELD -> removeToolGunWelds(player, prop)
-            ToolGunMode.ROPE, ToolGunMode.AXIS, ToolGunMode.NO_COLLIDE -> {
-                weldSelectionByPlayer.remove(player.uuid)
-                service.submit(PhysicsCommand.DestroyToolConstraints(level.physicsDimensionId(), bodyId))
-                    .also { accepted ->
-                        if (accepted) {
-                            toolConnections.removeIf { it.contains(prop.uuid) }
-                            confirmedToolConnections.removeIf { it.contains(prop.uuid) }
-                            pendingConnections.entries.removeIf { !it.value.weld && it.value.key.contains(prop.uuid) }
-                        }
-                        sendToolGunState(player)
-                    }
-            }
+            ToolGunMode.ROPE, ToolGunMode.AXIS, ToolGunMode.NO_COLLIDE -> removeToolGunConstraints(player, prop)
             ToolGunMode.WEIGHT_BUOYANCY -> {
                 prop.toolPhysicsPreset = ToolPhysicsPreset.DEFAULT
                 recreateBody(prop, level)
@@ -599,8 +598,35 @@ class PhysicsPropManager(
         }
     }
 
+    private fun removeToolGunConstraints(player: Player, prop: PhysicsPropEntity): Boolean {
+        val level = player.level() as? ServerLevel ?: return false
+        if (prop.level() !== level || player.distanceToSqr(prop) > TOOL_GUN_REACH_SQUARED ||
+            !player.isHolding { it.item === TumbleItems.TOOL_GUN } || toolConnections.none { it.contains(prop.uuid) }
+        ) return false
+        parkForRecovery(level, componentFor(level, prop.uuid))
+        if (!tombstoneConnections(level) { it.kind != PhysicsJointKind.WELD && (it.first == prop.uuid || it.second == prop.uuid) }) return false
+        cancelPendingConnections { !it.weld && it.key.contains(prop.uuid) }
+        toolConnections.removeIf { it.contains(prop.uuid) }
+        confirmedToolConnections.removeIf { it.contains(prop.uuid) }
+        weldSelectionByPlayer.remove(player.uuid)
+        sendToolGunState(player)
+        return true
+    }
+
     private fun recreateBody(prop: PhysicsPropEntity, level: ServerLevel): Boolean {
         val bodyId = prop.runtimeBodyId ?: return false
+        val component = componentFor(level, prop.uuid)
+        if (component.size > 1) {
+            parkForRecovery(level, component)
+            if (!tombstoneConnections(level) { it.first == prop.uuid || it.second == prop.uuid }) return false
+            val removedWelds = activeWelds.filter { it.contains(prop.uuid) }.toSet()
+            activeWelds.removeAll(removedWelds)
+            toolConnections.removeIf { it.contains(prop.uuid) }
+            confirmedToolConnections.removeIf { it.contains(prop.uuid) }
+            cancelPendingConnections { it.key.contains(prop.uuid) }
+            weldHistoryByPlayer.values.forEach { history -> history.removeIf(removedWelds::contains) }
+            return true
+        }
         releaseProp(prop.uuid)
         val dimension = level.physicsDimensionId()
         if (!service.submit(PhysicsCommand.DestroyBody(dimension, bodyId))) return false
@@ -622,24 +648,18 @@ class PhysicsPropManager(
 
     fun removeToolGunWelds(player: Player, prop: PhysicsPropEntity): Boolean {
         val level = player.level() as? ServerLevel ?: return false
-        val bodyId = prop.runtimeBodyId ?: return false
         if (prop.level() !== level || player.distanceToSqr(prop) > TOOL_GUN_REACH_SQUARED ||
             !player.isHolding { it.item === TumbleItems.TOOL_GUN }
         ) return false
-        weldSelectionByPlayer.remove(player.uuid)
         val removed = activeWelds.filter { it.contains(prop.uuid) }
-        if (removed.isEmpty()) {
-            sendToolGunState(player)
-            return false
-        }
-        val accepted = service.submit(PhysicsCommand.DestroyWelds(level.physicsDimensionId(), bodyId))
-        if (accepted) {
-            activeWelds.removeAll(removed.toSet())
-            pendingConnections.entries.removeIf { it.value.weld && it.value.key in removed }
-            weldHistoryByPlayer.values.forEach { history -> history.removeIf(removed::contains) }
-        }
+        if (removed.isEmpty()) return false
+        parkForRecovery(level, componentFor(level, prop.uuid))
+        if (!tombstoneConnections(level) { it.kind == PhysicsJointKind.WELD && (it.first == prop.uuid || it.second == prop.uuid) }) return false
+        cancelPendingConnections { it.weld && it.key in removed }
+        activeWelds.removeAll(removed.toSet())
+        weldHistoryByPlayer.values.forEach { history -> history.removeIf(removed::contains) }
         sendToolGunState(player)
-        return accepted
+        return true
     }
 
     fun undoToolGunWeld(player: Player): Boolean {
@@ -651,22 +671,21 @@ class PhysicsPropManager(
                 history.removeLast()
                 continue
             }
-            val firstProp = props[key.first]
-            val secondProp = props[key.second]
-            if (firstProp != null && isTerrainPaused(firstProp, level) ||
-                secondProp != null && isTerrainPaused(secondProp, level)
-            ) return false
-            val first = firstProp?.runtimeBodyId
-            val second = secondProp?.runtimeBodyId
-            val accepted = first != null && second != null &&
-                service.submit(PhysicsCommand.DestroyWeld(level.physicsDimensionId(), first, second))
-            if (accepted) {
-                history.removeLast()
-                activeWelds.remove(key)
-                pendingConnections.entries.removeIf { it.value.weld && it.value.key == key }
-            }
+            val first = props[key.first]
+            val second = props[key.second]
+            if (first != null && second != null &&
+                (isTerrainPaused(first, level) || isTerrainPaused(second, level))) return false
+            if (first != null && first.level() !== level || second != null && second.level() !== level) return false
+            val record = activeConnections(level).firstOrNull {
+                it.kind == PhysicsJointKind.WELD && WeldKey.of(it.first, it.second) == key
+            } ?: return false
+            parkForRecovery(level, componentFor(level, key.first))
+            if (!tombstoneConnections(level) { it.id == record.id }) return false
+            cancelPendingConnections { it.weld && it.key == key }
+            history.removeLast()
+            activeWelds.remove(key)
             sendToolGunState(player)
-            return accepted
+            return true
         }
         sendToolGunState(player)
         return false
@@ -682,6 +701,187 @@ class PhysicsPropManager(
             serverPlayer,
             ToolGunStatePayload(toolGunMode(player), selected?.propId, selected?.face, canUndo)
         )
+    }
+
+    fun checkpointConnections() {
+        val records = journal.records().filterNot { it.deleted }
+        if (records.isEmpty() || !service.isRunning()) return
+        val updates = mutableListOf<DurableConnection>()
+        val visited = mutableSetOf<UUID>()
+        records.forEach { record ->
+            if (record.first in visited) return@forEach
+            val level = server.allLevels.firstOrNull { it.physicsDimensionId().value == record.dimension } ?: return@forEach
+            val members = componentFor(level, record.first)
+            visited += members
+            if (parkingGroups.values.any { group -> group.members.any { it in members } } ||
+                pendingConnections.values.any { it.first in members || it.second in members }) return@forEach
+            val frame = service.latestFrame(level.physicsDimensionId())
+            val states = members.mapNotNull { id ->
+                val prop = props[id]?.takeIf { it.level() === level && !it.isRemoved } ?: return@mapNotNull null
+                val body = prop.runtimeBodyId ?: return@mapNotNull null
+                val group = memberRestoreTokens[id]?.let(restoreGroups::get)
+                if (group != null && (!group.activated || frame.physicsStep <= group.activationAfterStep)) return@mapNotNull null
+                frame.bodies[body]?.toDurableState(id)
+            }
+            if (states.size != members.size) return@forEach
+            updates += records.filter { it.dimension == record.dimension && it.first in members && it.second in members }
+                .map { it.copy(checkpoint = states) }
+        }
+        if (updates.isNotEmpty()) journal.putAll(updates)
+    }
+
+    fun connectionRelationshipsBlocked(id: UUID): Boolean = id in props &&
+        (pendingConnections.values.any { it.key.contains(id) } ||
+            journal.records().any { !it.deleted && it.passengerSafe && (it.first == id || it.second == id) })
+
+    private fun canConnectWithoutPassengers(level: ServerLevel, first: UUID, second: UUID): Boolean =
+        (componentFor(level, first) + componentFor(level, second)).all { id ->
+            val prop = props[id]
+            prop != null && !prop.isRemoved && prop.level() === level && !prop.isPassenger && prop.passengers.isEmpty()
+        }
+
+    private fun activeConnections(level: ServerLevel): List<DurableConnection> =
+        journal.records().filter { !it.deleted && it.dimension == level.physicsDimensionId().value }
+
+    private fun componentFor(level: ServerLevel, root: UUID): Set<UUID> {
+        val adjacency = mutableMapOf<UUID, MutableList<UUID>>()
+        activeConnections(level).forEach { record ->
+            adjacency.getOrPut(record.first, ::mutableListOf).add(record.second)
+            adjacency.getOrPut(record.second, ::mutableListOf).add(record.first)
+        }
+        val result = linkedSetOf(root)
+        val queue = ArrayDeque<UUID>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            adjacency[queue.removeFirst()].orEmpty().forEach { other -> if (result.add(other)) queue.addLast(other) }
+        }
+        return result
+    }
+
+    private fun cancelPendingConnections(predicate: (PendingConnection) -> Boolean) {
+        val cancelled = pendingConnections.filterValues(predicate)
+        cancelled.forEach { (request, pending) ->
+            service.submit(PhysicsCommand.CancelConnectionPreparation(pending.dimension, request))
+            pendingConnections.remove(request)
+        }
+    }
+
+    private fun tombstoneConnections(level: ServerLevel, predicate: (DurableConnection) -> Boolean): Boolean {
+        val removed = activeConnections(level).filter(predicate).map { it.copy(deleted = true) }
+        if (removed.isEmpty()) return true
+        return try {
+            journal.putAll(removed)
+            true
+        } catch (error: Exception) {
+            logger.error("Could not persist connection removal; keeping the component parked", error)
+            false
+        }
+    }
+
+    private fun parkForRecovery(level: ServerLevel, members: Set<UUID>) {
+        if (parkingGroups.values.any { group -> group.members.any { it in members } }) return
+        val tokens = members.mapNotNull(memberRestoreTokens::get).toSet()
+        val staged = tokens.flatMap { restoreGroups[it]?.bodies.orEmpty() }
+        val loaded = members.mapNotNull(props::get).filter { it.level() === level }
+        val live = loaded.mapNotNull { prop -> prop.runtimeBodyId?.let { ParkBody(prop.uuid, it) } }
+        val snapshotMembers = live.mapTo(mutableSetOf()) { it.propId }
+        val bodies = (live + staged).distinctBy { it.propId }
+        loaded.forEach { prop ->
+            releaseProp(prop.uuid)
+            deferredAssemblies.remove(prop.uuid)
+            deferredTerrainProps.remove(prop.uuid)
+            associations.remove(prop.uuid)
+            associations.register(prop.uuid)
+            prop.runtimeBodyId?.let { bodyOwners.remove(RuntimeBodyKey(level.physicsDimensionId(), it)) }
+            prop.runtimeBodyId = null
+            prop.physicsPending = true
+            pendingRestores += prop.uuid
+        }
+        val request = UUID.randomUUID()
+        if (bodies.isNotEmpty()) parkingGroups[request] = ParkingGroup(level, members, snapshotMembers)
+        service.invalidateRestores(tokens, level.physicsDimensionId(), bodies, request)
+    }
+
+    private fun parkStaged(token: PhysicsRestoreToken, group: RestoreGroup) {
+        val request = UUID.randomUUID()
+        if (group.bodies.isNotEmpty()) parkingGroups[request] = ParkingGroup(group.level, group.members, emptySet())
+        service.invalidateRestore(token, group.level.physicsDimensionId(), group.bodies, request)
+        if (group.bodies.isEmpty()) {
+            restoreGroups.remove(token)
+            group.members.forEach { if (memberRestoreTokens[it] === token) memberRestoreTokens.remove(it) }
+        }
+        group.members.filterTo(pendingRestores) { it in props }
+    }
+
+    private fun processPendingRestores() {
+        repeat(minOf(MAX_DEFERRED_ASSEMBLIES_PER_TICK, pendingRestores.size)) {
+            val id = pendingRestores.firstOrNull() ?: return@repeat
+            pendingRestores.remove(id)
+            val entity = props[id] ?: return@repeat
+            val level = entity.level() as? ServerLevel ?: return@repeat
+            val members = componentFor(level, id)
+            val loaded = members.mapNotNull(props::get)
+            if (!service.isRunning() || loaded.size != members.size || loaded.any { it.level() !== level || it.isRemoved } ||
+                members.any { it in memberRestoreTokens } || parkingGroups.values.any { group -> group.members.any { it in members } }
+            ) {
+                pendingRestores += id
+                return@repeat
+            }
+            if (loaded.any { it.runtimeBodyId != null }) {
+                parkForRecovery(level, members)
+                return@repeat
+            }
+            val records = activeConnections(level).filter { it.first in members && it.second in members }
+            if (records.isNotEmpty() && (records.any { !it.passengerSafe } || loaded.any { it.isPassenger || it.passengers.isNotEmpty() })) {
+                if (loggedPassengerGates.add(id)) logger.warn("Linked component {} has an unsafe or unknown passenger relationship; recovery remains parked", members)
+                pendingRestores += id
+                return@repeat
+            }
+            val checkpoint = if (records.isEmpty()) emptyMap() else records.first().checkpoint
+                .filter { it.propId in members }.associateBy { it.propId }
+            if (records.isNotEmpty() && (checkpoint.keys != members || records.any { record ->
+                    record.checkpoint.filter { it.propId in members }.associateBy { it.propId } != checkpoint
+                })) {
+                logger.error("Cannot restore linked component {} without a coherent checkpoint", members)
+                pendingRestores += id
+                return@repeat
+            }
+            if (records.isNotEmpty()) loaded.forEach { prop ->
+                val state = checkpoint.getValue(prop.uuid)
+                prop.restoreCheckpoint(state.transform, state.linearVelocity, state.angularVelocity)
+            }
+            if (loaded.any { prop -> prop.terrainBlockers.any { terrainBlocked(level, it) } ||
+                    terrain.coveredChunks(prop).any { terrainBlocked(level, it) } || !terrain.primeForAssembly(level, prop) }) {
+                pendingRestores += id
+                return@repeat
+            }
+            loaded.forEach { it.terrainBlockers = emptyList() }
+            if (records.isEmpty()) {
+                entity.physicsPending = false
+                queueBodyCreation(entity, level)
+                return@repeat
+            }
+            val indices = loaded.mapIndexed { index, prop -> prop.uuid to index }.toMap()
+            val joints = records.map { record ->
+                RestoredJoint(indices.getValue(record.first), indices.getValue(record.second), record.kind, record.frames, record.ropeLength)
+            }
+            val requests = loaded.associate { it.uuid to associations.requestId(it.uuid) }
+            val bodies = loaded.map { prop ->
+                val state = checkpoint.getValue(prop.uuid)
+                RestoreBody(prop.uuid, requests.getValue(prop.uuid), bodyDefinition(prop, level).copy(
+                    transform = state.transform, linearVelocity = state.linearVelocity, angularVelocity = state.angularVelocity
+                ))
+            }
+            val token = PhysicsRestoreToken()
+            if (!service.submit(PhysicsCommand.RestoreComponent(level.physicsDimensionId(), bodies, joints, token))) {
+                pendingRestores += id
+                return@repeat
+            }
+            val group = RestoreGroup(level, members, requests)
+            restoreGroups[token] = group
+            members.forEach { memberRestoreTokens[it] = token }
+            pendingRestores.removeAll(members)
+        }
     }
 
     fun entityLoaded(entity: Entity, level: ServerLevel) {
@@ -703,6 +903,23 @@ class PhysicsPropManager(
     }
 
     private fun activateEntity(entity: PhysicsPropEntity, level: ServerLevel) {
+        val records = activeConnections(level).filter { it.first == entity.uuid || it.second == entity.uuid }
+        if (records.isNotEmpty()) {
+            records.forEach { record ->
+                val key = WeldKey.of(record.first, record.second)
+                if (record.kind == PhysicsJointKind.WELD) {
+                    activeWelds += key
+                    val history = weldHistoryByPlayer.getOrPut(record.owner) { java.util.ArrayDeque() }
+                    if (key !in history) history.addLast(key)
+                } else {
+                    toolConnections += key
+                    confirmedToolConnections += key
+                }
+            }
+            entity.physicsPending = true
+            pendingRestores += entity.uuid
+            return
+        }
         if (entity.terrainBlockers.isNotEmpty()) {
             entity.physicsPending = true
             deferredTerrainProps.addLast(entity.uuid)
@@ -722,13 +939,19 @@ class PhysicsPropManager(
     }
 
     fun entityUnloaded(entity: Entity, level: ServerLevel, visibilityEvent: Boolean = false) {
-        if (entity !is PhysicsPropEntity || props.remove(entity.uuid) == null) return
+        if (entity !is PhysicsPropEntity || props[entity.uuid] !== entity) return
+        val reason = entity.removalReason
+        val visibilityUnload = visibilityEvent && reason != Entity.RemovalReason.KILLED &&
+            reason != Entity.RemovalReason.DISCARDED && reason != Entity.RemovalReason.CHANGED_DIMENSION
+        val component = componentFor(level, entity.uuid)
+        if (component.size > 1) parkForRecovery(level, component)
+        props.remove(entity.uuid)
+        pendingRestores.remove(entity.uuid)
         assemblies.remove(entity.uuid)
         failedAssemblyConversions.remove(entity.uuid)
         val terrainWait = terrainWaits.remove(entity.uuid)
         deferredAssemblies.remove(entity.uuid)
         deferredTerrainProps.remove(entity.uuid)
-        val reason = entity.removalReason
         if (visibilityEvent && reason != Entity.RemovalReason.KILLED && reason != Entity.RemovalReason.DISCARDED &&
             reason != Entity.RemovalReason.CHANGED_DIMENSION && entity.assembly != null
         ) markConnectedTerrainWait(entity.uuid, terrain.coveredChunks(entity))
@@ -746,12 +969,14 @@ class PhysicsPropManager(
         releaseProp(entity.uuid)
         launchedProps.remove(entity.uuid)
         weldSelectionByPlayer.entries.removeIf { it.value.propId == entity.uuid }
-        val removedWelds = activeWelds.filter { it.contains(entity.uuid) }
-        activeWelds.removeAll(removedWelds.toSet())
-        toolConnections.removeIf { it.contains(entity.uuid) }
-        confirmedToolConnections.removeIf { it.contains(entity.uuid) }
-        pendingConnections.entries.removeIf { it.value.key.contains(entity.uuid) }
-        weldHistoryByPlayer.values.forEach { history -> history.removeIf(removedWelds::contains) }
+        if (!visibilityUnload && tombstoneConnections(level) { it.first == entity.uuid || it.second == entity.uuid }) {
+            val removedWelds = activeWelds.filter { it.contains(entity.uuid) }
+            activeWelds.removeAll(removedWelds.toSet())
+            toolConnections.removeIf { it.contains(entity.uuid) }
+            confirmedToolConnections.removeIf { it.contains(entity.uuid) }
+            cancelPendingConnections { it.key.contains(entity.uuid) }
+            weldHistoryByPlayer.values.forEach { history -> history.removeIf(removedWelds::contains) }
+        }
         val bodyId = associations.remove(entity.uuid) ?: entity.runtimeBodyId
         if (bodyId != null) {
             val dimension = level.physicsDimensionId()
@@ -797,6 +1022,8 @@ class PhysicsPropManager(
             it.observedUnload = true
         }
         affected.forEach {
+            val component = componentFor(level, it.uuid)
+            if (component.size > 1) parkForRecovery(level, component)
             pauseForTerrain(it, level, setOf(chunk))
         }
         terrain.chunkUnloaded(level, chunkX, chunkZ)
@@ -834,7 +1061,9 @@ class PhysicsPropManager(
     }
 
     internal fun isTerrainPaused(prop: PhysicsPropEntity, level: ServerLevel): Boolean {
-        if (prop.uuid in terrainWaits || prop.terrainBlockers.isNotEmpty()) return true
+        if (prop.uuid in terrainWaits || prop.terrainBlockers.isNotEmpty() || prop.uuid in pendingRestores ||
+            memberRestoreTokens[prop.uuid]?.let { restoreGroups[it]?.activated != true } == true ||
+            pendingConnections.values.any { it.key.contains(prop.uuid) }) return true
         val body = prop.runtimeBodyId ?: return false
         return service.latestFrame(level.physicsDimensionId()).bodies[body]?.suspended == true
     }
@@ -1012,6 +1241,7 @@ class PhysicsPropManager(
         managerTick++
         drainAcknowledgements()
         drainImpactEvents()
+        processPendingRestores()
         repeat(minOf(MAX_DEFERRED_ASSEMBLIES_PER_TICK, failedAssemblyConversions.size)) {
             val id = failedAssemblyConversions.first()
             failedAssemblyConversions.remove(id)
@@ -1801,9 +2031,7 @@ class PhysicsPropManager(
             )
         )
 
-    private fun queueBodyCreation(entity: PhysicsPropEntity, level: ServerLevel) {
-        if (entity.physicsPending || entity.runtimeBodyId != null) return
-        entity.physicsPending = true
+    private fun bodyDefinition(entity: PhysicsPropEntity, level: ServerLevel): PhysicsBodyDefinition {
         val velocity = entity.deltaMovement
         val blockPhysics = MinecraftTerrainAdapter.physicsData(entity.blockState)
         val assemblyShape = entity.assembly?.shape?.let { shape ->
@@ -1812,57 +2040,186 @@ class PhysicsPropManager(
                 part.copy(material = part.material.copy(density = part.material.density * scale))
             })
         }
+        return PhysicsBodyDefinition(
+            transform = PhysicsTransform(
+                PhysicsVector(entity.x, entity.y, entity.z),
+                entity.bodyRotation
+            ),
+            shape = assemblyShape ?: MinecraftTerrainAdapter.dynamicShape(
+                entity.blockState.getCollisionShape(level, entity.blockPosition()).toAabbs()
+            ) ?: cc.modlabs.tumble.physics.PhysicsShapeDefinition.Box(
+                cc.modlabs.tumble.physics.PhysicsBox.UNIT
+            ),
+            material = blockPhysics.material.copy(
+                density = blockPhysics.material.density * entity.toolPhysicsPreset.densityScale
+            ),
+            motionType = if (entity.frozen) PhysicsMotionType.STATIC else PhysicsMotionType.DYNAMIC,
+            buoyancy = blockPhysics.buoyancy.copy(
+                enabled = blockPhysics.buoyancy.enabled || entity.toolPhysicsPreset.buoyancyScale > 1f,
+                forceScale = blockPhysics.buoyancy.forceScale * entity.toolPhysicsPreset.buoyancyScale
+            ),
+            linearVelocity = PhysicsVector(velocity.x, velocity.y, velocity.z),
+            angularVelocity = entity.angularVelocity,
+            emitImpactEvents = entity.blockState.`is`(Blocks.TNT)
+        )
+    }
+
+    private fun queueBodyCreation(entity: PhysicsPropEntity, level: ServerLevel) {
+        if (entity.physicsPending || entity.runtimeBodyId != null) return
+        entity.physicsPending = true
         val command = PhysicsCommand.SpawnBody(
-                entity.uuid,
-                level.physicsDimensionId(),
-                PhysicsBodyDefinition(
-                    transform = PhysicsTransform(
-                        PhysicsVector(entity.x, entity.y, entity.z),
-                        entity.bodyRotation
-                    ),
-                    shape = assemblyShape ?: MinecraftTerrainAdapter.dynamicShape(
-                        entity.blockState.getCollisionShape(level, entity.blockPosition()).toAabbs()
-                    ) ?: cc.modlabs.tumble.physics.PhysicsShapeDefinition.Box(
-                        cc.modlabs.tumble.physics.PhysicsBox.UNIT
-                    ),
-                    material = blockPhysics.material.copy(
-                        density = blockPhysics.material.density * entity.toolPhysicsPreset.densityScale
-                    ),
-                    motionType = if (entity.frozen) PhysicsMotionType.STATIC else PhysicsMotionType.DYNAMIC,
-                    buoyancy = blockPhysics.buoyancy.copy(
-                        enabled = blockPhysics.buoyancy.enabled || entity.toolPhysicsPreset.buoyancyScale > 1f,
-                        forceScale = blockPhysics.buoyancy.forceScale * entity.toolPhysicsPreset.buoyancyScale
-                    ),
-                    linearVelocity = PhysicsVector(velocity.x, velocity.y, velocity.z),
-                    angularVelocity = entity.angularVelocity,
-                    emitImpactEvents = entity.blockState.`is`(Blocks.TNT)
-                ),
-                requestId = associations.requestId(entity.uuid)
-            )
+            entity.uuid, level.physicsDimensionId(), bodyDefinition(entity, level), associations.requestId(entity.uuid)
+        )
         val accepted = if (entity.uuid in terrainWaits) service.submitSuspendedSpawn(command) else service.submit(command)
         if (!accepted) entity.physicsPending = false
+    }
+
+    private fun failConnection(requestId: UUID, pending: PendingConnection) {
+        try {
+            pending.record?.let { journal.put(it.copy(deleted = true)) }
+        } catch (error: Exception) {
+            logger.error("Could not persist failed connection tombstone; keeping bodies parked", error)
+            return
+        }
+        service.submit(PhysicsCommand.CancelConnectionPreparation(pending.dimension, requestId))
+        pendingConnections.remove(requestId)
+        if (pending.weld) {
+            activeWelds.remove(pending.key)
+            weldHistoryByPlayer.values.forEach { it.removeIf { key -> key == pending.key } }
+        } else if (pending.key !in confirmedToolConnections &&
+            pendingConnections.values.none { !it.weld && it.key == pending.key }
+        ) toolConnections.remove(pending.key)
+        logger.warn("Physics connection creation failed between {} and {}", pending.first, pending.second)
+        server.playerList.getPlayer(pending.playerId)?.let {
+            it.sendOverlayMessage(net.minecraft.network.chat.Component.translatable("message.tumble.tool_gun.failed"))
+            sendToolGunState(it)
+        }
     }
 
     private fun drainAcknowledgements() {
         while (true) {
             when (val acknowledgement = service.pollAcknowledgement() ?: return) {
-                is PhysicsAcknowledgement.ConnectionCreated -> {
-                    val pending = pendingConnections.remove(acknowledgement.requestId) ?: continue
-                    if (acknowledgement.success) {
-                        if (!pending.weld) confirmedToolConnections += pending.key
-                    } else {
-                        if (pending.weld) {
-                            activeWelds.remove(pending.key)
-                            weldHistoryByPlayer.values.forEach { it.removeIf { key -> key == pending.key } }
-                        } else if (pending.key !in confirmedToolConnections &&
-                            pendingConnections.values.none { !it.weld && it.key == pending.key }
-                        ) toolConnections.remove(pending.key)
-                        logger.warn("Physics connection creation failed between {} and {}", pending.key.first, pending.key.second)
-                        server.playerList.getPlayer(pending.playerId)?.let {
-                            it.sendOverlayMessage(net.minecraft.network.chat.Component.translatable("message.tumble.tool_gun.failed"))
-                            sendToolGunState(it)
+                is PhysicsAcknowledgement.ComponentStaged -> {
+                    val group = restoreGroups[acknowledgement.token] ?: continue
+                    group.bodies = acknowledgement.bodies
+                    if (!acknowledgement.success) {
+                        restoreGroups.remove(acknowledgement.token)
+                        group.members.forEach { if (memberRestoreTokens[it] === acknowledgement.token) memberRestoreTokens.remove(it) }
+                        group.members.filterTo(pendingRestores) { it in props }
+                        continue
+                    }
+                    val ready = acknowledgement.token.valid && group.members.all { id ->
+                        val prop = props[id]
+                        prop != null && !prop.isRemoved && prop.level() === group.level &&
+                            associations.isCurrent(id, group.requests.getValue(id)) &&
+                            prop.terrainBlockers.none { terrainBlocked(group.level, it) } &&
+                            terrain.coveredChunks(prop).none { terrainBlocked(group.level, it) }
+                    } && componentFor(group.level, group.members.first()) == group.members
+                    if (!ready || !service.submit(PhysicsCommand.ActivateRestoredComponent(acknowledgement.token))) {
+                        parkStaged(acknowledgement.token, group)
+                    }
+                }
+                is PhysicsAcknowledgement.ComponentActivated -> {
+                    val group = restoreGroups[acknowledgement.token] ?: continue
+                    if (!acknowledgement.success || !acknowledgement.token.valid || group.members.any { id ->
+                            val prop = props[id]
+                            prop == null || prop.isRemoved || !associations.isCurrent(id, group.requests.getValue(id))
+                        } || componentFor(group.level, group.members.first()) != group.members) {
+                        if (parkingGroups.values.none { parked -> parked.members.any { it in group.members } }) parkStaged(acknowledgement.token, group)
+                        continue
+                    }
+                    group.bodies.forEach { body ->
+                        val prop = props.getValue(body.propId)
+                        check(associations.acknowledge(body.propId, group.requests.getValue(body.propId), body.bodyId))
+                        prop.runtimeBodyId = body.bodyId
+                        prop.physicsPending = false
+                        bodyOwners[RuntimeBodyKey(group.level.physicsDimensionId(), body.bodyId)] = body.propId
+                        bodyGenerations.nextGeneration(body.propId)
+                    }
+                    group.activated = true
+                    group.activationAfterStep = service.latestFrame(group.level.physicsDimensionId()).physicsStep
+                }
+                is PhysicsAcknowledgement.ComponentParked -> {
+                    val parking = parkingGroups[acknowledgement.requestId] ?: continue
+                    if (!acknowledgement.success) {
+                        logger.error("Could not atomically park a linked component; stopping physics")
+                        service.close()
+                        continue
+                    }
+                    val records = activeConnections(parking.level).filter { it.first in parking.members && it.second in parking.members }
+                    if (records.isNotEmpty() && acknowledgement.snapshots.keys == parking.members &&
+                        parking.snapshotMembers == parking.members) {
+                        val checkpoint = acknowledgement.snapshots.map { (id, snapshot) -> snapshot.toDurableState(id) }
+                        try {
+                            journal.putAll(records.map { it.copy(checkpoint = checkpoint) })
+                        } catch (error: Exception) {
+                            logger.error("Could not persist parked component checkpoint; keeping it parked", error)
+                            continue
                         }
                     }
+                    parkingGroups.remove(acknowledgement.requestId)
+                    acknowledgement.snapshots.forEach { (id, snapshot) ->
+                        if (id in parking.snapshotMembers) props[id]?.let { prop -> prop.applySnapshot(prop.lastAppliedStep + 1, snapshot) }
+                    }
+                    val parked = acknowledgement.snapshots.keys
+                    restoreGroups.entries.removeIf { (token, group) ->
+                        val remove = !token.valid && group.bodies.isNotEmpty() && group.bodies.all { it.propId in parked }
+                        if (remove) group.members.forEach { if (memberRestoreTokens[it] === token) memberRestoreTokens.remove(it) }
+                        remove
+                    }
+                    parking.members.filterTo(pendingRestores) { it in props }
+                }
+                is PhysicsAcknowledgement.ConnectionPrepared -> {
+                    val pending = pendingConnections[acknowledgement.requestId]
+                    if (pending == null) continue
+                    val frames = acknowledgement.frames
+                    if (frames == null) {
+                        failConnection(acknowledgement.requestId, pending)
+                        continue
+                    }
+                    val first = props[pending.first]
+                    val level = first?.level() as? ServerLevel
+                    val members = if (level != null) componentFor(level, pending.first) + componentFor(level, pending.second) else emptySet()
+                    val snapshots = acknowledgement.snapshots
+                    if (level == null || snapshots.keys != members || members.any { id ->
+                            val prop = props[id]
+                            val snapshot = snapshots[id]
+                            prop == null || prop.isRemoved || prop.level() !== level || prop.isPassenger || prop.passengers.isNotEmpty() ||
+                                snapshot == null || prop.runtimeBodyId != snapshot.bodyId
+                        }) {
+                        failConnection(acknowledgement.requestId, pending)
+                        continue
+                    }
+                    val checkpoint = snapshots.map { (id, snapshot) -> snapshot.toDurableState(id) }
+                    val record = DurableConnection(acknowledgement.requestId, pending.dimension.value, pending.first,
+                        pending.second, pending.playerId, pending.kind, frames, pending.ropeLength, false, checkpoint, passengerSafe = true)
+                    try {
+                        val failures = PhysicsServices.chunkIoFailureCount(server)
+                        check(failures == 0L) { "A chunk I/O failure occurred before connection checkpoint" }
+                        snapshots.forEach { (id, snapshot) -> props.getValue(id).let { it.applySnapshot(it.lastAppliedStep + 1, snapshot) } }
+                        level.save(null, true, false)
+                        check(PhysicsServices.chunkIoFailureCount(server) == failures) { "Connection endpoint checkpoint failed" }
+                        check(members.all { id -> props[id]?.let {
+                            !it.isRemoved && it.level() === level && !it.isPassenger && it.passengers.isEmpty()
+                        } == true }) { "Connection endpoint changed or gained passengers during checkpoint" }
+                        val previous = activeConnections(level).filter { it.first in members && it.second in members }
+                        journal.putAll(previous.map { it.copy(checkpoint = checkpoint) } + record)
+                        pending.record = record
+                    } catch (error: Exception) {
+                        logger.error("Could not persist connection endpoint checkpoint; keeping bodies parked", error)
+                        continue
+                    }
+                    if (!service.submit(PhysicsCommand.InstallPreparedConnection(pending.dimension, pending.bodyA, pending.bodyB,
+                            acknowledgement.requestId, pending.kind, frames, pending.ropeLength))) {
+                        logger.error("Could not submit prepared connection; keeping bodies parked")
+                    }
+                }
+                is PhysicsAcknowledgement.ConnectionCreated -> {
+                    val pending = pendingConnections[acknowledgement.requestId] ?: continue
+                    if (acknowledgement.success) {
+                        pendingConnections.remove(acknowledgement.requestId)
+                        if (!pending.weld) confirmedToolConnections += pending.key
+                    } else failConnection(acknowledgement.requestId, pending)
                 }
                 is PhysicsAcknowledgement.BodyCreated -> {
                     val entity = props[acknowledgement.propId]
@@ -2021,7 +2378,34 @@ private data class PlatformMotion(
     val delta: PhysicsVector
 )
 
-private data class PendingConnection(val key: WeldKey, val weld: Boolean, val playerId: UUID)
+private fun PhysicsBodySnapshot.toDurableState(propId: UUID) =
+    DurableBodyState(propId, transform, linearVelocity, angularVelocity)
+
+private data class RestoreGroup(
+    val level: ServerLevel,
+    val members: Set<UUID>,
+    val requests: Map<UUID, UUID>,
+    var bodies: List<ParkBody> = emptyList(),
+    var activated: Boolean = false,
+    var activationAfterStep: Long = 0L
+)
+
+private data class ParkingGroup(val level: ServerLevel, val members: Set<UUID>, val snapshotMembers: Set<UUID>)
+
+private data class PendingConnection(
+    val key: WeldKey,
+    val first: UUID,
+    val second: UUID,
+    val playerId: UUID,
+    val dimension: PhysicsDimensionId,
+    val bodyA: PhysicsBodyId,
+    val bodyB: PhysicsBodyId,
+    val kind: PhysicsJointKind,
+    val ropeLength: Float,
+    var record: DurableConnection? = null
+) {
+    val weld get() = kind == PhysicsJointKind.WELD
+}
 
 private data class SelectedWeld(val propId: UUID, val face: Direction)
 

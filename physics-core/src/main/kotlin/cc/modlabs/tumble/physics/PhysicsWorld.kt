@@ -36,6 +36,7 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     private val welds = mutableListOf<NativeWeld>()
     private val toolJoints = mutableListOf<NativeToolJoint>()
     private val suspensionRoots = mutableMapOf<PhysicsBodyId, Set<PhysicsBodyId>>()
+    private val connectionPreparations = mutableMapOf<java.util.UUID, Set<PhysicsBodyId>>()
     private val pendingImpactEvents = mutableListOf<PhysicsImpactEvent>()
     private var latestMovedSnapshots = emptyList<PhysicsBodySnapshot>()
     private var nextBodyId = 1L
@@ -56,6 +57,54 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         return id
     }
 
+    /** Stages a component without advancing physics and rolls back every body if a joint fails. */
+    @JvmOverloads
+    fun restoreComponent(definitions: List<PhysicsBodyDefinition>, joints: List<RestoredJoint>, activate: Boolean = true): List<PhysicsBodyId>? {
+        checkUsable()
+        if (definitions.isEmpty() || joints.any { joint ->
+            joint.first !in definitions.indices || joint.second !in definitions.indices || joint.first == joint.second ||
+                (joint.kind == PhysicsJointKind.WELD || joint.kind == PhysicsJointKind.AXIS) && joint.frames == null ||
+                joint.kind == PhysicsJointKind.ROPE && (!joint.ropeLength.isFinite() || joint.ropeLength <= 0f)
+        }) return null
+        val created = mutableListOf<PhysicsBodyId>()
+        var complete = false
+        try {
+            definitions.forEach { created += createBody(it.copy(motionType = PhysicsMotionType.STATIC)) }
+            for (joint in joints) {
+                val first = created[joint.first]
+                val second = created[joint.second]
+                val success = when (joint.kind) {
+                    PhysicsJointKind.WELD -> createWeld(first, second, joint.frames)
+                    PhysicsJointKind.ROPE -> createRope(first, second, joint.ropeLength)
+                    PhysicsJointKind.AXIS -> createAxis(first, second, joint.frames)
+                    PhysicsJointKind.NO_COLLIDE -> createNoCollide(first, second)
+                }
+                if (!success) return null
+            }
+            if (activate && !activateRestoredComponent(created, definitions)) return null
+            complete = true
+            return created
+        } finally {
+            if (!complete) created.forEach(::destroyBody)
+        }
+    }
+
+    fun activateRestoredComponent(ids: List<PhysicsBodyId>, definitions: List<PhysicsBodyDefinition>): Boolean {
+        checkUsable()
+        if (ids.isEmpty() || ids.size != definitions.size || ids.toSet().size != ids.size || ids.any {
+                val body = bodies[it]
+                body == null || body.motionType != PhysicsMotionType.STATIC || body.suspended != null
+            }) return false
+        definitions.forEachIndexed { index, definition ->
+            setMotionType(ids[index], definition.motionType)
+            if (definition.motionType != PhysicsMotionType.STATIC) {
+                setLinearVelocity(ids[index], definition.linearVelocity)
+                setAngularVelocity(ids[index], definition.angularVelocity)
+            }
+        }
+        return true
+    }
+
     /** Owning physics thread only. Returns false when the body is already absent. */
     @JvmName("destroyBody")
     fun destroyBody(bodyId: PhysicsBodyId): Boolean {
@@ -66,6 +115,8 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
             if (bodyId in connected) connected - bodyId else seeds
         }
         suspensionRoots.entries.removeIf { it.value.isEmpty() }
+        connectionPreparations.replaceAll { _, seeds -> seeds - bodyId }
+        connectionPreparations.entries.removeIf { it.value.isEmpty() }
         bodies.remove(bodyId)
         temporaryBodies.remove(bodyId)
         bodyIdsByNativeKey.remove(body.nativeId.key())
@@ -80,18 +131,19 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     /** Owning physics thread only. Welds two bodies without changing their current relative transform. */
+    @JvmOverloads
     @JvmName("createWeld")
-    fun createWeld(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
+    fun createWeld(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, frames: PhysicsJointFrames? = null): Boolean = createWeldInternal(bodyA, bodyB, frames, false)
+
+    private fun createWeldInternal(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, frames: PhysicsJointFrames?, allowSuspended: Boolean): Boolean {
         checkUsable()
         if (bodyA == bodyB || welds.any { it.connects(bodyA, bodyB) }) return false
         val first = bodies[bodyA] ?: return false
         val second = bodies[bodyB] ?: return false
-        if (first.suspended != null || second.suspended != null) return false
-        val transformA = snapshotOf(bodyA, first).transform
-        val transformB = snapshotOf(bodyB, second).transform
-        val anchor = (transformA.position + transformB.position) * 0.5
-        val frameA = localJointFrame(transformA, anchor, transformA.rotation)
-        val frameB = localJointFrame(transformB, anchor, transformA.rotation)
+        if (!allowSuspended && (first.suspended != null || second.suspended != null)) return false
+        val jointFrames = frames ?: captureJointFrames(bodyA, bodyB) ?: return false
+        val frameA = jointFrames.first.toNativeJointTransform()
+        val frameB = jointFrames.second.toNativeJointTransform()
         val definition = b3DefaultWeldJointDef()
         return try {
             definition.base()
@@ -113,6 +165,19 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
             frameB.close()
             frameA.close()
         }
+    }
+
+    fun captureJointFrames(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): PhysicsJointFrames? {
+        checkUsable()
+        val first = bodies[bodyA] ?: return null
+        val second = bodies[bodyB] ?: return null
+        val transformA = snapshotOf(bodyA, first).transform
+        val transformB = snapshotOf(bodyB, second).transform
+        val anchor = (transformA.position + transformB.position) * 0.5
+        return PhysicsJointFrames(
+            localJointFrameData(transformA, anchor, transformA.rotation),
+            localJointFrameData(transformB, anchor, transformA.rotation)
+        )
     }
 
     /** Owning physics thread only. */
@@ -147,12 +212,14 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     @JvmName("createRope")
-    fun createRope(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, length: Float): Boolean {
+    fun createRope(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, length: Float): Boolean = createRopeInternal(bodyA, bodyB, length, false)
+
+    private fun createRopeInternal(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, length: Float, allowSuspended: Boolean): Boolean {
         checkUsable()
         require(length.isFinite() && length > 0f) { "Rope length must be positive" }
         val first = bodies[bodyA] ?: return false
         val second = bodies[bodyB] ?: return false
-        if (first.suspended != null || second.suspended != null) return false
+        if (!allowSuspended && (first.suspended != null || second.suspended != null)) return false
         val transformA = snapshotOf(bodyA, first).transform
         val transformB = snapshotOf(bodyB, second).transform
         val frameA = localJointFrame(transformA, transformA.position, transformA.rotation)
@@ -170,17 +237,18 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         }
     }
 
+    @JvmOverloads
     @JvmName("createAxis")
-    fun createAxis(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
+    fun createAxis(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, frames: PhysicsJointFrames? = null): Boolean = createAxisInternal(bodyA, bodyB, frames, false)
+
+    private fun createAxisInternal(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, frames: PhysicsJointFrames?, allowSuspended: Boolean): Boolean {
         checkUsable()
         val first = bodies[bodyA] ?: return false
         val second = bodies[bodyB] ?: return false
-        if (first.suspended != null || second.suspended != null) return false
-        val transformA = snapshotOf(bodyA, first).transform
-        val transformB = snapshotOf(bodyB, second).transform
-        val anchor = (transformA.position + transformB.position) * 0.5
-        val frameA = localJointFrame(transformA, anchor, transformA.rotation)
-        val frameB = localJointFrame(transformB, anchor, transformA.rotation)
+        if (!allowSuspended && (first.suspended != null || second.suspended != null)) return false
+        val jointFrames = frames ?: captureJointFrames(bodyA, bodyB) ?: return false
+        val frameA = jointFrames.first.toNativeJointTransform()
+        val frameB = jointFrames.second.toNativeJointTransform()
         val definition = b3DefaultRevoluteJointDef()
         return try {
             definition.base().bodyIdA(first.nativeId).bodyIdB(second.nativeId)
@@ -194,11 +262,13 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     }
 
     @JvmName("createNoCollide")
-    fun createNoCollide(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean {
+    fun createNoCollide(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): Boolean = createNoCollideInternal(bodyA, bodyB, false)
+
+    private fun createNoCollideInternal(bodyA: PhysicsBodyId, bodyB: PhysicsBodyId, allowSuspended: Boolean): Boolean {
         checkUsable()
         val first = bodies[bodyA] ?: return false
         val second = bodies[bodyB] ?: return false
-        if (first.suspended != null || second.suspended != null) return false
+        if (!allowSuspended && (first.suspended != null || second.suspended != null)) return false
         val definition = b3DefaultFilterJointDef()
         return try {
             definition.base().bodyIdA(first.nativeId).bodyIdB(second.nativeId).collideConnected(false)
@@ -366,6 +436,61 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
         if (motionType == PhysicsMotionType.DYNAMIC) b3Body_SetAwake(it.nativeId, true)
     }
 
+    /** Parks both connected components and captures frames without advancing physics. */
+    fun prepareConnection(requestId: java.util.UUID, bodyA: PhysicsBodyId, bodyB: PhysicsBodyId): PhysicsJointFrames? {
+        checkUsable()
+        if (bodyA == bodyB || requestId in connectionPreparations ||
+            bodies[bodyA]?.suspended != null || bodies[bodyB]?.suspended != null || bodyA !in bodies || bodyB !in bodies
+        ) return null
+        connectionPreparations[requestId] = setOf(bodyA, bodyB)
+        try {
+            refreshSuspensions()
+            return captureJointFrames(bodyA, bodyB)
+        } catch (error: Throwable) {
+            connectionPreparations.remove(requestId)
+            refreshSuspensions()
+            throw error
+        }
+    }
+
+    fun preparedConnectionSnapshots(requestId: java.util.UUID): List<PhysicsBodySnapshot>? {
+        checkUsable()
+        val seeds = connectionPreparations[requestId] ?: return null
+        return connectedBodies(seeds).map { id -> snapshotOf(id, bodies.getValue(id)) }
+    }
+
+    /** Installs a prepared joint and only then releases its preparation suspension. */
+    fun installPreparedConnection(
+        requestId: java.util.UUID,
+        bodyA: PhysicsBodyId,
+        bodyB: PhysicsBodyId,
+        kind: PhysicsJointKind,
+        frames: PhysicsJointFrames,
+        ropeLength: Float
+    ): Boolean {
+        checkUsable()
+        if (connectionPreparations[requestId] != setOf(bodyA, bodyB)) return false
+        val success = when (kind) {
+            PhysicsJointKind.WELD -> createWeldInternal(bodyA, bodyB, frames, true)
+            PhysicsJointKind.ROPE -> ropeLength.isFinite() && ropeLength > 0f && createRopeInternal(bodyA, bodyB, ropeLength, true)
+            PhysicsJointKind.AXIS -> createAxisInternal(bodyA, bodyB, frames, true)
+            PhysicsJointKind.NO_COLLIDE -> createNoCollideInternal(bodyA, bodyB, true)
+        }
+        if (success) {
+            connectionPreparations.remove(requestId)
+            refreshSuspensions()
+        }
+        return success
+    }
+
+    /** Releases only the preparation reason, preserving any independent terrain suspension. */
+    fun cancelConnectionPreparation(requestId: java.util.UUID): Boolean {
+        checkUsable()
+        if (connectionPreparations.remove(requestId) == null) return false
+        refreshSuspensions()
+        return true
+    }
+
     /** Temporarily holds a connected component in place while preserving its motion. */
     @JvmName("suspend")
     fun suspend(bodyId: PhysicsBodyId): Boolean {
@@ -389,6 +514,10 @@ class PhysicsWorld(private val config: PhysicsWorldConfig = PhysicsWorldConfig()
     private fun refreshSuspensions() {
         val blockers = mutableMapOf<PhysicsBodyId, MutableSet<PhysicsBodyId>>()
         suspensionRoots.forEach { (root, seeds) ->
+            connectedBodies(seeds).forEach { blockers.getOrPut(it, ::mutableSetOf).add(root) }
+        }
+        connectionPreparations.values.forEach { seeds ->
+            val root = seeds.first()
             connectedBodies(seeds).forEach { blockers.getOrPut(it, ::mutableSetOf).add(root) }
         }
         bodies.forEach { (id, body) ->
@@ -1040,11 +1169,17 @@ private fun localJointFrame(
     worldPosition: PhysicsVector,
     worldRotation: PhysicsRotation
 ): b3Transform {
+    return localJointFrameData(body, worldPosition, worldRotation).toNativeJointTransform()
+}
+
+private fun localJointFrameData(body: PhysicsTransform, worldPosition: PhysicsVector, worldRotation: PhysicsRotation): PhysicsTransform {
     val inverse = body.rotation.normalized().let { PhysicsRotation(-it.x, -it.y, -it.z, it.w) }
-    val localPosition = inverse.rotate(worldPosition - body.position)
-    val localRotation = inverse.multiply(worldRotation.normalized()).normalized()
-    val nativePosition = localPosition.toNativeVector()
-    val nativeRotation = localRotation.toNativeRotation()
+    return PhysicsTransform(inverse.rotate(worldPosition - body.position), inverse.multiply(worldRotation.normalized()).normalized())
+}
+
+private fun PhysicsTransform.toNativeJointTransform(): b3Transform {
+    val nativePosition = position.toNativeVector()
+    val nativeRotation = rotation.toNativeRotation()
     return try {
         b3Transform().p(nativePosition).q(nativeRotation)
     } finally {

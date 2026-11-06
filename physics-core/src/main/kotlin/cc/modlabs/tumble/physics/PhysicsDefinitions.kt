@@ -147,3 +147,14 @@ data class PhysicsWorldConfig(
 
     val stepSeconds: Float get() = 1f / frequencyHz
 }
+
+
+enum class PhysicsJointKind { WELD, ROPE, AXIS, NO_COLLIDE }
+
+data class RestoredJoint(
+    val first: Int,
+    val second: Int,
+    val kind: PhysicsJointKind,
+    val frames: PhysicsJointFrames? = null,
+    val ropeLength: Float = 0f
+)

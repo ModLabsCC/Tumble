@@ -125,6 +125,14 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
         mass = snapshot.mass
     }
 
+    internal fun restoreCheckpoint(transform: cc.modlabs.tumble.physics.PhysicsTransform, linear: PhysicsVector, angular: PhysicsVector) {
+        val rotation = transform.rotation.normalized()
+        entityData.set(DATA_ROTATION, Quaternionf(rotation.x.toFloat(), rotation.y.toFloat(), rotation.z.toFloat(), rotation.w.toFloat()))
+        setPos(transform.position.x, transform.position.y, transform.position.z)
+        setDeltaMovement(linear.x, linear.y, linear.z)
+        angularVelocity = angular
+    }
+
     override fun tick() {
         super.tick()
         fallDistance = 0.0
@@ -155,13 +163,15 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
     override fun canBeCollidedWith(other: Entity?) = false
     override fun isPickable() = true
 
-    private fun conversionPending(): Boolean =
-        (level() as? ServerLevel)?.let { PhysicsServices.assemblyConversionPending(it, uuid) } == true
+    private fun passengerRelationshipsBlocked(): Boolean =
+        (level() as? ServerLevel)?.let {
+            PhysicsServices.assemblyConversionPending(it, uuid) || PhysicsServices.connectionRelationshipsBlocked(it, uuid)
+        } == true
 
     override fun startRiding(entity: Entity, force: Boolean, sendEvent: Boolean): Boolean =
-        !conversionPending() && super.startRiding(entity, force, sendEvent)
+        !passengerRelationshipsBlocked() && super.startRiding(entity, force, sendEvent)
 
-    override fun couldAcceptPassenger(): Boolean = !conversionPending() && super.couldAcceptPassenger()
+    override fun couldAcceptPassenger(): Boolean = !passengerRelationshipsBlocked() && super.couldAcceptPassenger()
 
     override fun causeFallDamage(distance: Double, multiplier: Float, source: DamageSource) = false
     override fun hurtServer(level: ServerLevel, source: DamageSource, amount: Float): Boolean {

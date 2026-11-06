@@ -48,6 +48,8 @@ data class PhysicsTransform @JvmOverloads constructor(
     val rotation: PhysicsRotation = PhysicsRotation.IDENTITY
 )
 
+data class PhysicsJointFrames(val first: PhysicsTransform, val second: PhysicsTransform)
+
 data class PhysicsAabb(val min: PhysicsVector, val max: PhysicsVector) {
     init {
         require(min.x <= max.x && min.y <= max.y && min.z <= max.z) {

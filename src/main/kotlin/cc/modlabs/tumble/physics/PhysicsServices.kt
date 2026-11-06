@@ -44,10 +44,15 @@ object PhysicsServices {
     }
 
     fun stop(server: MinecraftServer) {
+        runtimes[server]?.manager?.checkpointConnections()
         runtimes.remove(server)?.let {
             it.publisher.close()
             it.service.close()
         }
+    }
+
+    fun checkpointConnections(server: MinecraftServer) {
+        runtimes[server]?.manager?.checkpointConnections()
     }
 
     fun stopped(server: MinecraftServer) {
@@ -74,6 +79,9 @@ object PhysicsServices {
 
     fun conversionWriteBlocked(level: ServerLevel, position: BlockPos, state: BlockState): Boolean =
         runtimes[level.server]?.manager?.conversionWriteBlocked(level, position, state) ?: false
+
+    fun connectionRelationshipsBlocked(level: ServerLevel, id: UUID): Boolean =
+        runtimes[level.server]?.manager?.connectionRelationshipsBlocked(id) ?: true
 
     fun assemblyConversionPending(level: ServerLevel, id: UUID): Boolean =
         runtimes[level.server]?.manager?.assemblyConversionPending(id) ?: false
