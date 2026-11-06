@@ -408,7 +408,7 @@ class PhysicsPropManager(
             val acquired = mutableListOf<ChunkPos>()
             try {
                 chunks.forEach { chunk ->
-                    RecoveryChunkTickets.acquire(level, chunk)
+                    RecoveryChunkTickets.acquireForRecovery(level, chunk)
                     acquired += chunk
                     level.getChunk(chunk.x, chunk.z)
                 }
@@ -458,7 +458,7 @@ class PhysicsPropManager(
             val chunk = ChunkPos(record.position.x shr 4, record.position.z shr 4)
             var ticketHeld = false
             try {
-                RecoveryChunkTickets.acquire(level, chunk)
+                RecoveryChunkTickets.acquireForRecovery(level, chunk)
                 ticketHeld = true
                 level.getChunk(chunk.x, chunk.z)
                 level.waitForEntities(chunk, 0)
@@ -587,7 +587,7 @@ class PhysicsPropManager(
             val chunk = ChunkPos(record.position.x shr 4, record.position.z shr 4)
             var ticketHeld = false
             try {
-                RecoveryChunkTickets.acquire(level, chunk)
+                RecoveryChunkTickets.acquireForRecovery(level, chunk)
                 ticketHeld = true
                 level.getChunk(chunk.x, chunk.z)
                 level.waitForEntities(chunk, 0)

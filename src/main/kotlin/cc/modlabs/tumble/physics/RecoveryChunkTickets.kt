@@ -25,7 +25,12 @@ internal object RecoveryChunkTickets {
     }
 
     /** Waits while pumping server tasks; callers must fence and revalidate mutable state. */
-    fun acquire(level: ServerLevel, chunk: ChunkPos) {
+    fun acquire(level: ServerLevel, chunk: ChunkPos) = acquire(level, chunk, requireTicking = true)
+
+    // Startup replay runs before the server can tick entities; loaded data is sufficient there.
+    fun acquireForRecovery(level: ServerLevel, chunk: ChunkPos) = acquire(level, chunk, requireTicking = false)
+
+    private fun acquire(level: ServerLevel, chunk: ChunkPos, requireTicking: Boolean) {
         request(level, chunk)
         try {
             val lease = leases.getValue(level).getValue(chunk)
@@ -33,7 +38,10 @@ internal object RecoveryChunkTickets {
             level.server.managedBlock { loaded.isDone }
             loaded.join()
             level.waitForEntities(chunk, 0)
-            check(level.areEntitiesActuallyLoadedAndTicking(chunk)) { "Recovery chunk entities are not yet ticking: $chunk" }
+            check(level.areEntitiesLoaded(chunk.pack())) { "Recovery chunk entities are not loaded: $chunk" }
+            if (requireTicking) check(level.areEntitiesActuallyLoadedAndTicking(chunk)) {
+                "Recovery chunk entities are not yet ticking: $chunk"
+            }
         } catch (error: Exception) {
             release(level, chunk)
             throw error
