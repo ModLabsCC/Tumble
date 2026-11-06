@@ -143,6 +143,27 @@ class ServerPhysicsService(private val logger: Logger) : AutoCloseable {
                         command.requestId
                     )
                 }
+                is PhysicsCommand.RestoreComponent -> {
+                    val ids = command.bodies.map { it.propId }
+                    val requests = command.bodies.map { it.requestId }
+                    val result = try {
+                        if (ids.isEmpty() || ids.toSet().size != ids.size || requests.toSet().size != requests.size || ids.any(bodies::containsKey)) null
+                        else worlds.getOrPut(command.dimension, ::createWorld).restoreComponent(command.bodies.map { it.definition }, command.joints)
+                    } catch (error: Throwable) {
+                        logger.error("Failed to restore physics component", error)
+                        null
+                    }
+                    if (result == null) {
+                        command.bodies.forEach {
+                            acknowledgements += PhysicsAcknowledgement.BodyCreationFailed(it.propId, "Component restore failed", it.requestId)
+                        }
+                    } else {
+                        command.bodies.zip(result).forEach { (body, id) ->
+                            bodies[body.propId] = RuntimeBody(command.dimension, id)
+                            acknowledgements += PhysicsAcknowledgement.BodyCreated(body.propId, command.dimension, id, body.requestId)
+                        }
+                    }
+                }
                 is PhysicsCommand.DestroyBody -> {
                     worlds[command.dimension]?.destroyBody(command.bodyId)
                     bodies.entries.removeIf {

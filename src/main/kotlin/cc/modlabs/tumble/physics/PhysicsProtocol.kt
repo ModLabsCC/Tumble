@@ -17,6 +17,8 @@ value class PhysicsDimensionId(val value: String) {
     }
 }
 
+data class RestoreBody(val propId: UUID, val requestId: UUID, val definition: PhysicsBodyDefinition)
+
 sealed interface PhysicsCommand {
     data class CreateDimension(val dimension: PhysicsDimensionId) : PhysicsCommand
     data class RemoveDimension(val dimension: PhysicsDimensionId) : PhysicsCommand
@@ -25,6 +27,11 @@ sealed interface PhysicsCommand {
         val dimension: PhysicsDimensionId,
         val definition: PhysicsBodyDefinition,
         val requestId: UUID = UUID.randomUUID()
+    ) : PhysicsCommand
+    data class RestoreComponent(
+        val dimension: PhysicsDimensionId,
+        val bodies: List<RestoreBody>,
+        val joints: List<RestoredJoint>
     ) : PhysicsCommand
     data class DestroyBody(val dimension: PhysicsDimensionId, val bodyId: PhysicsBodyId) : PhysicsCommand
     data class CreateWeld(

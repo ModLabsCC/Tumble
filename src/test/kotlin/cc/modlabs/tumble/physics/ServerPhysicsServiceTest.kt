@@ -13,6 +13,39 @@ import org.slf4j.LoggerFactory
 
 class ServerPhysicsServiceTest {
     @Test
+    fun `component restore acknowledges all bodies or none`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:component-restore")
+        val frames = PhysicsJointFrames(PhysicsTransform(PhysicsVector(1.0, 0.0, 0.0)), PhysicsTransform(PhysicsVector(-1.0, 0.0, 0.0)))
+        val bodies = listOf(
+            RestoreBody(UUID.randomUUID(), UUID.randomUUID(), bodyDefinition()),
+            RestoreBody(UUID.randomUUID(), UUID.randomUUID(), bodyDefinition().copy(transform = PhysicsTransform(PhysicsVector(2.0, 0.0, 0.0))))
+        )
+        val weld = RestoredJoint(0, 1, PhysicsJointKind.WELD, frames)
+        service.start()
+        try {
+            service.submit(PhysicsCommand.RestoreComponent(dimension, bodies, listOf(weld, weld)))
+            val failed = mutableListOf<PhysicsAcknowledgement.BodyCreationFailed>()
+            waitUntil {
+                (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreationFailed)?.let(failed::add)
+                failed.size == 2
+            }
+            assertEquals(bodies.map { it.propId }.toSet(), failed.map { it.propId }.toSet())
+            assertTrue(service.latestFrame(dimension).bodies.isEmpty())
+            service.submit(PhysicsCommand.RestoreComponent(dimension, bodies, listOf(weld)))
+            val created = mutableListOf<PhysicsAcknowledgement.BodyCreated>()
+            waitUntil {
+                (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let(created::add)
+                created.size == 2
+            }
+            assertEquals(bodies.map { it.requestId }.toSet(), created.map { it.requestId }.toSet())
+            waitUntil { service.latestFrame(dimension).bodies.size == 2 }
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
     fun `connection acknowledgements report native success and missing bodies`() {
         val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
         val dimension = PhysicsDimensionId("test:connection-ack")
