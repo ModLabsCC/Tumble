@@ -183,6 +183,57 @@ class AssemblyGameTests {
     }
 
     @GameTest(maxTicks = 400)
+    fun failedRemovalJournalKeepsLinkedProps(helper: GameTestHelper) {
+        val manager = PhysicsServices.runtime(helper.level.server)!!.manager
+        val origin = helper.absolutePos(BlockPos(1, 3, 1))
+        val first = manager.spawn(helper.level, PhysicsVector(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn first prop")
+        val second = manager.spawn(helper.level, PhysicsVector(origin.x + 2.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn second prop")
+        val player = (helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer).apply {
+            setPos(origin.x + 1.5, origin.y.toDouble(), origin.z + 2.5)
+            setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
+        }
+        var phase = 0
+        helper.succeedWhen {
+            Thread.sleep(5)
+            if (phase == 0) {
+                val ready = manager.networkProps().mapTo(mutableSetOf()) { it.propId }
+                helper.assertTrue(first.uuid in ready && second.uuid in ready, "bodies are not ready")
+                helper.assertTrue(manager.useToolGunWeld(player, first) == ToolGunWeldResult.SELECTED, "selection failed")
+                helper.assertTrue(manager.useToolGunWeld(player, second) == ToolGunWeldResult.WELDED, "weld failed")
+                phase = 1
+                helper.assertTrue(false, "waiting for weld")
+            }
+            helper.assertTrue(TumbleApi.status(helper.level, first.uuid) == TumbleApi.PropStatus.READY, "weld not ready")
+            val position = first.blockPosition()
+            player.setPos(position.x + 0.5, position.y.toDouble(), position.z + 2.0)
+            val dir = Files.createTempDirectory("tumble-removal-wal-failure")
+            val obstruction = dir.resolve("blocked")
+            Files.writeString(obstruction, "obstruction")
+            val journal = manager.javaClass.getDeclaredField("removalJournal").apply { isAccessible = true }.get(manager)
+            val field = journal.javaClass.getDeclaredField("directory").apply { isAccessible = true }
+            val original = field.get(journal)
+            try {
+                field.set(journal, obstruction)
+                helper.assertTrue(!TumbleApi.remove(helper.level, first.uuid), "removal ignored journal failure")
+                helper.assertTrue(!first.isRemoved && !second.isRemoved && helper.level.getBlockState(position).isAir, "failure consumed a prop or altered source")
+                val connections = manager.javaClass.getDeclaredField("journal").apply { isAccessible = true }.get(manager)
+                val records = connections.javaClass.getMethod("records").invoke(connections) as List<*>
+                helper.assertTrue(records.filterNotNull().any { record ->
+                    val type = record.javaClass
+                    setOf(type.getMethod("getFirst").invoke(record), type.getMethod("getSecond").invoke(record)) == setOf(first.uuid, second.uuid) &&
+                        type.getMethod("getDeleted").invoke(record) == false
+                }, "removal journal failure removed the weld")
+            } finally {
+                field.set(journal, original)
+                Files.deleteIfExists(obstruction)
+                Files.deleteIfExists(dir)
+            }
+        }
+    }
+
+    @GameTest(maxTicks = 400)
     fun deniedBlockPlacementKeepsExistingWeld(helper: GameTestHelper) {
         val runtime = PhysicsServices.runtime(helper.level.server)!!
         val origin = helper.absolutePos(BlockPos(1, 3, 1))

@@ -13,6 +13,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 abstract class PlacementManagerCrashMixin {
     @Inject(method = "checkpointPlacement", at = @At("HEAD"), remap = false)
     private void tumble$crashBeforeCheckpoint(UUID id, ServerLevel level, CallbackInfo callback) throws Exception {
+        if ("verify".equals(System.getProperty("tumble.placement.phase")) && Boolean.getBoolean("tumble.placement.replayCrash")) {
+            level.save(null, true, false);
+            java.nio.file.Files.writeString(java.nio.file.Path.of("placement-replay-crash-reached.txt"), id.toString());
+            Runtime.getRuntime().halt(87);
+        }
         PlacementCrashHook.crash("removed", null);
     }
 }

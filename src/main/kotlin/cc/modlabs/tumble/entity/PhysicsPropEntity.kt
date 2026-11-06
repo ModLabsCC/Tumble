@@ -168,7 +168,8 @@ class PhysicsPropEntity(type: EntityType<out PhysicsPropEntity>, level: Level) :
         if (serverLevel != null && (reason == RemovalReason.KILLED || reason == RemovalReason.DISCARDED) &&
             !PhysicsServices.beforePropRemoval(this, serverLevel)
         ) return
-        super.remove(reason)
+        try { super.remove(reason) }
+        finally { if (serverLevel != null && (reason == RemovalReason.KILLED || reason == RemovalReason.DISCARDED)) PhysicsServices.afterPropRemoval(this, serverLevel) }
     }
 
     override fun teleport(transition: net.minecraft.world.level.portal.TeleportTransition): Entity? {

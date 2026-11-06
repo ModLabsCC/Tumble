@@ -66,6 +66,7 @@ object PhysicsServices {
     }
 
     fun recoverConversions(server: MinecraftServer) {
+        runtimes[server]?.manager?.recoverRemovals()
         runtimes[server]?.manager?.recoverPlacements()
         runtimes[server]?.manager?.recoverConversions()
     }
@@ -103,7 +104,11 @@ object PhysicsServices {
         val manager = runtimes[level.server]?.manager ?: return true
         if (manager.findProp(entity.uuid) !== entity) return true
         if (manager.isBlockPlacementPending(entity.uuid)) return false
-        return manager.entityUnloaded(entity, level)
+        return manager.beginPropRemoval(entity, level)
+    }
+
+    fun afterPropRemoval(entity: cc.modlabs.tumble.entity.PhysicsPropEntity, level: ServerLevel) {
+        runtimes[level.server]?.manager?.finishPropRemoval(entity, level)
     }
 
     fun canTeleportProp(entity: cc.modlabs.tumble.entity.PhysicsPropEntity, level: ServerLevel, destination: ServerLevel): Boolean =

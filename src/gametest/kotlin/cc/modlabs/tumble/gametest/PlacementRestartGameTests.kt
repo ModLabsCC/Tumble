@@ -32,8 +32,13 @@ class PlacementRestartGameTests {
     fun inject(helper: GameTestHelper) {
         if (System.getProperty("tumble.placement.phase") != "inject") return helper.succeed()
         val level = helper.level
-        level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
-        level.getChunkAt(origin)
+        for (dx in -1..1) for (dz in -1..1) {
+            val cx = (origin.x shr 4) + dx
+            val cz = (origin.z shr 4) + dz
+            level.setChunkForced(cx, cz, true)
+            level.getChunk(cx, cz)
+            level.waitForEntities(net.minecraft.world.level.ChunkPos(cx, cz), 0)
+        }
         for (x in -3..5) for (z in -3..3) level.setBlock(origin.offset(x, -1, z), Blocks.STONE.defaultBlockState(), 3)
         val manager = PhysicsServices.runtime(level.server)!!.manager
         val first = manager.spawn(level, PhysicsVector(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5), Blocks.STONE.defaultBlockState())
@@ -62,6 +67,7 @@ class PlacementRestartGameTests {
                     val pos = first.blockPosition()
                     player.setPos(pos.x + 0.5, pos.y.toDouble(), pos.z + 2.0)
                     Files.writeString(idFile, "${first.uuid}\n${second.uuid}\n${pos.x} ${pos.y} ${pos.z}\n")
+                    for (dx in -1..1) for (dz in -1..1) level.setChunkForced((origin.x shr 4) + dx, (origin.z shr 4) + dz, false)
                     PlacementCrashHook.level = level
                     manager.usePhysicsGunSecondary(player, first, true)
                     helper.fail("placement did not reach the crash hook")
@@ -80,9 +86,14 @@ class PlacementRestartGameTests {
         val xyz = lines[2].split(" ").map(String::toInt)
         val pos = BlockPos(xyz[0], xyz[1], xyz[2])
         val level = helper.level
-        level.setChunkForced(pos.x shr 4, pos.z shr 4, true)
-        level.getChunkAt(pos)
-        level.waitForEntities(net.minecraft.world.level.ChunkPos(pos.x shr 4, pos.z shr 4), 0)
+        helper.assertTrue(!level.forceLoadedChunks.contains(net.minecraft.world.level.ChunkPos(pos.x shr 4, pos.z shr 4).pack()), "replay leaked a forced chunk")
+        for (dx in -1..1) for (dz in -1..1) {
+            val cx = (origin.x shr 4) + dx
+            val cz = (origin.z shr 4) + dz
+            level.setChunkForced(cx, cz, true)
+            level.getChunk(cx, cz)
+            level.waitForEntities(net.minecraft.world.level.ChunkPos(cx, cz), 0)
+        }
         var motionPhase = 0
         var beforeX = 0.0
         var startStep = 0L
