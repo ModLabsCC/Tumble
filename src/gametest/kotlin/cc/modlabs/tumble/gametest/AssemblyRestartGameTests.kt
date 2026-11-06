@@ -44,6 +44,10 @@ class AssemblyRestartGameTests {
         val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
         player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
         val flush = System.getProperty("tumble.restart.flush", "none")
+        if (flush == "prepare") {
+            TumbleApi.convertAssembly(level, listOf(origin, origin.east()), player)
+            return helper.fail("conversion did not reach the prepared journal crash")
+        }
         if (flush == "none") {
             ServerEntityEvents.ENTITY_LOAD.register { entity, entityLevel ->
                 if (entityLevel === level && entity is PhysicsPropEntity && entity.blockPosition() == origin) {

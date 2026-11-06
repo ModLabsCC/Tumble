@@ -43,6 +43,9 @@ pipeline {
         stage('Assembly crash GameTests') {
             steps {
                 sh 'python3 scripts/test_assembly_crash.py'
+                sh 'python3 scripts/test_assembly_crash.py --order prepare'
+                sh 'python3 scripts/test_assembly_crash.py --order block'
+                sh 'python3 scripts/test_assembly_crash.py --order entity'
             }
         }
         stage('Physics benchmark') {

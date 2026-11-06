@@ -26,12 +26,12 @@ def run(task, order):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--order', choices=('none', 'block', 'entity'), default='none')
+    parser.add_argument('--order', choices=('none', 'prepare', 'block', 'entity'), default='none')
     order = parser.parse_args().order
     if run('runAssemblyCrashBaseline', order).returncode != 0:
         raise RuntimeError('Crash baseline failed')
     crash = run('runAssemblyCrashInject', order)
-    expected_marker = 'entity-load: ' if order == 'none' else f'{order}-save: '
+    expected_marker = 'entity-load: ' if order == 'none' else 'prepare: ' if order == 'prepare' else f'{order}-save: '
     if (crash.returncode == 0 or 'finished with non-zero exit value 86' not in crash.stdout
             or not MARKER.is_file() or not MARKER.read_text(encoding='utf-8').startswith(expected_marker)):
         raise RuntimeError('Server did not reach the expected injected crash with exit 86')
