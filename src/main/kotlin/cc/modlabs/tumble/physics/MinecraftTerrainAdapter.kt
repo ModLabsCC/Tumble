@@ -22,9 +22,7 @@ import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.phys.AABB
 import cc.modlabs.tumble.entity.PhysicsPropBounds
-import kotlin.math.abs
 import kotlin.math.floor
-import kotlin.math.sqrt
 
 data class TerrainSectionKey(
     val dimension: PhysicsDimensionId,
@@ -330,20 +328,12 @@ class TerrainSectionTracker(private val service: ServerPhysicsService) {
             return
         }
         val rotation = prop.bodyRotation
-        val angularVelocity = prop.angularVelocity
-        val angularSpeed = sqrt(angularVelocity.x * angularVelocity.x + angularVelocity.y * angularVelocity.y + angularVelocity.z * angularVelocity.z)
         structure.coverageBounds.forEach { local ->
             val rotated = PhysicsPropBounds.rotatedAabb(rotation, local)
-            val radiusX = maxOf(abs(local.min.x), abs(local.max.x))
-            val radiusY = maxOf(abs(local.min.y), abs(local.max.y))
-            val radiusZ = maxOf(abs(local.min.z), abs(local.max.z))
-            val radius = sqrt(radiusX * radiusX + radiusY * radiusY + radiusZ * radiusZ)
-            // shortcut: acceleration between snapshots is unbounded; use a physics-thread sweep for strict coverage.
-            val rotationPadding = radius * minOf(2.0, angularSpeed * TERRAIN_LOOKAHEAD_SECONDS)
             val bounds = AABB(
                 prop.x + rotated.min.x, prop.y + rotated.min.y, prop.z + rotated.min.z,
                 prop.x + rotated.max.x, prop.y + rotated.max.y, prop.z + rotated.max.z
-            ).inflate(rotationPadding)
+            )
             forEachSectionInBounds(bounds, prop, horizontalPadding, verticalPadding, below, action)
         }
     }
