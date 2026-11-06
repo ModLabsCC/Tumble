@@ -99,6 +99,72 @@ class AssemblyGameTests {
         }
     }
 
+    @GameTest(maxTicks = 800)
+    fun removingWeldWithPeerUnloadedDoesNotRestoreIt(helper: GameTestHelper) {
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        val origin = helper.absolutePos(BlockPos(1, 4, 1))
+        val first = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn first prop")
+        var peer = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 2.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn peer")
+        val player = helper.makeMockPlayer(GameType.CREATIVE).apply {
+            setPos(origin.x + 1.5, origin.y.toDouble(), origin.z + 2.5)
+            setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
+        }
+        val dimension = helper.level.physicsDimensionId()
+        var phase = 0
+        var checkpoint = 0L
+        var removalAccepted = false
+        var savedPeer: net.minecraft.nbt.CompoundTag? = null
+        var firstX = 0.0
+        helper.succeedWhen {
+            Thread.sleep(5)
+            val frame = runtime.service.latestFrame(dimension)
+            when (phase) {
+                0 -> {
+                    val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
+                    if (first.uuid !in ready || peer.uuid !in ready) return@succeedWhen helper.assertTrue(false, "bodies are not ready")
+                    helper.assertTrue(runtime.manager.useToolGunWeld(player, first) == ToolGunWeldResult.SELECTED, "weld selection failed")
+                    helper.assertTrue(runtime.manager.useToolGunWeld(player, peer) == ToolGunWeldResult.WELDED, "weld creation failed")
+                    checkpoint = frame.physicsStep
+                    phase = 1
+                }
+                1 -> if (frame.physicsStep - checkpoint >= 10) {
+                    val saved = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
+                    peer.saveWithoutId(saved)
+                    savedPeer = saved.buildResult()
+                    runtime.manager.entityUnloaded(peer, helper.level, true)
+                    peer.discard()
+                    removalAccepted = runtime.manager.removeToolGunWelds(player, first)
+                    phase = 2
+                }
+                2 -> {
+                    helper.assertTrue(removalAccepted, "could not remove the weld while its peer was unloaded")
+                    val restored = TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)
+                        ?: error("could not reload peer")
+                    restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), requireNotNull(savedPeer)))
+                    helper.assertTrue(helper.level.addFreshEntity(restored), "could not add reloaded peer")
+                    runtime.manager.entityLoaded(restored, helper.level)
+                    peer = restored
+                    phase = 3
+                }
+                3 -> {
+                    val body = runtime.manager.networkProps().firstOrNull { it.propId == peer.uuid }
+                        ?: return@succeedWhen helper.assertTrue(false, "peer is not ready")
+                    firstX = first.x
+                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, body.bodyId, PhysicsVector(12.0, 0.0, 0.0)))
+                    checkpoint = frame.physicsStep
+                    phase = 4
+                }
+                4 -> if (frame.physicsStep - checkpoint >= 30) {
+                    helper.assertTrue(kotlin.math.abs(first.x - firstX) < 0.25, "deleted weld was restored")
+                    return@succeedWhen
+                }
+            }
+            helper.assertTrue(false, "waiting for unloaded-peer removal, phase=$phase")
+        }
+    }
+
     @GameTest(maxTicks = 1200)
     fun linkedPropReloadWaitsForMissingAssemblyTerrain(helper: GameTestHelper) = checkLinkedReload(helper, 0)
 
@@ -123,7 +189,7 @@ class AssemblyGameTests {
             AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))),
             AssemblyCollisionBox(1, PhysicsBox(PhysicsVector(31.5, -0.5, -0.5), PhysicsVector(32.5, 0.5, 0.5)))
         ))
-        val assembly = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        var assembly = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
         assembly.setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
         assembly.initializeAssembly(structure)
         helper.assertTrue(helper.level.addFreshEntity(assembly), "could not add assembly")
@@ -140,7 +206,12 @@ class AssemblyGameTests {
         var checkpoint = 0L
         var weldFailure = "none"
         var undoWhilePaused: Boolean? = null
+        var savedAssembly: net.minecraft.nbt.CompoundTag? = null
+        var assemblyHeight = 0.0
         fun reloadOther(step: Long, otherFirst: Boolean = false) {
+            val assemblyOutput = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
+            assembly.saveWithoutId(assemblyOutput)
+            savedAssembly = assemblyOutput.buildResult()
             val saved = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
             other.saveWithoutId(saved)
             if (otherFirst) {
@@ -201,10 +272,36 @@ class AssemblyGameTests {
                         TumbleApi.snapshot(helper.level, other.uuid) == null,
                         "reloaded prop started while assembly terrain was missing: $status")
                     PhysicsServices.chunkLoaded(helper.level, remote.x shr 4, 0)
+                    checkpoint = frame.physicsStep
                     phase = 4
                 }
-                4 -> if (TumbleApi.status(helper.level, other.uuid) == TumbleApi.PropStatus.READY) return@succeedWhen
+                4 -> if (frame.physicsStep - checkpoint >= 30) {
+                    val status = TumbleApi.status(helper.level, other.uuid)
+                    helper.assertTrue(status == TumbleApi.PropStatus.PENDING || status == TumbleApi.PropStatus.PAUSED,
+                        "peer resumed before the assembly entity returned: $status")
+                    val restored = TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)
+                        ?: error("could not reload assembly")
+                    restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), requireNotNull(savedAssembly)))
+                    helper.assertTrue(helper.level.addFreshEntity(restored), "could not add reloaded assembly")
+                    runtime.manager.entityLoaded(restored, helper.level)
+                    assembly = restored
+                    phase = 6
+                }
                 5 -> helper.assertTrue(false, weldFailure)
+                6 -> {
+                    if (TumbleApi.status(helper.level, assembly.uuid) != TumbleApi.PropStatus.READY ||
+                        TumbleApi.status(helper.level, other.uuid) != TumbleApi.PropStatus.READY
+                    ) return@succeedWhen helper.assertTrue(false, "restored group is not ready")
+                    val peer = runtime.manager.networkProps().first { it.propId == other.uuid }
+                    assemblyHeight = assembly.y
+                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, peer.bodyId, PhysicsVector(0.0, 12.0, 0.0)))
+                    checkpoint = frame.physicsStep
+                    phase = 7
+                }
+                7 -> if (frame.physicsStep - checkpoint >= 30) {
+                    helper.assertTrue(assembly.y > assemblyHeight + 0.1, "reloaded assembly did not move with welded peer")
+                    return@succeedWhen
+                }
             }
             helper.assertTrue(false, "waiting for linked reload, phase=$phase")
         }
