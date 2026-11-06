@@ -48,6 +48,11 @@ pipeline {
                 sh 'python3 scripts/test_assembly_crash.py --order entity'
             }
         }
+        stage('Connection crash GameTests') {
+            steps {
+                sh 'python3 scripts/test_connection_crash.py'
+            }
+        }
         stage('Physics benchmark') {
             steps {
                 sh './gradlew :physics-core:benchmark --no-daemon --stacktrace'
