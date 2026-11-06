@@ -537,6 +537,67 @@ class AssemblyGameTests {
     }
 
     @GameTest
+    fun pendingAssemblySavesRecoveryDataBeforeBodyCreation(helper: GameTestHelper) {
+        val origin = BlockPos(2272, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val id = TumbleApi.convertAssembly(helper.level, listOf(origin), player)
+            ?: return helper.fail("could not start assembly conversion")
+        val manager = PhysicsServices.runtime(helper.level.server)!!.manager
+        val field = manager.javaClass.getDeclaredField("props").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val entity = (field.get(manager) as Map<UUID, PhysicsPropEntity>)[id] ?: return helper.fail("assembly missing")
+        val saved = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
+        entity.saveWithoutId(saved)
+        val restored = TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)
+            ?: return helper.fail("could not reload assembly")
+        restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), saved.buildResult()))
+        val recovery = restored.javaClass.getDeclaredField("recoveryOrigin").apply { isAccessible = true }
+        helper.assertTrue(recovery.get(restored) == origin, "pending assembly did not save its recovery origin")
+        helper.succeed()
+    }
+
+    @GameTest
+    fun partiallyRemovedAssemblyCanBeRecovered(helper: GameTestHelper) {
+        val origin = BlockPos(2208, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        val stone = Blocks.STONE.defaultBlockState()
+        val stairs = Blocks.OAK_STAIRS.defaultBlockState()
+        helper.level.setBlock(origin, stone, 3)
+        helper.level.setBlock(origin.east(), Blocks.AIR.defaultBlockState(), 3)
+        val definition = AssemblyDefinition.of(listOf(
+            AssemblyBlock(BlockPos.ZERO, stone), AssemblyBlock(BlockPos(1, 0, 0), stairs)
+        ))
+        val structure = AssemblyStructure.of(definition, listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))),
+            AssemblyCollisionBox(1, PhysicsBox(PhysicsVector(0.5, -0.5, -0.5), PhysicsVector(1.5, 0.0, 0.5)))
+        ))
+        val entity = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        entity.setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+        entity.initializeAssembly(structure)
+        val recovery = entity.javaClass.getDeclaredField("recoveryOrigin")
+        recovery.isAccessible = true
+        recovery.set(entity, origin)
+        val logger = LoggerFactory.getLogger("partial-assembly-recovery-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning())
+        try {
+            manager.entityLoaded(entity, helper.level)
+            manager.tick()
+            helper.assertTrue(helper.level.getBlockState(origin) == stone && helper.level.getBlockState(origin.east()) == stairs,
+                "recovery did not restore the removed block while retaining the original block")
+            helper.assertTrue(entity.isRemoved, "recovered assembly was not removed")
+        } finally {
+            service.close()
+        }
+        helper.succeed()
+    }
+
+    @GameTest
     fun blockedAssemblyRollbackRecoversAfterTheObstructionIsRemoved(helper: GameTestHelper) {
         val origin = BlockPos(1824, 4, 0)
         helper.level.setChunkForced(origin.x shr 4, 0, true)

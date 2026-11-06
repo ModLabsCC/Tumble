@@ -200,34 +200,45 @@ class PhysicsPropManager(
             logger.debug("Cannot capture assembly: {}", error.message)
             return null
         }
-        val removed = ArrayList<ConvertedBlock>(captured.size)
-        captured.forEach { block ->
-            if (!level.setBlock(block.position, Blocks.AIR.defaultBlockState(), CONVERSION_FLAGS)) {
-                restoreBlocks(removed)
-                return null
-            }
-            removed += block
-        }
-        terrain.primeForPositions(level, positions)
         val entity = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
             setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
             initializeAssembly(structure)
+            recoveryOrigin = origin
         }
-        skipTerrainPrime += entity.uuid
         if (!level.addFreshEntity(entity)) {
-            skipTerrainPrime.remove(entity.uuid)
-            restoreBlocks(removed)
             return null
         }
         entityLoaded(entity, level)
-        if (!entity.physicsPending && entity.runtimeBodyId == null) {
-            entityUnloaded(entity, level)
-            entity.discard()
-            restoreBlocks(removed)
+        failedAssemblyConversions.remove(entity.uuid)
+        try {
+            for (block in captured) {
+                if (level.getBlockState(block.position) != block.state ||
+                    !level.setBlock(block.position, Blocks.AIR.defaultBlockState(), CONVERSION_FLAGS)
+                ) {
+                    abortAssemblyConversion(entity, level)
+                    return null
+                }
+            }
+            terrain.primeForPositions(level, positions)
+            activateEntity(entity, level)
+        } catch (error: Exception) {
+            logger.error("Failed to convert assembly at {}", origin, error)
+            abortAssemblyConversion(entity, level)
             return null
         }
-        pendingConversions[entity.uuid] = captured
+        if (!entity.physicsPending && entity.runtimeBodyId == null) {
+            abortAssemblyConversion(entity, level)
+            return null
+        }
         return entity
+    }
+
+    private fun abortAssemblyConversion(entity: PhysicsPropEntity, level: ServerLevel) {
+        retainFailedAssembly(entity)
+        if (rollbackPendingConversion(entity.uuid)) {
+            entityUnloaded(entity, level)
+            entity.discard()
+        }
     }
 
     fun usePhysicsGunSecondary(player: Player, prop: PhysicsPropEntity, changeToBlock: Boolean): Boolean {
@@ -501,6 +512,10 @@ class PhysicsPropManager(
             failedAssemblyConversions += entity.uuid
             return
         }
+        activateEntity(entity, level)
+    }
+
+    private fun activateEntity(entity: PhysicsPropEntity, level: ServerLevel) {
         if (entity.terrainBlockers.isNotEmpty()) {
             entity.physicsPending = true
             deferredTerrainProps.addLast(entity.uuid)
@@ -531,7 +546,9 @@ class PhysicsPropManager(
             reason != Entity.RemovalReason.CHANGED_DIMENSION && entity.assembly != null
         ) markConnectedTerrainWait(entity.uuid, terrain.coveredChunks(entity))
         if (visibilityEvent && reason != Entity.RemovalReason.KILLED && reason != Entity.RemovalReason.DISCARDED) {
-            pendingConversions.remove(entity.uuid)?.forEach(::notifyConvertedBlock)
+            pendingConversions.remove(entity.uuid)?.let { conversions ->
+                if (entity.recoveryOrigin == null) conversions.forEach(::notifyConvertedBlock)
+            }
             pendingItemConversions.remove(entity.uuid)
         } else {
             rollbackPendingConversion(entity.uuid)
@@ -1189,15 +1206,11 @@ class PhysicsPropManager(
         if (conversions.any {
                 !it.level.isInWorldBounds(it.position) ||
                     !it.level.chunkSource.hasChunk(it.position.x shr 4, it.position.z shr 4) ||
-                    !it.level.getBlockState(it.position).isAir
+                    it.level.getBlockState(it.position).let { state -> !state.isAir && state != it.state }
             }) return false
-        val restored = ArrayList<ConvertedBlock>(conversions.size)
         conversions.forEach { block ->
-            if (!restoreBlock(block)) {
-                restored.forEach { it.level.setBlock(it.position, Blocks.AIR.defaultBlockState(), CONVERSION_FLAGS) }
-                return false
-            }
-            restored += block
+            if (block.level.getBlockState(block.position) == block.state) return@forEach
+            if (!restoreBlock(block)) return false
         }
         return true
     }
@@ -1664,6 +1677,7 @@ class PhysicsPropManager(
                     } else {
                         val converted = pendingConversions.remove(acknowledgement.propId)
                         pendingItemConversions.remove(acknowledgement.propId)
+                        entity.recoveryOrigin = null
                         entity.runtimeBodyId = acknowledgement.bodyId
                         entity.physicsPending = false
                         bodyOwners[RuntimeBodyKey(acknowledgement.dimension, acknowledgement.bodyId)] =
