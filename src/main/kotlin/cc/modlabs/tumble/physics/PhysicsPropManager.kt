@@ -77,6 +77,7 @@ class PhysicsPropManager(
     private val assemblies = mutableMapOf<UUID, PhysicsPropEntity>()
     private val terrainWaits = mutableMapOf<UUID, MutableSet<Long>>()
     private val pendingRestores = linkedSetOf<UUID>()
+    private val loggedPassengerGates = mutableSetOf<UUID>()
     private val restoreGroups = mutableMapOf<PhysicsRestoreToken, RestoreGroup>()
     private val memberRestoreTokens = mutableMapOf<UUID, PhysicsRestoreToken>()
     private val parkingGroups = mutableMapOf<UUID, ParkingGroup>()
@@ -481,7 +482,8 @@ class PhysicsPropManager(
         val first = props[selected.propId]
         val firstBody = first?.runtimeBodyId
         val key = WeldKey.of(selected.propId, prop.uuid)
-        if (first == null || firstBody == null || first.level() !== level || isTerrainPaused(first, level) || key in activeWelds) {
+        if (first == null || firstBody == null || first.level() !== level || isTerrainPaused(first, level) || key in activeWelds ||
+            !canConnectWithoutPassengers(level, first.uuid, prop.uuid)) {
             sendToolGunState(player)
             return ToolGunWeldResult.FAILED
         }
@@ -550,7 +552,8 @@ class PhysicsPropManager(
         }
         val first = props[selected.propId]
         val firstBody = first?.runtimeBodyId
-        if (first == null || firstBody == null || first.level() !== level || isTerrainPaused(first, level)) {
+        if (first == null || firstBody == null || first.level() !== level || isTerrainPaused(first, level) ||
+            !canConnectWithoutPassengers(level, first.uuid, prop.uuid)) {
             sendToolGunState(player)
             return ToolGunResult.FAILED
         }
@@ -727,6 +730,16 @@ class PhysicsPropManager(
         if (updates.isNotEmpty()) journal.putAll(updates)
     }
 
+    fun connectionRelationshipsBlocked(id: UUID): Boolean = id in props &&
+        (pendingConnections.values.any { it.key.contains(id) } ||
+            journal.records().any { !it.deleted && it.passengerSafe && (it.first == id || it.second == id) })
+
+    private fun canConnectWithoutPassengers(level: ServerLevel, first: UUID, second: UUID): Boolean =
+        (componentFor(level, first) + componentFor(level, second)).all { id ->
+            val prop = props[id]
+            prop != null && !prop.isRemoved && prop.level() === level && !prop.isPassenger && prop.passengers.isEmpty()
+        }
+
     private fun activeConnections(level: ServerLevel): List<DurableConnection> =
         journal.records().filter { !it.deleted && it.dimension == level.physicsDimensionId().value }
 
@@ -819,6 +832,11 @@ class PhysicsPropManager(
                 return@repeat
             }
             val records = activeConnections(level).filter { it.first in members && it.second in members }
+            if (records.isNotEmpty() && (records.any { !it.passengerSafe } || loaded.any { it.isPassenger || it.passengers.isNotEmpty() })) {
+                if (loggedPassengerGates.add(id)) logger.warn("Linked component {} has an unsafe or unknown passenger relationship; recovery remains parked", members)
+                pendingRestores += id
+                return@repeat
+            }
             val checkpoint = if (records.isEmpty()) emptyMap() else records.first().checkpoint
                 .filter { it.propId in members }.associateBy { it.propId }
             if (records.isNotEmpty() && (checkpoint.keys != members || records.any { record ->
@@ -2166,24 +2184,24 @@ class PhysicsPropManager(
                     if (level == null || snapshots.keys != members || members.any { id ->
                             val prop = props[id]
                             val snapshot = snapshots[id]
-                            prop == null || prop.isRemoved || prop.level() !== level || snapshot == null ||
-                                prop.runtimeBodyId != snapshot.bodyId
+                            prop == null || prop.isRemoved || prop.level() !== level || prop.isPassenger || prop.passengers.isNotEmpty() ||
+                                snapshot == null || prop.runtimeBodyId != snapshot.bodyId
                         }) {
                         failConnection(acknowledgement.requestId, pending)
                         continue
                     }
                     val checkpoint = snapshots.map { (id, snapshot) -> snapshot.toDurableState(id) }
                     val record = DurableConnection(acknowledgement.requestId, pending.dimension.value, pending.first,
-                        pending.second, pending.playerId, pending.kind, frames, pending.ropeLength, false, checkpoint)
+                        pending.second, pending.playerId, pending.kind, frames, pending.ropeLength, false, checkpoint, passengerSafe = true)
                     try {
                         val failures = PhysicsServices.chunkIoFailureCount(server)
                         check(failures == 0L) { "A chunk I/O failure occurred before connection checkpoint" }
                         snapshots.forEach { (id, snapshot) -> props.getValue(id).let { it.applySnapshot(it.lastAppliedStep + 1, snapshot) } }
                         level.save(null, true, false)
                         check(PhysicsServices.chunkIoFailureCount(server) == failures) { "Connection endpoint checkpoint failed" }
-                        check(members.all { id -> props[id]?.let { !it.isRemoved && it.level() === level } == true }) {
-                            "Connection endpoint disappeared during checkpoint"
-                        }
+                        check(members.all { id -> props[id]?.let {
+                            !it.isRemoved && it.level() === level && !it.isPassenger && it.passengers.isEmpty()
+                        } == true }) { "Connection endpoint changed or gained passengers during checkpoint" }
                         val previous = activeConnections(level).filter { it.first in members && it.second in members }
                         journal.putAll(previous.map { it.copy(checkpoint = checkpoint) } + record)
                         pending.record = record

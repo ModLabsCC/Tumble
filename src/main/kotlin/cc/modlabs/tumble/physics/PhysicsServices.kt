@@ -80,6 +80,9 @@ object PhysicsServices {
     fun conversionWriteBlocked(level: ServerLevel, position: BlockPos, state: BlockState): Boolean =
         runtimes[level.server]?.manager?.conversionWriteBlocked(level, position, state) ?: false
 
+    fun connectionRelationshipsBlocked(level: ServerLevel, id: UUID): Boolean =
+        runtimes[level.server]?.manager?.connectionRelationshipsBlocked(id) ?: true
+
     fun assemblyConversionPending(level: ServerLevel, id: UUID): Boolean =
         runtimes[level.server]?.manager?.assemblyConversionPending(id) ?: false
 

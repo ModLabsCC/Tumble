@@ -32,7 +32,8 @@ internal data class DurableConnection(
     val frames: PhysicsJointFrames?,
     val ropeLength: Float,
     val deleted: Boolean,
-    val checkpoint: List<DurableBodyState> = emptyList()
+    val checkpoint: List<DurableBodyState> = emptyList(),
+    val passengerSafe: Boolean = false
 ) {
     init {
         require(dimension.isNotBlank() && dimension.length <= 512 && first != second)
@@ -64,7 +65,9 @@ internal class DurableConnectionJournal(private val path: Path) {
         if (size > MAX_BYTES) throw IOException("Connection journal is too large")
         try {
             val input = DataInputStream(ByteArrayInputStream(Files.readAllBytes(path)))
-            if (input.readInt() != MAGIC || input.readInt() != VERSION) throw IOException("Invalid connection journal header")
+            if (input.readInt() != MAGIC) throw IOException("Invalid connection journal header")
+            val version = input.readInt()
+            if (version !in 2..VERSION) throw IOException("Unsupported connection journal version")
             val size = input.readInt()
             if (size < 0 || size > MAX_BYTES - 20 || input.available() != size + 8) throw IOException("Invalid connection journal length")
             val payload = input.readNBytes(size)
@@ -91,7 +94,8 @@ internal class DurableConnectionJournal(private val path: Path) {
                 val length = data.readFloat()
                 val deleted = data.readBoolean()
                 val checkpoint = checkpoints.getOrNull(data.readInt()) ?: throw IOException("Invalid checkpoint reference")
-                val record = DurableConnection(id, dimension, first, second, owner, kind, frames, length, deleted, checkpoint)
+                val passengerSafe = if (version >= 3) data.readBoolean() else false
+                val record = DurableConnection(id, dimension, first, second, owner, kind, frames, length, deleted, checkpoint, passengerSafe)
                 if (result.put(id, record) != null) throw IOException("Duplicate connection journal ID")
             }
             if (data.available() != 0) throw IOException("Unexpected connection journal data")
@@ -132,6 +136,7 @@ internal class DurableConnectionJournal(private val path: Path) {
                     output.writeFloat(record.ropeLength)
                     output.writeBoolean(record.deleted)
                     output.writeInt(checkpointIndices.getValue(record.checkpoint))
+                    output.writeBoolean(record.passengerSafe)
                 }
             }
         }.toByteArray()
@@ -165,7 +170,7 @@ internal class DurableConnectionJournal(private val path: Path) {
 
     private companion object {
         const val MAGIC = 0x54434a31
-        const val VERSION = 2
+        const val VERSION = 3
         const val MAX_RECORDS = 50_000
         const val MAX_BYTES = 16 * 1024 * 1024
     }

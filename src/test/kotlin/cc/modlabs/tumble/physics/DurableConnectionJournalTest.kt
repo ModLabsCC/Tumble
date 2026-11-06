@@ -13,6 +13,20 @@ class DurableConnectionJournalTest {
     @TempDir lateinit var directory: Path
 
     @Test
+    fun `legacy connection record is not assumed passenger safe`() {
+        val path = directory.resolve("connections.dat")
+        val record = DurableConnection(UUID.randomUUID(), "minecraft:overworld", UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), PhysicsJointKind.NO_COLLIDE, null, 0f, false, passengerSafe = true)
+        DurableConnectionJournal(path).put(record)
+        val current = Files.readAllBytes(path)
+        val oldPayload = current.copyOfRange(12, current.size - 9)
+        val old = java.nio.ByteBuffer.allocate(12 + oldPayload.size + 8)
+            .putInt(0x54434a31).putInt(2).putInt(oldPayload.size).put(oldPayload)
+            .putLong(java.util.zip.CRC32().apply { update(oldPayload) }.value).array()
+        Files.write(path, old)
+        assertEquals(false, DurableConnectionJournal(path).records().single().passengerSafe)
+    }
+
+    @Test
     fun `journal preserves coherent component checkpoints across replacement`() {
         val path = directory.resolve("connections.dat")
         val first = UUID(0, 1)

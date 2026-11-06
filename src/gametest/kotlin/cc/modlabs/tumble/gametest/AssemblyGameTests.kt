@@ -104,6 +104,113 @@ class AssemblyGameTests {
     }
 
     @GameTest(maxTicks = 800)
+    fun legacyConnectionWithoutPassengerProofRemainsParked(helper: GameTestHelper) {
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        val origin = helper.absolutePos(BlockPos(1, 4, 1))
+        fun prop(x: Double) = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level).apply {
+            setPos(x, origin.y + 0.5, origin.z + 0.5)
+            initialize(Blocks.STONE.defaultBlockState(), PhysicsVector.ZERO)
+        }
+        val first = prop(origin.x + 0.5)
+        val second = prop(origin.x + 2.5)
+        val stateClass = Class.forName("cc.modlabs.tumble.physics.DurableBodyState")
+        val stateConstructor = stateClass.getConstructor(UUID::class.java, PhysicsTransform::class.java, PhysicsVector::class.java, PhysicsVector::class.java)
+        val checkpoint = listOf(first, second).map { prop ->
+            stateConstructor.newInstance(prop.uuid, PhysicsTransform(PhysicsVector(prop.x, prop.y, prop.z)), PhysicsVector.ZERO, PhysicsVector.ZERO)
+        }
+        val recordClass = Class.forName("cc.modlabs.tumble.physics.DurableConnection")
+        val record = recordClass.getConstructor(UUID::class.java, String::class.java, UUID::class.java, UUID::class.java,
+            UUID::class.java, cc.modlabs.tumble.physics.PhysicsJointKind::class.java, cc.modlabs.tumble.physics.PhysicsJointFrames::class.java,
+            Float::class.javaPrimitiveType, Boolean::class.javaPrimitiveType, java.util.List::class.java, Boolean::class.javaPrimitiveType)
+            .newInstance(UUID.randomUUID(), helper.level.physicsDimensionId().value, first.uuid, second.uuid, UUID.randomUUID(),
+                cc.modlabs.tumble.physics.PhysicsJointKind.NO_COLLIDE, null, 0f, false, checkpoint, false)
+        val journal = runtime.manager.javaClass.getDeclaredField("journal").apply { isAccessible = true }.get(runtime.manager)
+        journal.javaClass.getMethod("put", recordClass).invoke(journal, record)
+        runtime.manager.entityLoaded(first, helper.level)
+        runtime.manager.entityLoaded(second, helper.level)
+        val marker = net.minecraft.world.entity.item.ItemEntity(helper.level, first.x, first.y, first.z, ItemStack(net.minecraft.world.item.Items.STONE))
+        helper.assertTrue(marker.startRiding(first, true, false), "legacy passenger relationship could not load")
+        val dimension = helper.level.physicsDimensionId()
+        val start = runtime.service.latestFrame(dimension).physicsStep
+        helper.succeedWhen {
+            Thread.sleep(5)
+            if (runtime.service.latestFrame(dimension).physicsStep - start < 30) return@succeedWhen helper.assertTrue(false, "waiting for legacy recovery gate")
+            val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
+            helper.assertTrue(first.uuid !in ready && second.uuid !in ready, "legacy passenger-unsafe graph was activated")
+            helper.assertTrue(marker.isPassenger, "legacy passenger relationship was discarded")
+            marker.stopRiding()
+            runtime.manager.entityUnloaded(first, helper.level)
+            runtime.manager.entityUnloaded(second, helper.level)
+            first.discard()
+            second.discard()
+        }
+    }
+
+    @GameTest(maxTicks = 800)
+    fun passengerRelationshipsAreBlockedForPendingAndLinkedProps(helper: GameTestHelper) = checkConnectionPassengerPolicy(helper, ToolGunMode.WELD)
+
+    @GameTest(maxTicks = 800)
+    fun passengerRelationshipsAreBlockedForRope(helper: GameTestHelper) = checkConnectionPassengerPolicy(helper, ToolGunMode.ROPE)
+
+    @GameTest(maxTicks = 800)
+    fun passengerRelationshipsAreBlockedForAxis(helper: GameTestHelper) = checkConnectionPassengerPolicy(helper, ToolGunMode.AXIS)
+
+    @GameTest(maxTicks = 800)
+    fun passengerRelationshipsAreBlockedForNoCollide(helper: GameTestHelper) = checkConnectionPassengerPolicy(helper, ToolGunMode.NO_COLLIDE)
+
+    private fun checkConnectionPassengerPolicy(helper: GameTestHelper, mode: ToolGunMode) {
+        val runtime = PhysicsServices.runtime(helper.level.server)!!
+        val origin = helper.absolutePos(BlockPos(1, 4, 1))
+        val first = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn first prop")
+        val second = runtime.manager.spawn(helper.level, PhysicsVector(origin.x + 2.5, origin.y + 0.5, origin.z + 0.5))
+            ?: return helper.fail("could not spawn second prop")
+        val marker = net.minecraft.world.entity.item.ItemEntity(helper.level, origin.x.toDouble(), origin.y.toDouble(), origin.z.toDouble(), ItemStack(net.minecraft.world.item.Items.STONE))
+        val player = helper.makeMockPlayer(GameType.CREATIVE).apply {
+            setPos(origin.x + 1.5, origin.y.toDouble(), origin.z + 2.5)
+            setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.TOOL_GUN))
+        }
+        repeat(mode.ordinal) { runtime.manager.cycleToolGunMode(player, 1) }
+        var phase = 0
+        var failure = "none"
+        helper.succeedWhen {
+            Thread.sleep(5)
+            when (phase) {
+                0 -> {
+                    val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
+                    if (first.uuid !in ready || second.uuid !in ready) return@succeedWhen helper.assertTrue(false, "bodies not ready")
+                    helper.assertTrue(first.startRiding(marker, true, false), "could not create existing vehicle relationship")
+                    helper.assertTrue(runtime.manager.useToolGun(player, first) == ToolGunResult.SELECTED, "selection failed")
+                    val ridingResult = runtime.manager.useToolGun(player, second)
+                    first.stopRiding()
+                    if (ridingResult != ToolGunResult.FAILED) { failure = "linked a riding prop: $ridingResult"; phase = 99 }
+                    helper.assertTrue(phase != 99, failure)
+                    helper.assertTrue(marker.startRiding(first, true, false), "could not create existing passenger relationship")
+                    helper.assertTrue(runtime.manager.useToolGun(player, first) == ToolGunResult.SELECTED, "second selection failed")
+                    val carryingResult = runtime.manager.useToolGun(player, second)
+                    marker.stopRiding()
+                    if (carryingResult != ToolGunResult.FAILED) { failure = "linked a prop carrying a passenger: $carryingResult"; phase = 99 }
+                    helper.assertTrue(phase != 99, failure)
+                    helper.assertTrue(runtime.manager.useToolGun(player, first) == ToolGunResult.SELECTED, "final selection failed")
+                    helper.assertTrue(runtime.manager.useToolGun(player, second) == ToolGunResult.APPLIED, "valid weld failed")
+                    helper.assertTrue(!first.startRiding(marker, true, false), "pending linked prop became a forced passenger")
+                    helper.assertTrue(!marker.startRiding(first, true, false), "pending linked prop accepted a forced passenger")
+                    phase = 1
+                }
+                99 -> helper.assertTrue(false, failure)
+                1 -> {
+                    if (TumbleApi.status(helper.level, first.uuid) != TumbleApi.PropStatus.READY || TumbleApi.status(helper.level, second.uuid) != TumbleApi.PropStatus.READY)
+                        return@succeedWhen helper.assertTrue(false, "link not ready")
+                    helper.assertTrue(!first.startRiding(marker, true, false), "linked prop became a forced passenger")
+                    helper.assertTrue(!marker.startRiding(first, true, false), "linked prop accepted a forced passenger")
+                    return@succeedWhen
+                }
+            }
+            helper.assertTrue(false, "waiting for passenger policy, phase=$phase")
+        }
+    }
+
+    @GameTest(maxTicks = 800)
     fun cancelledPendingWeldIsNotResurrectedByLateAcknowledgement(helper: GameTestHelper) {
         val runtime = PhysicsServices.runtime(helper.level.server)!!
         val origin = helper.absolutePos(BlockPos(1, 4, 1))
@@ -152,7 +259,12 @@ class AssemblyGameTests {
     @GameTest(maxTicks = 1600)
     fun movedComponentUsesItsUnloadCheckpointAfterReopen(helper: GameTestHelper) {
         val runtime = PhysicsServices.runtime(helper.level.server)!!
-        val origin = helper.absolutePos(BlockPos(1, 4, 1))
+        val origin = BlockPos(5904, 50, 0)
+        for (x in 0..2) {
+            helper.level.setChunkForced((origin.x shr 4) + x, 0, true)
+            helper.level.getChunk((origin.x shr 4) + x, 0)
+        }
+        for (x in 0..25) for (z in 0..2) helper.level.setBlock(origin.offset(x, -1, z), Blocks.STONE.defaultBlockState(), 3)
         val stone = Blocks.STONE.defaultBlockState()
         val structure = AssemblyStructure.of(AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, stone))), listOf(
             AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5)))
@@ -197,9 +309,16 @@ class AssemblyGameTests {
                     step = frame.physicsStep
                     phase = 2
                 }
-                2 -> if (frame.physicsStep - step >= 20) {
+                2 -> if (frame.physicsStep - step >= 40) {
+                    val bodies = runtime.manager.networkProps().associateBy { it.propId }
+                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, bodies.getValue(root.uuid).bodyId, PhysicsVector.ZERO))
+                    runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, bodies.getValue(peer.uuid).bodyId, PhysicsVector.ZERO))
+                    step = frame.physicsStep
+                    phase = 5
+                }
+                5 -> if (frame.physicsStep - step >= 5) {
                     movedX = root.x
-                    helper.assertTrue(movedX > origin.x + 0.6, "component did not move before unload")
+                    helper.assertTrue(movedX > origin.x + 2.5, "component did not move far enough before unload")
                     fun copy(prop: PhysicsPropEntity): PhysicsPropEntity {
                         val output = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
                         prop.saveWithoutId(output)
@@ -230,8 +349,9 @@ class AssemblyGameTests {
                         ?: return@succeedWhen helper.assertTrue(false, "reopened root not ready")
                     val snapshot = requireNotNull(reopenedService).latestFrame(dimension).bodies[body.bodyId]
                         ?: return@succeedWhen helper.assertTrue(false, "reopened snapshot unavailable")
-                    helper.assertTrue(kotlin.math.abs(snapshot.transform.position.x - movedX) < 1.0,
-                        "unload restored stale creation pose: ${snapshot.transform.position.x} vs $movedX")
+                    helper.assertTrue(snapshot.transform.position.x > origin.x + 2.5 &&
+                        kotlin.math.abs(snapshot.transform.position.x - movedX) < 2.0,
+                        "unload restored a stale or inconsistent pose: ${snapshot.transform.position.x} vs $movedX")
                     requireNotNull(reopenedService).close()
                     return@succeedWhen
                 }
@@ -383,6 +503,7 @@ class AssemblyGameTests {
         var phase = 0
         var checkpoint = 0L
         var removalAccepted = false
+        var failure = "none"
         var savedPeer: net.minecraft.nbt.CompoundTag? = null
         var initialDistance = 0.0
         helper.succeedWhen {
@@ -392,10 +513,16 @@ class AssemblyGameTests {
                 0 -> {
                     val ready = runtime.manager.networkProps().mapTo(mutableSetOf()) { it.propId }
                     if (first.uuid !in ready || peer.uuid !in ready) return@succeedWhen helper.assertTrue(false, "bodies are not ready")
-                    helper.assertTrue(runtime.manager.useToolGun(player, first) == ToolGunResult.SELECTED, "connection selection failed")
-                    helper.assertTrue(runtime.manager.useToolGun(player, peer) == ToolGunResult.APPLIED, "connection creation failed")
-                    checkpoint = frame.physicsStep
-                    phase = 1
+                    val selected = runtime.manager.useToolGun(player, first)
+                    val connected = runtime.manager.useToolGun(player, peer)
+                    if (selected != ToolGunResult.SELECTED || connected != ToolGunResult.APPLIED) {
+                        failure = "connection failed: mode=$mode, selected=$selected, connected=$connected"
+                        phase = 99
+                    } else {
+                        checkpoint = frame.physicsStep
+                        phase = 1
+                    }
+                    helper.assertTrue(phase != 99, failure)
                 }
                 1 -> if (frame.physicsStep - checkpoint >= 10) {
                     val saved = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
@@ -431,6 +558,7 @@ class AssemblyGameTests {
                     checkpoint = frame.physicsStep
                     phase = 4
                 }
+                99 -> helper.assertTrue(false, failure)
                 4 -> if (frame.physicsStep - checkpoint >= 30) {
                     if (mode == ToolGunMode.NO_COLLIDE) {
                         helper.assertTrue(first.position().distanceTo(peer.position()) > 0.5, "removed no-collide still suppressed collisions")

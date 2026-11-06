@@ -107,6 +107,11 @@ class ConnectionCrashGameTests {
                 0 -> {
                     if (TumbleApi.status(level, rootId) != TumbleApi.PropStatus.READY || TumbleApi.status(level, peerId) != TumbleApi.PropStatus.READY)
                         return@succeedWhen helper.assertTrue(false, "crash-recovered group not ready")
+                    val marker = net.minecraft.world.entity.item.ItemEntity(level, root.x, root.y, root.z, ItemStack(net.minecraft.world.item.Items.STONE))
+                    helper.assertTrue(!root.startRiding(marker, true, false), "recovered linked prop became a forced passenger")
+                    helper.assertTrue(!marker.startRiding(root, true, false), "recovered linked prop accepted a forced passenger")
+                    helper.assertTrue(!peer.startRiding(marker, true, false), "recovered peer became a forced passenger")
+                    helper.assertTrue(!marker.startRiding(peer, true, false), "recovered peer accepted a forced passenger")
                     val peerBody = runtime.manager.networkProps().first { it.propId == peerId }
                     startX = root.x
                     runtime.service.submit(PhysicsCommand.SetLinearVelocity(dimension, peerBody.bodyId, PhysicsVector(40.0, 0.0, 0.0)))
