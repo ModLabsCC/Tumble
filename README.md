@@ -4,6 +4,8 @@ Tumble brings physical objects to Minecraft. It is a Fabric mod built around Box
 
 Tumble is in early development. You can turn blocks into props and move them with the tools in the creative inventory. Multiplayer, saving and performance are still being tested. See [what's left](docs/status.md) before using it in a world you care about.
 
+The Gravity Gun, Physics Gun and Tool Gun are creative and developer tools. They have no default survival recipes or progression. Find them in the Tumble creative tab or use the operator commands `/tumble gravitygun`, `/tumble physicsgun` and `/tumble toolgun`. A server can add recipes through an optional datapack.
+
 Physics runs on the CPU using Box3D. Minecraft uses the GPU for rendering; Tumble does not currently run its physics on the GPU.
 
 ## Try a build
