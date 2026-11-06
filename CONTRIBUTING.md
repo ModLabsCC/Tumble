@@ -18,4 +18,4 @@ New source files should include `SPDX-License-Identifier: MPL-2.0`. Only contrib
 
 Run `./gradlew runAssemblyRestartTest -PacceptMinecraftEula=true` with Java 25 to test a converted assembly across two production server processes and an orderly disk save. The task removes only its dedicated `build/run/assemblyRestart/world` test world. This does not simulate crashes or independent chunk/entity save ordering.
 
-On Windows, `./scripts/test-assembly-crash.ps1` saves source blocks, terminates a separate server during conversion's entity-load event, and verifies the saved world in a third process. The injected server is expected to fail. It uses a separate `build/run/assemblyCrash/world`; it does not test every save ordering.
+`python scripts/test_assembly_crash.py` saves source blocks, terminates a separate server during conversion's entity-load event, and verifies the saved world in a third process. The injected server must exit with code 86. It uses a separate `build/run/assemblyCrash/world`; it does not test every save ordering.
