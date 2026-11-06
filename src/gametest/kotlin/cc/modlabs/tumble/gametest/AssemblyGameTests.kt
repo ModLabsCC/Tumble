@@ -167,6 +167,12 @@ class AssemblyGameTests {
         }
     }
 
+    private fun obstructProtectedSource(manager: PhysicsPropManager, helper: GameTestHelper, id: UUID, position: BlockPos) {
+        val permit = manager.javaClass.getDeclaredField("conversionWritePermit").apply { isAccessible = true }
+        permit.set(manager, id to (helper.level.physicsDimensionId().value to position))
+        helper.assertTrue(helper.level.setBlock(position, Blocks.DIRT.defaultBlockState(), 3), "could not inject source obstruction")
+    }
+
     @GameTest(maxTicks = 1200)
     fun linkedPropReloadWaitsForMissingAssemblyTerrain(helper: GameTestHelper) = checkLinkedReload(helper, 0)
 
@@ -670,9 +676,14 @@ class AssemblyGameTests {
         helper.level.getChunkAt(origin)
         helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
         helper.level.setBlock(origin.east(), Blocks.OAK_STAIRS.defaultBlockState(), 3)
+        val manager = PhysicsServices.runtime(helper.level.server)!!.manager
         net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents.BEFORE.register { level, _, position, _, _ ->
             if (level === helper.level && position == origin.east()) {
-                level.setBlock(position, Blocks.DIRT.defaultBlockState(), 3)
+                val field = manager.javaClass.getDeclaredField("conversionLocks").apply { isAccessible = true }
+                @Suppress("UNCHECKED_CAST")
+                val locks = field.get(manager) as Map<Pair<String, BlockPos>, UUID>
+                val id = locks.getValue(level.physicsDimensionId().value to position)
+                obstructProtectedSource(manager, helper, id, position)
             }
             true
         }
@@ -683,6 +694,51 @@ class AssemblyGameTests {
         helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE), "removed source block was not restored")
         helper.assertTrue(helper.level.getBlockState(origin.east()).`is`(Blocks.DIRT), "rollback overwrote the changed block")
         helper.succeed()
+    }
+
+    @GameTest
+    fun rejectedOrThrowingBreakCallbackReleasesSourceFence(helper: GameTestHelper) {
+        val origin = BlockPos(50128, 4, 0)
+        val throwing = origin.east(2)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        helper.level.setBlock(throwing, Blocks.STONE.defaultBlockState(), 3)
+        net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents.BEFORE.register { level, _, position, _, _ ->
+            if (level === helper.level && position == throwing) throw IllegalStateException("injected callback failure")
+            level !== helper.level || position != origin
+        }
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        helper.assertTrue(TumbleApi.convertAssembly(helper.level, listOf(origin), player) == null, "denied conversion was accepted")
+        helper.assertTrue(helper.level.setBlock(origin, Blocks.DIRT.defaultBlockState(), 3), "denial left the source locked")
+        val threw = try {
+            TumbleApi.convertAssembly(helper.level, listOf(throwing), player)
+            false
+        } catch (_: IllegalStateException) { true }
+        helper.assertTrue(threw, "callback exception was not propagated")
+        helper.assertTrue(helper.level.setBlock(throwing, Blocks.DIRT.defaultBlockState(), 3), "exception left the source locked")
+        helper.succeed()
+    }
+
+    @GameTest
+    fun pendingAssemblyProtectsItsSourceUntilCheckpoint(helper: GameTestHelper) {
+        val origin = BlockPos(50000, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val id = TumbleApi.convertAssembly(helper.level, listOf(origin), player)
+            ?: return helper.fail("could not start assembly conversion")
+        helper.assertTrue(!helper.level.setBlock(origin, Blocks.DIRT.defaultBlockState(), 3), "pending source accepted a replacement")
+        helper.assertTrue(!helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3), "pending source accepted an identical replacement")
+        helper.assertTrue(helper.level.getBlockState(origin).isAir, "pending source was changed")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
+            helper.assertTrue(helper.level.setBlock(origin, Blocks.DIRT.defaultBlockState(), 3), "completed source stayed locked")
+        }
     }
 
     @GameTest
@@ -783,7 +839,7 @@ class AssemblyGameTests {
         val body = created ?: return helper.fail("physics worker did not create the test body")
         helper.assertTrue(acknowledgements.remove(body), "could not intercept the acknowledgement")
         runtime.service.submit(PhysicsCommand.DestroyBody(body.dimension, body.bodyId))
-        helper.level.setBlock(origin.east(), Blocks.DIRT.defaultBlockState(), 3)
+        obstructProtectedSource(runtime.manager, helper, id, origin.east())
         acknowledgements.add(PhysicsAcknowledgement.BodyCreationFailed(id, "injected assembly failure", body.requestId))
         runtime.manager.tick()
         helper.assertTrue(helper.level.getBlockState(origin.east()).`is`(Blocks.DIRT), "rollback overwrote the obstruction")
@@ -823,7 +879,7 @@ class AssemblyGameTests {
         val body = created ?: return helper.fail("physics worker did not create the test body")
         helper.assertTrue(acknowledgements.remove(body), "could not intercept the acknowledgement")
         runtime.service.submit(PhysicsCommand.DestroyBody(body.dimension, body.bodyId))
-        helper.level.setBlock(origin.east(), Blocks.DIRT.defaultBlockState(), 3)
+        obstructProtectedSource(runtime.manager, helper, id, origin.east())
         acknowledgements.add(PhysicsAcknowledgement.BodyCreationFailed(id, "injected assembly failure", body.requestId))
         runtime.manager.tick()
         val propsField = runtime.manager.javaClass.getDeclaredField("props")

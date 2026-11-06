@@ -14,9 +14,15 @@ import java.util.UUID
 import java.util.zip.CRC32
 import net.minecraft.core.BlockPos
 
-internal data class AssemblyRecoveryRecord(val dimension: String, val origin: BlockPos, val definition: AssemblyDefinition) {
+internal data class AssemblyRecoveryRecord(
+    val dimension: String,
+    val origin: BlockPos,
+    val definition: AssemblyDefinition,
+    val fenced: Boolean = false
+) {
     fun encode(): ByteArray = JsonObject().apply {
         addProperty("dimension", dimension)
+        addProperty("fenced", fenced)
         add("origin", BlockPos.CODEC.encodeStart(JsonOps.INSTANCE, origin).result().orElseThrow())
         add("definition", AssemblyDefinition.CODEC.encodeStart(JsonOps.INSTANCE, definition).result().orElseThrow())
     }.toString().toByteArray(Charsets.UTF_8)
@@ -29,7 +35,8 @@ internal data class AssemblyRecoveryRecord(val dimension: String, val origin: Bl
             return AssemblyRecoveryRecord(
                 dimension,
                 BlockPos.CODEC.parse(JsonOps.INSTANCE, json.get("origin")).result().orElseThrow(),
-                AssemblyDefinition.CODEC.parse(JsonOps.INSTANCE, json.get("definition")).result().orElseThrow()
+                AssemblyDefinition.CODEC.parse(JsonOps.INSTANCE, json.get("definition")).result().orElseThrow(),
+                json.get("fenced")?.asBoolean ?: false
             )
         }
     }
