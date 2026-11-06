@@ -103,6 +103,7 @@ class PhysicsPropManager(
     private val toolConnections = mutableSetOf<WeldKey>()
     private val confirmedToolConnections = mutableSetOf<WeldKey>()
     private val pendingConnections = mutableMapOf<UUID, PendingConnection>()
+    private val preparedConnections = mutableMapOf<UUID, PreparedConnectionCheckpoint>()
     private val pendingBlockPlacements = mutableSetOf<UUID>()
     private val weldHistoryByPlayer = mutableMapOf<UUID, java.util.ArrayDeque<WeldKey>>()
     private val lastPhysicsGunControlTick = mutableMapOf<UUID, Long>()
@@ -950,6 +951,7 @@ class PhysicsPropManager(
         val cancelled = pendingConnections.filterValues(predicate)
         cancelled.forEach { (request, pending) ->
             service.submit(PhysicsCommand.CancelConnectionPreparation(pending.dimension, request))
+            releasePreparedConnection(request)
             pendingConnections.remove(request)
         }
     }
@@ -993,6 +995,7 @@ class PhysicsPropManager(
         pendingConnections.filterValues { it.first in members || it.second in members }.toList().forEach { (id, pending) ->
             if (pending.record == null) failConnection(id, pending)
             else {
+                releasePreparedConnection(id)
                 pendingConnections.remove(id)
                 service.submit(PhysicsCommand.CancelConnectionPreparation(pending.dimension, id))
             }
@@ -2289,6 +2292,7 @@ class PhysicsPropManager(
             return
         }
         service.submit(PhysicsCommand.CancelConnectionPreparation(pending.dimension, requestId))
+        releasePreparedConnection(requestId)
         pendingConnections.remove(requestId)
         if (pending.weld) {
             activeWelds.remove(pending.key)
@@ -2303,9 +2307,19 @@ class PhysicsPropManager(
         }
     }
 
+    private fun releasePreparedConnection(id: UUID) {
+        preparedConnections.remove(id)?.let { prepared ->
+            prepared.chunks.asReversed().forEach { RecoveryChunkTickets.release(prepared.level, it) }
+        }
+    }
+
     private fun drainAcknowledgements() {
         while (true) {
-            when (val acknowledgement = service.pollAcknowledgement() ?: return) {
+            val ready = preparedConnections.values.firstOrNull { prepared ->
+                prepared.members.any { (id, prop) -> props[id] !== prop || prop.isRemoved } ||
+                    prepared.chunks.all { prepared.level.areEntitiesActuallyLoadedAndTicking(it) }
+            }
+            when (val acknowledgement = ready?.acknowledgement ?: service.pollAcknowledgement() ?: return) {
                 is PhysicsAcknowledgement.ComponentStaged -> {
                     val group = restoreGroups[acknowledgement.token] ?: continue
                     group.bodies = acknowledgement.bodies
@@ -2400,17 +2414,44 @@ class PhysicsPropManager(
                     val checkpoint = snapshots.map { (id, snapshot) -> snapshot.toDurableState(id) }
                     val record = DurableConnection(acknowledgement.requestId, pending.dimension.value, pending.first,
                         pending.second, pending.playerId, pending.kind, frames, pending.ropeLength, false, checkpoint, passengerSafe = true)
+                    val prepared = preparedConnections[acknowledgement.requestId] ?: run {
+                        val participants = members.associateWith { props.getValue(it) }
+                        val chunks = snapshots.flatMap { (id, snapshot) ->
+                            val position = snapshot.transform.position
+                            val current = participants.getValue(id).blockPosition()
+                            val saved = BlockPos.containing(position.x, position.y, position.z)
+                            listOf(ChunkPos(current.x shr 4, current.z shr 4), ChunkPos(saved.x shr 4, saved.z shr 4))
+                        }.distinct()
+                        val acquired = mutableListOf<ChunkPos>()
+                        try {
+                            chunks.forEach { chunk -> RecoveryChunkTickets.acquire(level, chunk); acquired += chunk }
+                            PreparedConnectionCheckpoint(acknowledgement, level, participants, chunks).also {
+                                preparedConnections[acknowledgement.requestId] = it
+                            }
+                        } catch (error: Exception) {
+                            acquired.asReversed().forEach { RecoveryChunkTickets.release(level, it) }
+                            logger.error("Could not hold connection endpoint chunks", error)
+                            failConnection(acknowledgement.requestId, pending)
+                            continue
+                        }
+                    }
+                    if (!prepared.chunks.all { level.areEntitiesActuallyLoadedAndTicking(it) }) continue
+                    val participants = prepared.members
                     try {
                         val failures = PhysicsServices.chunkIoFailureCount(server)
                         check(failures == 0L) { "A chunk I/O failure occurred before connection checkpoint" }
-                        snapshots.forEach { (id, snapshot) -> props.getValue(id).let { it.applySnapshot(it.lastAppliedStep + 1, snapshot) } }
+                        snapshots.forEach { (id, snapshot) -> participants.getValue(id).let { it.applySnapshot(it.lastAppliedStep + 1, snapshot) } }
                         level.save(null, true, false)
                         check(PhysicsServices.chunkIoFailureCount(server) == failures) { "Connection endpoint checkpoint failed" }
                         val changed = members.mapNotNull { id ->
                             val prop = props[id]
                             when {
                                 prop == null -> "$id missing"
-                                prop.isRemoved -> "$id removed"
+                                prop !== participants[id] -> "$id replaced"
+                                prop.isRemoved -> "$id removed (${prop.removalReason})"
+                                prop.runtimeBodyId != snapshots[id]?.bodyId -> "$id body changed"
+                                prop.position() != net.minecraft.world.phys.Vec3(snapshots.getValue(id).transform.position.x,
+                                    snapshots.getValue(id).transform.position.y, snapshots.getValue(id).transform.position.z) -> "$id moved"
                                 prop.level() !== level -> "$id changed level"
                                 prop.isPassenger -> "$id is a passenger"
                                 prop.passengers.isNotEmpty() -> "$id carries passengers"
@@ -2428,6 +2469,8 @@ class PhysicsPropManager(
                     } catch (error: Exception) {
                         logger.error("Could not persist connection endpoint checkpoint; keeping bodies parked", error)
                         continue
+                    } finally {
+                        releasePreparedConnection(acknowledgement.requestId)
                     }
                     if (!service.submit(PhysicsCommand.InstallPreparedConnection(pending.dimension, pending.bodyA, pending.bodyB,
                             acknowledgement.requestId, pending.kind, frames, pending.ropeLength))) {
@@ -2611,6 +2654,13 @@ private data class RestoreGroup(
 )
 
 private data class ParkingGroup(val level: ServerLevel, val members: Set<UUID>, val snapshotMembers: Set<UUID>)
+
+private data class PreparedConnectionCheckpoint(
+    val acknowledgement: PhysicsAcknowledgement.ConnectionPrepared,
+    val level: ServerLevel,
+    val members: Map<UUID, PhysicsPropEntity>,
+    val chunks: List<ChunkPos>
+)
 
 private data class PendingConnection(
     val key: WeldKey,

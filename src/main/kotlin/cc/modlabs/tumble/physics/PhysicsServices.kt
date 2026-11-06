@@ -53,6 +53,7 @@ object PhysicsServices {
     }
 
     fun stopped(server: MinecraftServer) {
+        RecoveryChunkTickets.stopped(server)
         chunkIoFailures.remove(server)
     }
 
