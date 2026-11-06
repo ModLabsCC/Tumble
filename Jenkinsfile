@@ -35,6 +35,19 @@ pipeline {
                 sh './gradlew runProductionGameTest -PacceptMinecraftEula=true --no-daemon --stacktrace'
             }
         }
+        stage('Assembly restart GameTests') {
+            steps {
+                sh './gradlew runAssemblyRestartTest -PacceptMinecraftEula=true --no-daemon --stacktrace'
+            }
+        }
+        stage('Assembly crash GameTests') {
+            steps {
+                sh 'python3 scripts/test_assembly_crash.py'
+                sh 'python3 scripts/test_assembly_crash.py --order prepare'
+                sh 'python3 scripts/test_assembly_crash.py --order block'
+                sh 'python3 scripts/test_assembly_crash.py --order entity'
+            }
+        }
         stage('Physics benchmark') {
             steps {
                 sh './gradlew :physics-core:benchmark --no-daemon --stacktrace'

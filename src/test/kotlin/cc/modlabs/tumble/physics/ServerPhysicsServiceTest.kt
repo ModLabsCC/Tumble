@@ -67,6 +67,28 @@ class ServerPhysicsServiceTest {
     }
 
     @Test
+    fun `suspension takes effect before a step despite queued terrain commands`() {
+        val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
+        val dimension = PhysicsDimensionId("test:suspend-backlog")
+        service.start()
+        try {
+            service.submit(PhysicsCommand.SpawnBody(UUID.randomUUID(), dimension, bodyDefinition()))
+            var created: PhysicsAcknowledgement.BodyCreated? = null
+            waitUntil { (service.pollAcknowledgement() as? PhysicsAcknowledgement.BodyCreated)?.let { created = it }; created != null }
+            val body = requireNotNull(created).bodyId
+            waitUntil { service.latestFrame(dimension).bodies.containsKey(body) }
+            repeat(5000) { service.submit(PhysicsCommand.RemoveTerrainSection(dimension, PhysicsSectionPosition(it, 0, 0))) }
+            service.submit(PhysicsCommand.SuspendBody(dimension, body))
+            val step = service.latestFrame(dimension).physicsStep
+            waitUntil { service.latestFrame(dimension).physicsStep > step }
+            assertTrue(service.latestFrame(dimension).bodies[body]?.suspended == true,
+                "body continued stepping while its suspension waited behind terrain commands")
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
     fun `a queued spawn is suspended before its first published frame`() {
         val service = ServerPhysicsService(LoggerFactory.getLogger("tumble-test"))
         val dimension = PhysicsDimensionId("test:spawn-before-suspend")

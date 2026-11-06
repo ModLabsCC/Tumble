@@ -14,6 +14,19 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(LevelChunk.class)
 abstract class LevelChunkMixin {
+    @Inject(method = "setBlockState", at = @At("HEAD"), cancellable = true)
+    private void tumble$protectConversionSources(
+        BlockPos position,
+        BlockState newState,
+        int flags,
+        CallbackInfoReturnable<BlockState> callback
+    ) {
+        Level level = ((LevelChunk) (Object) this).getLevel();
+        if (level instanceof ServerLevel serverLevel && PhysicsServices.INSTANCE.conversionWriteBlocked(serverLevel, position, newState)) {
+            callback.setReturnValue(null);
+        }
+    }
+
     @Inject(method = "setBlockState", at = @At("RETURN"))
     private void tumble$markTerrainDirty(
         BlockPos position,

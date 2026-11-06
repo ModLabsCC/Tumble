@@ -1,0 +1,6 @@
+{
+  "required": true,
+  "package": "cc.modlabs.tumble.gametest.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "mixins": ["AssemblyJournalCrashMixin"]
+}

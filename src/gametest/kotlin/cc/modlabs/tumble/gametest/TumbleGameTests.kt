@@ -198,6 +198,10 @@ class TumbleGameTests {
         var checkpoint = 0L
         var oldBody = 0L
         var releaseY = 0.0
+        var invalidatedOnRecreation = false
+        val cacheField = runtime.manager.javaClass.getDeclaredField("submersionByProp").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val waterCache = cacheField.get(runtime.manager) as Map<java.util.UUID, Float>
         helper.succeedWhen {
             Thread.sleep(5)
             val networkProp = runtime.manager.networkProps().firstOrNull { it.propId == prop.uuid }
@@ -206,18 +210,28 @@ class TumbleGameTests {
             when (phase) {
                 0 -> {
                     helper.assertTrue(runtime.manager.usePhysicsGunSecondary(player, prop, false), "could not freeze prop")
+                    helper.assertTrue(runtime.service.submit(PhysicsCommand.SetTransform(
+                        networkProp.dimension, networkProp.bodyId, PhysicsTransform(PhysicsVector(baseX + 1.5, 2.0, 1.5))
+                    )), "could not reset the frozen prop")
                     oldBody = networkProp.bodyId.value
                     checkpoint = step
                     phase = 1
                 }
                 1 -> if (step - checkpoint >= 60) {
+                    helper.assertTrue(MinecraftTerrainAdapter.submersion(helper.level, prop.boundingBox) == 1f,
+                        "frozen prop did not settle fully underwater: y=${prop.y}")
+                    helper.assertTrue(waterCache[prop.uuid] == 1f, "water state was not cached before recreation")
                     repeat(4) { runtime.manager.cycleToolGunMode(player, 1) }
                     helper.assertTrue(runtime.manager.useToolGun(player, prop) == ToolGunResult.APPLIED, "could not change preset")
+                    invalidatedOnRecreation = prop.uuid !in waterCache
                     phase = 2
                 }
-                2 -> if (networkProp.bodyId.value != oldBody) {
-                    checkpoint = step
-                    phase = 3
+                2 -> {
+                    helper.assertTrue(invalidatedOnRecreation, "old body's water state survived recreation")
+                    if (networkProp.bodyId.value != oldBody) {
+                        checkpoint = step
+                        phase = 3
+                    }
                 }
                 3 -> if (step - checkpoint >= 60) {
                     player.setItemSlot(EquipmentSlot.MAINHAND, ItemStack(TumbleItems.PHYSICS_GUN))
@@ -228,7 +242,10 @@ class TumbleGameTests {
                     phase = 4
                 }
                 4 -> if (step - checkpoint >= 120) {
-                    helper.assertTrue(prop.y > releaseY + 0.5, "recreated prop did not float")
+                    helper.assertTrue(prop.y > releaseY + 0.5,
+                        "recreated prop did not float: releaseY=$releaseY, y=${prop.y}, " +
+                            "water=${MinecraftTerrainAdapter.submersion(helper.level, prop.boundingBox)}, " +
+                            "snapshot=${runtime.service.latestFrame(networkProp.dimension).bodies[networkProp.bodyId]}")
                     return@succeedWhen
                 }
             }

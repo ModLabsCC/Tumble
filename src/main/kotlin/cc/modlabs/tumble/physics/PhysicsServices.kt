@@ -2,6 +2,8 @@
 package cc.modlabs.tumble.physics
 
 import java.util.IdentityHashMap
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicLong
 import java.util.UUID
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.core.BlockPos
@@ -22,7 +24,8 @@ import net.minecraft.sounds.SoundSource
 import org.slf4j.Logger
 
 object PhysicsServices {
-    private val runtimes = IdentityHashMap<MinecraftServer, Runtime>()
+    private val runtimes = Collections.synchronizedMap(IdentityHashMap<MinecraftServer, Runtime>())
+    private val chunkIoFailures = Collections.synchronizedMap(IdentityHashMap<MinecraftServer, AtomicLong>())
     private val placementCapture = ThreadLocal<PlacementCapture?>()
     private val pistonCapture = ThreadLocal<PistonCapture?>()
 
@@ -47,6 +50,10 @@ object PhysicsServices {
         }
     }
 
+    fun stopped(server: MinecraftServer) {
+        chunkIoFailures.remove(server)
+    }
+
     fun levelLoaded(server: MinecraftServer, level: ServerLevel) {
         runtimes[server]?.service?.submit(PhysicsCommand.CreateDimension(level.physicsDimensionId()))
     }
@@ -54,6 +61,19 @@ object PhysicsServices {
     fun levelUnloaded(server: MinecraftServer, level: ServerLevel) {
         runtimes[server]?.service?.submit(PhysicsCommand.RemoveDimension(level.physicsDimensionId()))
     }
+
+    fun recoverConversions(server: MinecraftServer) {
+        runtimes[server]?.manager?.recoverConversions()
+    }
+
+    fun chunkIoFailed(server: MinecraftServer) {
+        synchronized(chunkIoFailures) { chunkIoFailures.getOrPut(server) { AtomicLong() } }.incrementAndGet()
+    }
+
+    internal fun chunkIoFailureCount(server: MinecraftServer): Long = chunkIoFailures[server]?.get() ?: 0L
+
+    fun conversionWriteBlocked(level: ServerLevel, position: BlockPos, state: BlockState): Boolean =
+        runtimes[level.server]?.manager?.conversionWriteBlocked(level, position, state) ?: false
 
     fun entityLoaded(entity: Entity, level: ServerLevel) {
         runtimes[level.server]?.manager?.let { manager ->

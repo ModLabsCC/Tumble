@@ -17,6 +17,7 @@ import cc.modlabs.tumble.physics.PhysicsShapeDefinition
 import cc.modlabs.tumble.physics.PhysicsTransform
 import cc.modlabs.tumble.physics.PhysicsVector
 import java.util.UUID
+import java.nio.file.Path
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.server.MinecraftServer
@@ -33,6 +34,7 @@ import net.minecraft.world.item.BlockItem
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.level.Level
 import net.minecraft.world.level.ChunkPos
+import net.minecraft.world.level.storage.LevelResource
 import net.minecraft.world.level.block.Block
 import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.state.BlockState
@@ -67,7 +69,8 @@ class PhysicsPropManager(
     private val service: ServerPhysicsService,
     private val terrain: TerrainSectionTracker,
     private val logger: Logger,
-    private val tuning: TumbleTuning
+    private val tuning: TumbleTuning,
+    journalDirectory: Path = server.getWorldPath(LevelResource.ROOT).resolve("tumble-assembly-journal")
 ) {
     private val journal = DurableConnectionJournal(server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT).resolve("data/tumble_connections.dat"))
     private val props = mutableMapOf<UUID, PhysicsPropEntity>()
@@ -104,6 +107,12 @@ class PhysicsPropManager(
     private val launchedProps = mutableMapOf<UUID, LaunchedProp>()
     private val pendingPhysicsGunHolds = mutableMapOf<UUID, UUID>()
     private val pendingConversions = mutableMapOf<UUID, List<ConvertedBlock>>()
+    private val conversionJournal = AssemblyConversionJournal(journalDirectory)
+    private val journalRecords = conversionJournal.pending().toMutableMap()
+    private val recoveryRecords = journalRecords.mapValuesTo(mutableMapOf()) { AssemblyRecoveryRecord.decode(it.value.payload) }
+    private val journalFailureEpoch = recoveryRecords.keys.associateWithTo(mutableMapOf()) { 0L }
+    private val conversionLocks = mutableMapOf<Pair<String, BlockPos>, UUID>()
+    private var conversionWritePermit: Pair<UUID, Pair<String, BlockPos>>? = null
     private val failedAssemblyConversions = linkedSetOf<UUID>()
     private val pendingItemConversions = mutableMapOf<UUID, ConvertedItem>()
     private val pendingPlacedBlocks = linkedSetOf<PendingPlacedBlock>()
@@ -121,6 +130,7 @@ class PhysicsPropManager(
         private set
 
     init {
+        recoveryRecords.forEach { (id, record) -> lockConversion(id, record) }
         submitNativeTuning()
     }
 
@@ -166,12 +176,17 @@ class PhysicsPropManager(
     }
 
     internal fun convertAssembly(level: ServerLevel, positions: List<BlockPos>, player: ServerPlayer, allowRemote: Boolean = false): PhysicsPropEntity? {
-        if (!service.isRunning() || player.level() !== level || !player.isAlive || player.isSpectator || !player.mayBuild() || !canSpawn() ||
-            positions.isEmpty() || positions.size > AssemblyDefinition.MAX_BLOCKS || positions.toSet().size != positions.size
+        if (!service.isRunning() || PhysicsServices.chunkIoFailureCount(server) != 0L ||
+            player.level() !== level || !player.isAlive || player.isSpectator || !player.mayBuild() || !canSpawn() ||
+            positions.isEmpty() || positions.size > AssemblyDefinition.MAX_BLOCKS
         ) return null
-        val origin = positions.first().immutable()
+        val selected = positions.map { it.immutable() }
+        if (selected.isEmpty() || selected.size > AssemblyDefinition.MAX_BLOCKS || selected.toSet().size != selected.size ||
+            selected.any { (level.physicsDimensionId().value to it) in conversionLocks }
+        ) return null
+        val origin = selected.first()
         if (player.distanceToSqr(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5) > PHYSICS_GUN_REACH_SQUARED) return null
-        val remaining = positions.mapTo(mutableSetOf()) { it.immutable() }
+        val remaining = selected.toMutableSet()
         val queue = ArrayDeque<BlockPos>()
         queue.add(origin)
         remaining.remove(origin)
@@ -184,6 +199,24 @@ class PhysicsPropManager(
         }
         if (remaining.isNotEmpty()) return null
 
+        val conversionId = UUID.randomUUID()
+        val keys = selected.map { level.physicsDimensionId().value to it }
+        keys.forEach { conversionLocks[it] = conversionId }
+        return try {
+            convertAssemblyLocked(level, selected, player, allowRemote, origin, conversionId)
+        } finally {
+            if (conversionId !in recoveryRecords) keys.forEach { conversionLocks.remove(it, conversionId) }
+        }
+    }
+
+    private fun convertAssemblyLocked(
+        level: ServerLevel,
+        positions: List<BlockPos>,
+        player: ServerPlayer,
+        allowRemote: Boolean,
+        origin: BlockPos,
+        conversionId: UUID
+    ): PhysicsPropEntity? {
         val captured = ArrayList<ConvertedBlock>(positions.size)
         positions.forEach { position ->
             if (!level.isInWorldBounds(position) || !level.chunkSource.hasChunk(position.x shr 4, position.z shr 4) ||
@@ -205,34 +238,194 @@ class PhysicsPropManager(
             logger.debug("Cannot capture assembly: {}", error.message)
             return null
         }
-        val removed = ArrayList<ConvertedBlock>(captured.size)
-        captured.forEach { block ->
-            if (!level.setBlock(block.position, Blocks.AIR.defaultBlockState(), CONVERSION_FLAGS)) {
-                restoreBlocks(removed)
-                return null
-            }
-            removed += block
-        }
-        terrain.primeForPositions(level, positions)
         val entity = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level).apply {
+            setUUID(conversionId)
             setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
             initializeAssembly(structure)
+            recoveryOrigin = origin
         }
-        skipTerrainPrime += entity.uuid
+        val record = AssemblyRecoveryRecord(level.physicsDimensionId().value, origin, structure.definition, fenced = true)
+        try {
+            conversionJournal.prepare(entity.uuid, record.encode())
+        } catch (error: Exception) {
+            logger.error("Could not journal assembly conversion at {}", origin, error)
+            return null
+        }
+        if (PhysicsServices.chunkIoFailureCount(server) != 0L) {
+            conversionJournal.complete(entity.uuid)
+            return null
+        }
+        recoveryRecords[entity.uuid] = record
+        journalFailureEpoch[entity.uuid] = 0L
+        lockConversion(entity.uuid, record)
+        try {
+            conversionJournal.markStarted(entity.uuid)
+        } catch (error: Exception) {
+            server.halt(false)
+            throw error
+        }
+        journalRecords[entity.uuid] = AssemblyConversionJournal.Pending(record.encode(), true)
         if (!level.addFreshEntity(entity)) {
-            skipTerrainPrime.remove(entity.uuid)
-            restoreBlocks(removed)
+            conversionJournal.complete(entity.uuid)
+            recoveryRecords.remove(entity.uuid)
+            journalRecords.remove(entity.uuid)
+            journalFailureEpoch.remove(entity.uuid)
+            unlockConversion(entity.uuid, record)
             return null
         }
         entityLoaded(entity, level)
-        if (!entity.physicsPending && entity.runtimeBodyId == null) {
-            entityUnloaded(entity, level)
-            entity.discard()
-            restoreBlocks(removed)
+        failedAssemblyConversions.remove(entity.uuid)
+        val removed = ArrayList<ConvertedBlock>(captured.size)
+        var removalFailed = false
+        try {
+            for (block in captured) {
+                if (level.getBlockState(block.position) != block.state) {
+                    removalFailed = true
+                    break
+                }
+                removed += block
+                if (!setConversionBlock(block, Blocks.AIR.defaultBlockState(), entity.uuid)) {
+                    removalFailed = true
+                    break
+                }
+            }
+            if (!removalFailed) {
+                terrain.primeForPositions(level, positions)
+                activateEntity(entity, level)
+            }
+        } catch (error: Exception) {
+            logger.error("Failed to convert assembly at {}", origin, error)
+            removalFailed = true
+        }
+        if (removalFailed || !entity.physicsPending && entity.runtimeBodyId == null) {
+            abortAssemblyConversion(entity, level, removed)
             return null
         }
-        pendingConversions[entity.uuid] = captured
         return entity
+    }
+
+    private fun abortAssemblyConversion(entity: PhysicsPropEntity, level: ServerLevel, removed: List<ConvertedBlock>) {
+        pendingConversions[entity.uuid] = removed.toList()
+        retainFailedAssembly(entity)
+        if (rollbackPendingConversion(entity.uuid)) {
+            entityUnloaded(entity, level)
+            entity.discard()
+            checkpointConversion(entity.uuid, level)
+        }
+    }
+
+    private fun lockConversion(id: UUID, record: AssemblyRecoveryRecord) {
+        record.definition.blocks.forEach {
+            val key = record.dimension to record.origin.offset(it.offset)
+            val previous = conversionLocks.putIfAbsent(key, id)
+            check(previous == null || previous == id) { "Overlapping assembly recovery journals" }
+        }
+    }
+
+    private fun unlockConversion(id: UUID, record: AssemblyRecoveryRecord) {
+        record.definition.blocks.forEach { conversionLocks.remove(record.dimension to record.origin.offset(it.offset), id) }
+    }
+
+    fun conversionWriteBlocked(level: ServerLevel, position: BlockPos, state: BlockState): Boolean {
+        if (conversionLocks.isEmpty()) return false
+        val key = level.physicsDimensionId().value to position
+        val owner = conversionLocks[key] ?: return false
+        if (conversionWritePermit == (owner to key)) {
+            conversionWritePermit = null
+            return false
+        }
+        val record = recoveryRecords[owner] ?: return true
+        val expected = record.definition.blocks.firstOrNull { record.origin.offset(it.offset) == position }?.state ?: return true
+        val current = level.getBlockState(position)
+        if (state.isAir && !current.isAir && current != expected) return false
+        return true
+    }
+
+    private fun setConversionBlock(block: ConvertedBlock, state: BlockState, owner: UUID): Boolean {
+        check(conversionWritePermit == null)
+        conversionWritePermit = owner to (block.level.physicsDimensionId().value to block.position)
+        return try { block.level.setBlock(block.position, state, CONVERSION_FLAGS) }
+        finally { conversionWritePermit = null }
+    }
+
+    private fun checkpointConversion(id: UUID, level: ServerLevel) {
+        if (id !in recoveryRecords) return
+        try {
+            val failures = journalFailureEpoch.getValue(id)
+            check(PhysicsServices.chunkIoFailureCount(server) == failures) { "A chunk I/O failure occurred during assembly conversion $id; journal retained" }
+            level.save(null, true, false)
+            check(PhysicsServices.chunkIoFailureCount(server) == failures) { "Could not save assembly conversion $id; journal retained" }
+            conversionJournal.complete(id)
+            recoveryRecords.remove(id)?.let { unlockConversion(id, it) }
+            journalRecords.remove(id)
+            journalFailureEpoch.remove(id)
+        } catch (error: Exception) {
+            server.halt(false)
+            throw error
+        }
+    }
+
+    internal fun recoverConversions() {
+        for ((id, record) in recoveryRecords.toMap()) {
+            val level = server.allLevels.firstOrNull { it.physicsDimensionId().value == record.dimension }
+                ?: error("Missing dimension for assembly conversion $id")
+            val failures = PhysicsServices.chunkIoFailureCount(server)
+            check(failures == 0L) { "A chunk I/O failure occurred before assembly recovery $id" }
+            val chunks = record.definition.blocks.map {
+                val position = record.origin.offset(it.offset)
+                ChunkPos(position.x shr 4, position.z shr 4)
+            }.distinct()
+            val newlyForced = chunks.filter { !level.forceLoadedChunks.contains(it.pack()) }
+            try {
+                chunks.forEach { chunk ->
+                    level.setChunkForced(chunk.x, chunk.z, true)
+                    level.getChunk(chunk.x, chunk.z)
+                }
+                level.waitForEntities(ChunkPos(record.origin.x shr 4, record.origin.z shr 4), 0)
+                check(PhysicsServices.chunkIoFailureCount(server) == failures) { "Could not load chunks for assembly conversion $id" }
+                val found = level.getEntityInAnyDimension(id)
+                if (journalRecords.getValue(id).started.not()) {
+                    check(found == null && record.definition.blocks.all {
+                        level.getBlockState(record.origin.offset(it.offset)) == it.state
+                    }) { "Unstarted assembly conversion $id no longer matches its originals" }
+                    conversionJournal.complete(id)
+                    recoveryRecords.remove(id)
+                    journalRecords.remove(id)
+                    journalFailureEpoch.remove(id)
+                    unlockConversion(id, record)
+                    continue
+                }
+                if (found == null) {
+                    // shortcut: external teleports can move a pending entity elsewhere; fence movement before supporting them.
+                    check(restoreJournalBlocks(id, record, level)) { "Assembly recovery for $id is obstructed; journal retained" }
+                    checkpointConversion(id, level)
+                    continue
+                }
+                val entity = found as? PhysicsPropEntity
+                    ?: error("Entity for assembly conversion $id has the wrong type; journal retained")
+                check(entity.level() === level && entity.assembly?.definition?.blocks == record.definition.blocks) {
+                    "Assembly entity for $id does not match its journal"
+                }
+                check(restoreJournalBlocks(id, record, level)) { "Assembly recovery for $id is obstructed; journal retained" }
+                pendingConversions.remove(id)
+                entityUnloaded(entity, level)
+                entity.discard()
+                checkpointConversion(id, level)
+            } finally {
+                newlyForced.forEach { level.setChunkForced(it.x, it.z, false) }
+            }
+        }
+    }
+
+    private fun restoreJournalBlocks(id: UUID, record: AssemblyRecoveryRecord, level: ServerLevel): Boolean {
+        val blocks = record.definition.blocks.map {
+            ConvertedBlock(level, record.origin.offset(it.offset), it.state)
+        }.toMutableList()
+        if (record.fenced) {
+            if (blocks.any { block -> level.getBlockState(block.position).let { !it.isAir && it != block.state } }) return false
+            blocks.removeIf { level.getBlockState(it.position) == it.state }
+        }
+        return restoreBlocks(blocks, id)
     }
 
     fun usePhysicsGunSecondary(player: Player, prop: PhysicsPropEntity, changeToBlock: Boolean): Boolean {
@@ -629,6 +822,7 @@ class PhysicsPropManager(
         unloadedTerrainWaits.filter { it.level === level && it.propId == entity.uuid }.forEach { it.observedUnload = true }
         if (entity.assembly != null) assemblies[entity.uuid] = entity
         associations.register(entity.uuid)
+        recoveryRecords[entity.uuid]?.let { entity.recoveryOrigin = it.origin }
         val recoveryOrigin = entity.recoveryOrigin
         val recoveryStructure = entity.assembly
         if (recoveryOrigin != null && recoveryStructure != null) {
@@ -638,6 +832,10 @@ class PhysicsPropManager(
             failedAssemblyConversions += entity.uuid
             return
         }
+        activateEntity(entity, level)
+    }
+
+    private fun activateEntity(entity: PhysicsPropEntity, level: ServerLevel) {
         val records = activeConnections(level).filter { it.first == entity.uuid || it.second == entity.uuid }
         if (records.isNotEmpty()) {
             records.forEach { record ->
@@ -691,7 +889,9 @@ class PhysicsPropManager(
             reason != Entity.RemovalReason.CHANGED_DIMENSION && entity.assembly != null
         ) markConnectedTerrainWait(entity.uuid, terrain.coveredChunks(entity))
         if (visibilityEvent && reason != Entity.RemovalReason.KILLED && reason != Entity.RemovalReason.DISCARDED) {
-            pendingConversions.remove(entity.uuid)?.forEach(::notifyConvertedBlock)
+            pendingConversions.remove(entity.uuid)?.let { conversions ->
+                if (entity.recoveryOrigin == null) conversions.forEach(::notifyConvertedBlock)
+            }
             pendingItemConversions.remove(entity.uuid)
         } else {
             rollbackPendingConversion(entity.uuid)
@@ -981,6 +1181,7 @@ class PhysicsPropManager(
             val entity = props[id]
             if (entity != null && !entity.isRemoved && rollbackPendingConversion(id)) {
                 entity.discard()
+                checkpointConversion(id, entity.level() as ServerLevel)
             } else if (entity != null && !entity.isRemoved) failedAssemblyConversions += id
         }
         repeat(minOf(MAX_DEFERRED_ASSEMBLIES_PER_TICK, deferredTerrainProps.size)) {
@@ -1002,14 +1203,20 @@ class PhysicsPropManager(
             val level = entity.level() as? ServerLevel ?: return@repeat
             if (!service.isRunning()) {
                 entity.physicsPending = false
-                if (rollbackPendingConversion(id)) entity.discard()
+                if (rollbackPendingConversion(id)) {
+                    entity.discard()
+                    checkpointConversion(id, level)
+                }
                 else retainFailedAssembly(entity)
                 return@repeat
             }
             if (!terrain.primeForAssembly(level, entity)) {
                 if (service.isRunning()) deferredAssemblies.addLast(id) else {
                     entity.physicsPending = false
-                    if (rollbackPendingConversion(id)) entity.discard()
+                    if (rollbackPendingConversion(id)) {
+                        entity.discard()
+                        checkpointConversion(id, level)
+                    }
                     else retainFailedAssembly(entity)
                 }
             } else {
@@ -1334,8 +1541,15 @@ class PhysicsPropManager(
 
     private fun rollbackPendingConversion(propId: UUID): Boolean {
         pendingConversions[propId]?.let {
-            val restored = restoreBlocks(it)
+            val remaining = it.toMutableList()
+            if (recoveryRecords[propId]?.fenced == true) {
+                if (remaining.any { block -> !block.level.isInWorldBounds(block.position) ||
+                        !block.level.chunkSource.hasChunk(block.position.x shr 4, block.position.z shr 4) }) return false
+                remaining.removeIf { block -> block.level.getBlockState(block.position) == block.state }
+            }
+            val restored = restoreBlocks(remaining, propId.takeIf { it in recoveryRecords })
             if (restored || props[propId]?.assembly == null) pendingConversions.remove(propId)
+            else pendingConversions[propId] = remaining
             return restored
         }
         pendingItemConversions.remove(propId)?.let { return restoreItem(it) }
@@ -1343,28 +1557,26 @@ class PhysicsPropManager(
     }
 
     private fun retainFailedAssembly(entity: PhysicsPropEntity) {
-        val origin = pendingConversions[entity.uuid]?.firstOrNull()?.position ?: return
+        val origin = entity.recoveryOrigin ?: pendingConversions[entity.uuid]?.firstOrNull()?.position ?: return
         entity.recoveryOrigin = origin
         failedAssemblyConversions += entity.uuid
     }
 
-    private fun restoreBlock(conversion: ConvertedBlock): Boolean =
+    private fun restoreBlock(conversion: ConvertedBlock, owner: UUID? = null): Boolean =
         conversion.level.getBlockState(conversion.position).isAir &&
-            conversion.level.setBlock(conversion.position, conversion.state, CONVERSION_FLAGS)
+            if (owner == null) conversion.level.setBlock(conversion.position, conversion.state, CONVERSION_FLAGS)
+            else setConversionBlock(conversion, conversion.state, owner)
 
-    private fun restoreBlocks(conversions: List<ConvertedBlock>): Boolean {
+    private fun restoreBlocks(conversions: MutableList<ConvertedBlock>, owner: UUID? = null): Boolean {
         if (conversions.any {
                 !it.level.isInWorldBounds(it.position) ||
                     !it.level.chunkSource.hasChunk(it.position.x shr 4, it.position.z shr 4) ||
                     !it.level.getBlockState(it.position).isAir
             }) return false
-        val restored = ArrayList<ConvertedBlock>(conversions.size)
-        conversions.forEach { block ->
-            if (!restoreBlock(block)) {
-                restored.forEach { it.level.setBlock(it.position, Blocks.AIR.defaultBlockState(), CONVERSION_FLAGS) }
-                return false
-            }
-            restored += block
+        val iterator = conversions.iterator()
+        while (iterator.hasNext()) {
+            if (!restoreBlock(iterator.next(), owner)) return false
+            iterator.remove()
         }
         return true
     }
@@ -1918,6 +2130,8 @@ class PhysicsPropManager(
                     } else {
                         val converted = pendingConversions.remove(acknowledgement.propId)
                         pendingItemConversions.remove(acknowledgement.propId)
+                        entity.recoveryOrigin = null
+                        checkpointConversion(acknowledgement.propId, entity.level() as ServerLevel)
                         entity.runtimeBodyId = acknowledgement.bodyId
                         entity.physicsPending = false
                         bodyOwners[RuntimeBodyKey(acknowledgement.dimension, acknowledgement.bodyId)] =
@@ -1939,7 +2153,10 @@ class PhysicsPropManager(
                     pendingPhysicsGunHolds.remove(acknowledgement.propId)
                     val entity = props[acknowledgement.propId]
                     entity?.physicsPending = false
-                    if (rollbackPendingConversion(acknowledgement.propId)) entity?.discard()
+                    if (rollbackPendingConversion(acknowledgement.propId)) {
+                        entity?.discard()
+                        if (entity != null) checkpointConversion(entity.uuid, entity.level() as ServerLevel)
+                    }
                     else if (entity?.assembly != null && acknowledgement.propId in pendingConversions) {
                         retainFailedAssembly(entity)
                     }

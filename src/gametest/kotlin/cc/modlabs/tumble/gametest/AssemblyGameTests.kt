@@ -33,6 +33,7 @@ import cc.modlabs.tumble.network.AssemblyPayload
 import com.mojang.serialization.JsonOps
 import io.netty.buffer.Unpooled
 import java.util.UUID
+import java.nio.file.Files
 import java.util.concurrent.ConcurrentLinkedQueue
 import org.slf4j.LoggerFactory
 import net.fabricmc.fabric.api.gametest.v1.GameTest
@@ -51,6 +52,7 @@ import net.minecraft.server.level.ServerPlayer
 import net.minecraft.server.players.NameAndId
 import net.minecraft.world.level.storage.TagValueInput
 import net.minecraft.world.level.storage.TagValueOutput
+import net.minecraft.world.level.storage.LevelResource
 
 class AssemblyGameTests {
     @GameTest(maxTicks = 400)
@@ -280,6 +282,12 @@ class AssemblyGameTests {
             }
             helper.assertTrue(false, "waiting for unloaded-peer removal, phase=$phase")
         }
+    }
+
+    private fun obstructProtectedSource(manager: PhysicsPropManager, helper: GameTestHelper, id: UUID, position: BlockPos) {
+        val permit = manager.javaClass.getDeclaredField("conversionWritePermit").apply { isAccessible = true }
+        permit.set(manager, id to (helper.level.physicsDimensionId().value to position))
+        helper.assertTrue(helper.level.setBlock(position, Blocks.DIRT.defaultBlockState(), 3), "could not inject source obstruction")
     }
 
     @GameTest(maxTicks = 1200)
@@ -686,6 +694,126 @@ class AssemblyGameTests {
     }
 
     @GameTest
+    fun earlierChunkIoFailurePreventsNewAssemblyConversion(helper: GameTestHelper) {
+        val origin = BlockPos(50432, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val logger = LoggerFactory.getLogger("assembly-earlier-io-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        val directory = Files.createTempDirectory("tumble-earlier-io-test")
+        val journal = directory.resolve("journal")
+        val failuresField = PhysicsServices.javaClass.getDeclaredField("chunkIoFailures").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val failures = failuresField.get(PhysicsServices) as MutableMap<Any, Any>
+        val previous = failures.remove(helper.level.server)
+        try {
+            val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning(), journal)
+            PhysicsServices.chunkIoFailed(helper.level.server)
+            val method = manager.javaClass.declaredMethods.single { it.name.startsWith("convertAssembly") && it.parameterCount == 4 }
+            helper.assertTrue(method.invoke(manager, helper.level, listOf(origin), player, false) == null,
+                "conversion ignored an earlier chunk I/O failure")
+            helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE), "I/O failure consumed a source block")
+            helper.assertTrue(!Files.exists(journal), "refused conversion wrote a journal")
+            failures.remove(helper.level.server)
+            val during = origin.east()
+            helper.level.setBlock(during, Blocks.STONE.defaultBlockState(), 3)
+            net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents.BEFORE.register { level, _, position, _, _ ->
+                if (level === helper.level && position == during) PhysicsServices.chunkIoFailed(level.server)
+                true
+            }
+            helper.assertTrue(method.invoke(manager, helper.level, listOf(during), player, false) == null,
+                "conversion ignored a chunk I/O failure during validation")
+            helper.assertTrue(helper.level.getBlockState(during).`is`(Blocks.STONE), "validation-time I/O failure consumed a block")
+        } finally {
+            if (previous == null) failures.remove(helper.level.server) else failures[helper.level.server] = previous
+            service.close()
+            if (Files.isDirectory(journal)) {
+                Files.list(journal).use { files -> files.forEach { Files.delete(it) } }
+                Files.delete(journal)
+            }
+            Files.deleteIfExists(directory)
+        }
+        helper.succeed()
+    }
+
+    @GameTest
+    fun earlyChunkIoFailurePreventsJournalReplay(helper: GameTestHelper) {
+        val server = helper.level.server
+        val runtimesField = PhysicsServices.javaClass.getDeclaredField("runtimes").apply { isAccessible = true }
+        val failuresField = PhysicsServices.javaClass.getDeclaredField("chunkIoFailures").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val runtimes = runtimesField.get(PhysicsServices) as MutableMap<Any, Any>
+        @Suppress("UNCHECKED_CAST")
+        val failures = failuresField.get(PhysicsServices) as MutableMap<Any, Any>
+        val runtime = runtimes.remove(server) ?: return helper.fail("runtime missing")
+        val previousFailures = failures.remove(server)
+        val directory = Files.createTempDirectory("tumble-early-io-test")
+        val id = UUID.randomUUID()
+        val logger = LoggerFactory.getLogger("assembly-early-io-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        try {
+            PhysicsServices.chunkIoFailed(server)
+            runtimes[server] = runtime
+            val origin = BlockPos(50240, 4, 0)
+            val definition = AssemblyDefinition.of(listOf(AssemblyBlock(BlockPos.ZERO, Blocks.STONE.defaultBlockState())))
+            val recordClass = Class.forName("cc.modlabs.tumble.physics.AssemblyRecoveryRecord")
+            val record = recordClass.getConstructor(String::class.java, BlockPos::class.java, AssemblyDefinition::class.java, Boolean::class.javaPrimitiveType)
+                .newInstance(helper.level.physicsDimensionId().value, origin, definition, true)
+            val payload = recordClass.getMethod("encode").invoke(record) as ByteArray
+            val journalClass = Class.forName("cc.modlabs.tumble.physics.AssemblyConversionJournal")
+            val journal = journalClass.getConstructor(java.nio.file.Path::class.java).newInstance(directory)
+            journalClass.getMethod("prepare", UUID::class.java, ByteArray::class.java).invoke(journal, id, payload)
+            val manager = PhysicsPropManager(server, service, TerrainSectionTracker(service), logger, TumbleTuning(), directory)
+            val recover = manager.javaClass.declaredMethods.single { it.name.startsWith("recoverConversions") }
+            val blocked = try { recover.invoke(manager); false } catch (error: java.lang.reflect.InvocationTargetException) {
+                error.cause is IllegalStateException
+            }
+            helper.assertTrue(blocked, "recovery ignored a chunk I/O failure reported before runtime registration")
+            helper.assertTrue(Files.exists(directory.resolve("$id.journal")), "failed recovery deleted the journal")
+            PhysicsServices.stopped(server)
+            helper.assertTrue(server !in failures, "server stop retained its chunk I/O failure entry")
+        } finally {
+            runtimes[server] = runtime
+            if (previousFailures == null) failures.remove(server) else failures[server] = previousFailures
+            service.close()
+            Files.deleteIfExists(directory.resolve("$id.journal"))
+            Files.deleteIfExists(directory)
+        }
+        helper.succeed()
+    }
+
+    @GameTest
+    fun journalWriteFailureDoesNotRemoveBlocks(helper: GameTestHelper) {
+        val origin = BlockPos(2400, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val logger = LoggerFactory.getLogger("assembly-journal-write-failure-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        val directory = Files.createTempDirectory("tumble-journal-test")
+        val blocked = directory.resolve("journal")
+        try {
+            val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning(), blocked)
+            Files.writeString(blocked, "obstruction")
+            val method = manager.javaClass.declaredMethods.single { it.name.startsWith("convertAssembly") && it.parameterCount == 4 }
+            helper.assertTrue(method.invoke(manager, helper.level, listOf(origin), player, false) == null,
+                "conversion accepted a failed journal write")
+            helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE), "journal write failure removed a block")
+            helper.assertTrue(Files.readString(blocked) == "obstruction", "journal write overwrote another file")
+        } finally {
+            service.close()
+            Files.deleteIfExists(blocked)
+            Files.deleteIfExists(directory)
+        }
+        helper.succeed()
+    }
+
+    @GameTest
     fun stoppedPhysicsServiceDoesNotConsumeAssemblyBlocks(helper: GameTestHelper) {
         val origin = BlockPos(1472, 4, 0)
         helper.level.setChunkForced(origin.x shr 4, 0, true)
@@ -775,6 +903,173 @@ class AssemblyGameTests {
     }
 
     @GameTest
+    fun interruptedRemovalRestoresOnlyBlocksActuallyRemoved(helper: GameTestHelper) {
+        val origin = BlockPos(2336, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        helper.level.setBlock(origin.east(), Blocks.OAK_STAIRS.defaultBlockState(), 3)
+        val manager = PhysicsServices.runtime(helper.level.server)!!.manager
+        net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents.BEFORE.register { level, _, position, _, _ ->
+            if (level === helper.level && position == origin.east()) {
+                val field = manager.javaClass.getDeclaredField("conversionLocks").apply { isAccessible = true }
+                @Suppress("UNCHECKED_CAST")
+                val locks = field.get(manager) as Map<Pair<String, BlockPos>, UUID>
+                val id = locks.getValue(level.physicsDimensionId().value to position)
+                obstructProtectedSource(manager, helper, id, position)
+            }
+            true
+        }
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        helper.assertTrue(TumbleApi.convertAssembly(helper.level, listOf(origin, origin.east()), player) == null,
+            "conversion accepted a block that changed during capture")
+        helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE), "removed source block was not restored")
+        helper.assertTrue(helper.level.getBlockState(origin.east()).`is`(Blocks.DIRT), "rollback overwrote the changed block")
+        helper.succeed()
+    }
+
+    @GameTest
+    fun mutableInputPositionsCannotChangeTheCapturedSource(helper: GameTestHelper) {
+        val origin = BlockPos(50304, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val mutable = BlockPos.MutableBlockPos(origin.x, origin.y, origin.z)
+        net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents.BEFORE.register { level, _, position, _, _ ->
+            if (level === helper.level && position == origin) mutable.set(origin.x + 8, origin.y, origin.z)
+            true
+        }
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val id = TumbleApi.convertAssembly(helper.level, listOf(mutable), player)
+            ?: return helper.fail("mutable input changed the conversion")
+        helper.assertTrue(helper.level.getBlockState(origin).isAir, "conversion removed the wrong source")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
+            helper.assertTrue(helper.level.setBlock(origin, Blocks.DIRT.defaultBlockState(), 3), "mutable input left a stale source fence")
+        }
+    }
+
+    @GameTest
+    fun rejectedOrThrowingBreakCallbackReleasesSourceFence(helper: GameTestHelper) {
+        val origin = BlockPos(50128, 4, 0)
+        val throwing = origin.east(2)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        helper.level.setBlock(throwing, Blocks.STONE.defaultBlockState(), 3)
+        net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents.BEFORE.register { level, _, position, _, _ ->
+            if (level === helper.level && position == throwing) throw IllegalStateException("injected callback failure")
+            level !== helper.level || position != origin
+        }
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        helper.assertTrue(TumbleApi.convertAssembly(helper.level, listOf(origin), player) == null, "denied conversion was accepted")
+        helper.assertTrue(helper.level.setBlock(origin, Blocks.DIRT.defaultBlockState(), 3), "denial left the source locked")
+        val threw = try {
+            TumbleApi.convertAssembly(helper.level, listOf(throwing), player)
+            false
+        } catch (_: IllegalStateException) { true }
+        helper.assertTrue(threw, "callback exception was not propagated")
+        helper.assertTrue(helper.level.setBlock(throwing, Blocks.DIRT.defaultBlockState(), 3), "exception left the source locked")
+        helper.succeed()
+    }
+
+    @GameTest
+    fun pendingAssemblyProtectsItsSourceUntilCheckpoint(helper: GameTestHelper) {
+        val origin = BlockPos(50000, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val id = TumbleApi.convertAssembly(helper.level, listOf(origin), player)
+            ?: return helper.fail("could not start assembly conversion")
+        helper.assertTrue(!helper.level.setBlock(origin, Blocks.DIRT.defaultBlockState(), 3), "pending source accepted a replacement")
+        helper.assertTrue(!helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3), "pending source accepted an identical replacement")
+        helper.assertTrue(helper.level.getBlockState(origin).isAir, "pending source was changed")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
+            helper.assertTrue(helper.level.setBlock(origin, Blocks.DIRT.defaultBlockState(), 3), "completed source stayed locked")
+        }
+    }
+
+    @GameTest
+    fun pendingAssemblySavesRecoveryDataBeforeBodyCreation(helper: GameTestHelper) {
+        val origin = BlockPos(2272, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val id = TumbleApi.convertAssembly(helper.level, listOf(origin), player)
+            ?: return helper.fail("could not start assembly conversion")
+        val manager = PhysicsServices.runtime(helper.level.server)!!.manager
+        val field = manager.javaClass.getDeclaredField("props").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val entity = (field.get(manager) as Map<UUID, PhysicsPropEntity>)[id] ?: return helper.fail("assembly missing")
+        val saved = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, helper.level.registryAccess())
+        entity.saveWithoutId(saved)
+        val restored = TumbleEntities.PHYSICS_PROP.create(helper.level, EntitySpawnReason.COMMAND)
+            ?: return helper.fail("could not reload assembly")
+        restored.load(TagValueInput.create(ProblemReporter.DISCARDING, helper.level.registryAccess(), saved.buildResult()))
+        val recovery = restored.javaClass.getDeclaredField("recoveryOrigin").apply { isAccessible = true }
+        helper.assertTrue(recovery.get(restored) == origin, "pending assembly did not save its recovery origin")
+        val journal = helper.level.server.getWorldPath(LevelResource.ROOT).resolve("tumble-assembly-journal").resolve("$id.journal")
+        helper.assertTrue(Files.exists(journal), "pending assembly did not write its journal")
+        helper.succeedWhen {
+            Thread.sleep(5)
+            helper.assertTrue(TumbleApi.status(helper.level, id) == TumbleApi.PropStatus.READY, "assembly did not become ready")
+            helper.assertTrue(!Files.exists(journal), "completed assembly kept its journal")
+        }
+    }
+
+    @GameTest
+    fun matchingBlockDoesNotProveRecoveryIsComplete(helper: GameTestHelper) {
+        val origin = BlockPos(2208, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        val stone = Blocks.STONE.defaultBlockState()
+        val stairs = Blocks.OAK_STAIRS.defaultBlockState()
+        helper.level.setBlock(origin, stone, 3)
+        helper.level.setBlock(origin.east(), Blocks.AIR.defaultBlockState(), 3)
+        val definition = AssemblyDefinition.of(listOf(
+            AssemblyBlock(BlockPos.ZERO, stone), AssemblyBlock(BlockPos(1, 0, 0), stairs)
+        ))
+        val structure = AssemblyStructure.of(definition, listOf(
+            AssemblyCollisionBox(0, PhysicsBox(PhysicsVector(-0.5, -0.5, -0.5), PhysicsVector(0.5, 0.5, 0.5))),
+            AssemblyCollisionBox(1, PhysicsBox(PhysicsVector(0.5, -0.5, -0.5), PhysicsVector(1.5, 0.0, 0.5)))
+        ))
+        val entity = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
+        entity.setPos(origin.x + 0.5, origin.y + 0.5, origin.z + 0.5)
+        entity.initializeAssembly(structure)
+        val recovery = entity.javaClass.getDeclaredField("recoveryOrigin")
+        recovery.isAccessible = true
+        recovery.set(entity, origin)
+        val logger = LoggerFactory.getLogger("partial-assembly-recovery-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning())
+        try {
+            manager.entityLoaded(entity, helper.level)
+            manager.tick()
+            helper.assertTrue(helper.level.getBlockState(origin) == stone && helper.level.getBlockState(origin.east()).isAir,
+                "recovery treated a matching block as proof of restoration")
+            helper.assertTrue(!entity.isRemoved, "ambiguous recovery entity was discarded")
+            helper.level.setBlock(origin, Blocks.AIR.defaultBlockState(), 3)
+            manager.tick()
+            helper.assertTrue(helper.level.getBlockState(origin) == stone && helper.level.getBlockState(origin.east()) == stairs,
+                "recovery did not restore the blocks after the obstruction was removed")
+            helper.assertTrue(entity.isRemoved, "recovered assembly was not removed")
+        } finally {
+            service.close()
+        }
+        helper.succeed()
+    }
+
+    @GameTest
     fun blockedAssemblyRollbackRecoversAfterTheObstructionIsRemoved(helper: GameTestHelper) {
         val origin = BlockPos(1824, 4, 0)
         helper.level.setChunkForced(origin.x shr 4, 0, true)
@@ -800,7 +1095,7 @@ class AssemblyGameTests {
         val body = created ?: return helper.fail("physics worker did not create the test body")
         helper.assertTrue(acknowledgements.remove(body), "could not intercept the acknowledgement")
         runtime.service.submit(PhysicsCommand.DestroyBody(body.dimension, body.bodyId))
-        helper.level.setBlock(origin.east(), Blocks.DIRT.defaultBlockState(), 3)
+        obstructProtectedSource(runtime.manager, helper, id, origin.east())
         acknowledgements.add(PhysicsAcknowledgement.BodyCreationFailed(id, "injected assembly failure", body.requestId))
         runtime.manager.tick()
         helper.assertTrue(helper.level.getBlockState(origin.east()).`is`(Blocks.DIRT), "rollback overwrote the obstruction")
@@ -840,7 +1135,7 @@ class AssemblyGameTests {
         val body = created ?: return helper.fail("physics worker did not create the test body")
         helper.assertTrue(acknowledgements.remove(body), "could not intercept the acknowledgement")
         runtime.service.submit(PhysicsCommand.DestroyBody(body.dimension, body.bodyId))
-        helper.level.setBlock(origin.east(), Blocks.DIRT.defaultBlockState(), 3)
+        obstructProtectedSource(runtime.manager, helper, id, origin.east())
         acknowledgements.add(PhysicsAcknowledgement.BodyCreationFailed(id, "injected assembly failure", body.requestId))
         runtime.manager.tick()
         val propsField = runtime.manager.javaClass.getDeclaredField("props")
