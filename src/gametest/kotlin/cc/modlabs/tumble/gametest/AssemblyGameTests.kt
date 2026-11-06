@@ -553,6 +553,52 @@ class AssemblyGameTests {
     }
 
     @GameTest
+    fun earlierChunkIoFailurePreventsNewAssemblyConversion(helper: GameTestHelper) {
+        val origin = BlockPos(50432, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        val logger = LoggerFactory.getLogger("assembly-earlier-io-test")
+        val service = ServerPhysicsService(logger).also { it.start() }
+        val directory = Files.createTempDirectory("tumble-earlier-io-test")
+        val journal = directory.resolve("journal")
+        val failuresField = PhysicsServices.javaClass.getDeclaredField("chunkIoFailures").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val failures = failuresField.get(PhysicsServices) as MutableMap<Any, Any>
+        val previous = failures.remove(helper.level.server)
+        try {
+            val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning(), journal)
+            PhysicsServices.chunkIoFailed(helper.level.server)
+            val method = manager.javaClass.declaredMethods.single { it.name.startsWith("convertAssembly") && it.parameterCount == 4 }
+            helper.assertTrue(method.invoke(manager, helper.level, listOf(origin), player, false) == null,
+                "conversion ignored an earlier chunk I/O failure")
+            helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE), "I/O failure consumed a source block")
+            helper.assertTrue(!Files.exists(journal), "refused conversion wrote a journal")
+            failures.remove(helper.level.server)
+            val during = origin.east()
+            helper.level.setBlock(during, Blocks.STONE.defaultBlockState(), 3)
+            net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents.BEFORE.register { level, _, position, _, _ ->
+                if (level === helper.level && position == during) PhysicsServices.chunkIoFailed(level.server)
+                true
+            }
+            helper.assertTrue(method.invoke(manager, helper.level, listOf(during), player, false) == null,
+                "conversion ignored a chunk I/O failure during validation")
+            helper.assertTrue(helper.level.getBlockState(during).`is`(Blocks.STONE), "validation-time I/O failure consumed a block")
+        } finally {
+            if (previous == null) failures.remove(helper.level.server) else failures[helper.level.server] = previous
+            service.close()
+            if (Files.isDirectory(journal)) {
+                Files.list(journal).use { files -> files.forEach { Files.delete(it) } }
+                Files.delete(journal)
+            }
+            Files.deleteIfExists(directory)
+        }
+        helper.succeed()
+    }
+
+    @GameTest
     fun earlyChunkIoFailurePreventsJournalReplay(helper: GameTestHelper) {
         val server = helper.level.server
         val runtimesField = PhysicsServices.javaClass.getDeclaredField("runtimes").apply { isAccessible = true }

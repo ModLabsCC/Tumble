@@ -171,7 +171,8 @@ class PhysicsPropManager(
     }
 
     internal fun convertAssembly(level: ServerLevel, positions: List<BlockPos>, player: ServerPlayer, allowRemote: Boolean = false): PhysicsPropEntity? {
-        if (!service.isRunning() || player.level() !== level || !player.isAlive || player.isSpectator || !player.mayBuild() || !canSpawn() ||
+        if (!service.isRunning() || PhysicsServices.chunkIoFailureCount(server) != 0L ||
+            player.level() !== level || !player.isAlive || player.isSpectator || !player.mayBuild() || !canSpawn() ||
             positions.isEmpty() || positions.size > AssemblyDefinition.MAX_BLOCKS
         ) return null
         val selected = positions.map { it.immutable() }
@@ -245,8 +246,12 @@ class PhysicsPropManager(
             logger.error("Could not journal assembly conversion at {}", origin, error)
             return null
         }
+        if (PhysicsServices.chunkIoFailureCount(server) != 0L) {
+            conversionJournal.complete(entity.uuid)
+            return null
+        }
         recoveryRecords[entity.uuid] = record
-        journalFailureEpoch[entity.uuid] = PhysicsServices.chunkIoFailureCount(server)
+        journalFailureEpoch[entity.uuid] = 0L
         lockConversion(entity.uuid, record)
         try {
             conversionJournal.markStarted(entity.uuid)

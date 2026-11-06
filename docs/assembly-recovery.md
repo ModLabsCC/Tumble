@@ -18,3 +18,5 @@ If startup stops during recovery:
 4. Restart and let Tumble replay the retained journal. Never delete a retained journal while the provenance of its blocks and entity is unresolved. Keep the backup until the expected blocks and entity state have been verified.
 
 The journal and checkpoint target abrupt server-process termination on a local filesystem. Directory-entry durability after an operating-system crash or power loss is not guaranteed. A conversion performs a synchronous level save, which can briefly pause a large server. Other mods that directly modify chunk internals or teleport a pending assembly can bypass the normal recovery assumptions.
+
+If the server reports any chunk or entity storage I/O failure, Tumble refuses new assembly conversions for the rest of that server session. Investigate the reported storage error and restart after correcting it; a failed load may otherwise cause a conversion to capture substituted or incomplete world data. Other conversion paths are unaffected by this guard.
