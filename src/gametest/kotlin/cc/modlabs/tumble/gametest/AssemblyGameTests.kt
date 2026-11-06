@@ -56,42 +56,61 @@ import net.minecraft.world.level.storage.LevelResource
 
 class AssemblyGameTests {
     @GameTest
-    fun clearRetainsPropsWhenConnectionTombstonesFail(helper: GameTestHelper) {
-        val logger = LoggerFactory.getLogger("clear-connection-failure-test")
+    fun clearRetainsPropsWhenRemovalJournalPrepareFails(helper: GameTestHelper) {
+        if (System.getProperty("tumble.isolated.test") != "clear") return helper.succeed()
+        val level = helper.level
+        val server = level.server
+        val runtimeField = PhysicsServices.javaClass.getDeclaredField("runtimes").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val runtimes = runtimeField.get(PhysicsServices) as MutableMap<net.minecraft.server.MinecraftServer, PhysicsServices.Runtime>
+        val originalRuntime = requireNotNull(runtimes[server])
+        val logger = LoggerFactory.getLogger("clear-removal-failure-test")
         val service = ServerPhysicsService(logger).also { it.start() }
+        val terrain = TerrainSectionTracker(service)
+        val manager = PhysicsPropManager(server, service, terrain, logger, TumbleTuning())
         val directory = Files.createTempDirectory("tumble-clear-failure")
         val path = directory.resolve("connections.dat")
         val blocked = directory.resolve("blocked")
-        Files.createDirectory(blocked)
-        Files.writeString(blocked.resolve("keep"), "keep")
+        val removals = directory.resolve("removals")
+        Files.writeString(blocked, "obstruction")
+        Files.createDirectory(removals)
+        val first = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level)
+        val second = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, level)
+        val origin = helper.absolutePos(BlockPos(1, 3, 1))
+        first.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 0.5)
+        second.setPos(origin.x + 2.5, origin.y.toDouble(), origin.z + 0.5)
+        val journalClass = Class.forName("cc.modlabs.tumble.physics.DurableConnectionJournal")
+        val journal = journalClass.getConstructor(java.nio.file.Path::class.java).newInstance(path)
+        val recordClass = Class.forName("cc.modlabs.tumble.physics.DurableConnection")
+        val record = recordClass.getConstructor(UUID::class.java, String::class.java, UUID::class.java, UUID::class.java,
+            UUID::class.java, cc.modlabs.tumble.physics.PhysicsJointKind::class.java,
+            cc.modlabs.tumble.physics.PhysicsJointFrames::class.java, Float::class.javaPrimitiveType,
+            Boolean::class.javaPrimitiveType, List::class.java, Boolean::class.javaPrimitiveType)
+            .newInstance(UUID.randomUUID(), level.physicsDimensionId().value, first.uuid, second.uuid,
+                UUID.randomUUID(), cc.modlabs.tumble.physics.PhysicsJointKind.NO_COLLIDE, null, 0f, false, emptyList<Any>(), true)
+        journalClass.getMethod("put", recordClass).invoke(journal, record)
+        manager.javaClass.getDeclaredField("journal").apply { isAccessible = true }.set(manager, journal)
+        val removalJournal = manager.javaClass.getDeclaredField("removalJournal").apply { isAccessible = true }.get(manager)
+        val removalDirectory = removalJournal.javaClass.getDeclaredField("directory").apply { isAccessible = true }
+        removalDirectory.set(removalJournal, blocked)
+        runtimes[server] = originalRuntime.copy(service = service, terrain = terrain, manager = manager)
         try {
-            val first = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
-            val second = PhysicsPropEntity(TumbleEntities.PHYSICS_PROP, helper.level)
-            val journalClass = Class.forName("cc.modlabs.tumble.physics.DurableConnectionJournal")
-            val journal = journalClass.getConstructor(java.nio.file.Path::class.java).newInstance(path)
-            val recordClass = Class.forName("cc.modlabs.tumble.physics.DurableConnection")
-            val record = recordClass.getConstructor(UUID::class.java, String::class.java, UUID::class.java, UUID::class.java,
-                UUID::class.java, cc.modlabs.tumble.physics.PhysicsJointKind::class.java,
-                cc.modlabs.tumble.physics.PhysicsJointFrames::class.java, Float::class.javaPrimitiveType,
-                Boolean::class.javaPrimitiveType, List::class.java, Boolean::class.javaPrimitiveType)
-                .newInstance(UUID.randomUUID(), helper.level.physicsDimensionId().value, first.uuid, second.uuid,
-                    UUID.randomUUID(), cc.modlabs.tumble.physics.PhysicsJointKind.NO_COLLIDE, null, 0f, false, emptyList<Any>(), true)
-            journalClass.getMethod("put", recordClass).invoke(journal, record)
-            val manager = PhysicsPropManager(helper.level.server, service, TerrainSectionTracker(service), logger, TumbleTuning())
-            manager.javaClass.getDeclaredField("journal").apply { isAccessible = true }.set(manager, journal)
-            manager.entityLoaded(first, helper.level)
-            manager.entityLoaded(second, helper.level)
-            val journalPath = journalClass.getDeclaredField("path").apply { isAccessible = true }
-            journalPath.set(journal, blocked)
-            helper.assertTrue(manager.clear(helper.level) == 0, "clear reported props removed after journal failure")
-            helper.assertTrue(!first.isRemoved && !second.isRemoved, "clear discarded props after journal failure")
-            journalPath.set(journal, path)
-            helper.assertTrue(manager.clear(helper.level) == 2, "clear did not remove props after journal recovered")
+            helper.assertTrue(level.addFreshEntity(first) && level.addFreshEntity(second), "could not add test props")
+            manager.entityLoaded(first, level)
+            manager.entityLoaded(second, level)
+            helper.assertTrue(manager.clear(level) == 0, "clear reported props removed after journal preparation failed")
+            helper.assertTrue(!first.isRemoved && !second.isRemoved, "clear discarded props after journal preparation failed")
+            helper.assertTrue((journalClass.getMethod("records").invoke(journal) as List<*>).isNotEmpty(), "clear lost the connection")
+            removalDirectory.set(removalJournal, removals)
+            helper.assertTrue(manager.clear(level) == 2, "clear did not remove props after journal recovered")
         } finally {
+            runtimes[server] = originalRuntime
+            if (!first.isRemoved) first.discard()
+            if (!second.isRemoved) second.discard()
             service.close()
             Files.deleteIfExists(path)
-            Files.deleteIfExists(blocked.resolve("keep"))
             Files.deleteIfExists(blocked)
+            Files.deleteIfExists(removals)
             Files.deleteIfExists(directory)
         }
         helper.succeed()

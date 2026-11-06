@@ -52,6 +52,39 @@ import net.minecraft.world.level.storage.TagValueInput
 import net.minecraft.world.level.storage.TagValueOutput
 
 class TumbleGameTests {
+    @GameTest
+    fun stoppingServerRetainsPropsAfterPhysicsRuntimeDetaches(helper: GameTestHelper) {
+        if (System.getProperty("tumble.isolated.test") != "shutdown") return helper.succeed()
+        val level = helper.level
+        val server = level.server
+        val fields = PhysicsServices.javaClass
+        val runtimesField = fields.getDeclaredField("runtimes").apply { isAccessible = true }
+        val stoppingField = fields.getDeclaredField("stopping").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val runtimes = runtimesField.get(PhysicsServices) as MutableMap<net.minecraft.server.MinecraftServer, PhysicsServices.Runtime>
+        @Suppress("UNCHECKED_CAST")
+        val stopping = stoppingField.get(PhysicsServices) as MutableSet<net.minecraft.server.MinecraftServer>
+        val runtime = requireNotNull(runtimes.remove(server))
+        val prop = cc.modlabs.tumble.entity.PhysicsPropEntity(cc.modlabs.tumble.entity.TumbleEntities.PHYSICS_PROP, level)
+        try {
+            helper.assertTrue(PhysicsServices.beforePropRemoval(prop, level), "a server that never started Tumble was blocked")
+            runtimes[server] = runtime
+            val detach = fields.getDeclaredMethod("detachForShutdown", net.minecraft.server.MinecraftServer::class.java)
+                .apply { isAccessible = true }
+            helper.assertTrue(detach.invoke(PhysicsServices, server) === runtime, "shutdown did not detach the runtime")
+            prop.discard()
+            helper.assertTrue(!prop.isRemoved, "discard bypassed the shutdown guard after the runtime detached")
+            prop.remove(net.minecraft.world.entity.Entity.RemovalReason.KILLED)
+            helper.assertTrue(!prop.isRemoved, "kill bypassed the shutdown guard after the runtime detached")
+            helper.assertTrue(!PhysicsServices.canTeleportProp(prop, level, level), "shutdown allowed a prop teleport")
+        } finally {
+            stopping.remove(server)
+            runtimes[server] = runtime
+        }
+        helper.assertTrue(PhysicsServices.beforePropRemoval(prop, level), "guard remained active after shutdown ended")
+        helper.succeed()
+    }
+
     @GameTest(maxTicks = 600)
     fun addonCanObserveBodyCreationFailure(helper: GameTestHelper) {
         val baseX = 512

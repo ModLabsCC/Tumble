@@ -8,6 +8,18 @@ import net.minecraft.world.level.entity.PersistentEntitySectionManager;
 
 public final class RemovalCrashHook {
     public static ServerLevel level;
+    public static Object connectionJournal;
+    public static void failConnectionWriteAfterStarted(Path directory) throws Exception {
+        if (level == null || connectionJournal == null || !"connectionIo".equals(System.getProperty("tumble.removal.stage")) ||
+                directory == null || !directory.endsWith("tumble-prop-removal-journal")) return;
+        var blocked = Path.of("connection-io-obstruction");
+        Files.createDirectories(blocked);
+        Files.writeString(blocked.resolve("keep"), "obstruction");
+        var field = connectionJournal.getClass().getDeclaredField("path");
+        field.setAccessible(true);
+        field.set(connectionJournal, blocked);
+        Files.writeString(Path.of("removal-crash-reached.txt"), "connectionIo");
+    }
     public static void crash(String stage, Path directory) throws Exception {
         if (level == null || !stage.equals(System.getProperty("tumble.removal.stage"))) return;
         if (directory != null && !directory.endsWith("tumble-prop-removal-journal")) return;
