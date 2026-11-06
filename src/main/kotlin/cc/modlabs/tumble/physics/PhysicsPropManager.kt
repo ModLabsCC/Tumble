@@ -210,12 +210,16 @@ class PhysicsPropManager(
         }
         entityLoaded(entity, level)
         failedAssemblyConversions.remove(entity.uuid)
+        val removed = ArrayList<ConvertedBlock>(captured.size)
         try {
             for (block in captured) {
-                if (level.getBlockState(block.position) != block.state ||
-                    !level.setBlock(block.position, Blocks.AIR.defaultBlockState(), CONVERSION_FLAGS)
-                ) {
-                    abortAssemblyConversion(entity, level)
+                if (level.getBlockState(block.position) != block.state) {
+                    abortAssemblyConversion(entity, level, removed)
+                    return null
+                }
+                removed += block
+                if (!level.setBlock(block.position, Blocks.AIR.defaultBlockState(), CONVERSION_FLAGS)) {
+                    abortAssemblyConversion(entity, level, removed)
                     return null
                 }
             }
@@ -223,17 +227,18 @@ class PhysicsPropManager(
             activateEntity(entity, level)
         } catch (error: Exception) {
             logger.error("Failed to convert assembly at {}", origin, error)
-            abortAssemblyConversion(entity, level)
+            abortAssemblyConversion(entity, level, removed)
             return null
         }
         if (!entity.physicsPending && entity.runtimeBodyId == null) {
-            abortAssemblyConversion(entity, level)
+            abortAssemblyConversion(entity, level, removed)
             return null
         }
         return entity
     }
 
-    private fun abortAssemblyConversion(entity: PhysicsPropEntity, level: ServerLevel) {
+    private fun abortAssemblyConversion(entity: PhysicsPropEntity, level: ServerLevel, removed: List<ConvertedBlock>) {
+        pendingConversions[entity.uuid] = removed.toList()
         retainFailedAssembly(entity)
         if (rollbackPendingConversion(entity.uuid)) {
             entityUnloaded(entity, level)
@@ -1184,8 +1189,10 @@ class PhysicsPropManager(
 
     private fun rollbackPendingConversion(propId: UUID): Boolean {
         pendingConversions[propId]?.let {
-            val restored = restoreBlocks(it)
+            val remaining = it.toMutableList()
+            val restored = restoreBlocks(remaining)
             if (restored || props[propId]?.assembly == null) pendingConversions.remove(propId)
+            else pendingConversions[propId] = remaining
             return restored
         }
         pendingItemConversions.remove(propId)?.let { return restoreItem(it) }
@@ -1193,7 +1200,7 @@ class PhysicsPropManager(
     }
 
     private fun retainFailedAssembly(entity: PhysicsPropEntity) {
-        val origin = pendingConversions[entity.uuid]?.firstOrNull()?.position ?: return
+        val origin = entity.recoveryOrigin ?: pendingConversions[entity.uuid]?.firstOrNull()?.position ?: return
         entity.recoveryOrigin = origin
         failedAssemblyConversions += entity.uuid
     }
@@ -1202,15 +1209,16 @@ class PhysicsPropManager(
         conversion.level.getBlockState(conversion.position).isAir &&
             conversion.level.setBlock(conversion.position, conversion.state, CONVERSION_FLAGS)
 
-    private fun restoreBlocks(conversions: List<ConvertedBlock>): Boolean {
+    private fun restoreBlocks(conversions: MutableList<ConvertedBlock>): Boolean {
         if (conversions.any {
                 !it.level.isInWorldBounds(it.position) ||
                     !it.level.chunkSource.hasChunk(it.position.x shr 4, it.position.z shr 4) ||
-                    it.level.getBlockState(it.position).let { state -> !state.isAir && state != it.state }
+                    !it.level.getBlockState(it.position).isAir
             }) return false
-        conversions.forEach { block ->
-            if (block.level.getBlockState(block.position) == block.state) return@forEach
-            if (!restoreBlock(block)) return false
+        val iterator = conversions.iterator()
+        while (iterator.hasNext()) {
+            if (!restoreBlock(iterator.next())) return false
+            iterator.remove()
         }
         return true
     }

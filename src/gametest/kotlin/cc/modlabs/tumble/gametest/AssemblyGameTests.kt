@@ -537,6 +537,28 @@ class AssemblyGameTests {
     }
 
     @GameTest
+    fun interruptedRemovalRestoresOnlyBlocksActuallyRemoved(helper: GameTestHelper) {
+        val origin = BlockPos(2336, 4, 0)
+        helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
+        helper.level.getChunkAt(origin)
+        helper.level.setBlock(origin, Blocks.STONE.defaultBlockState(), 3)
+        helper.level.setBlock(origin.east(), Blocks.OAK_STAIRS.defaultBlockState(), 3)
+        net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents.BEFORE.register { level, _, position, _, _ ->
+            if (level === helper.level && position == origin.east()) {
+                level.setBlock(position, Blocks.DIRT.defaultBlockState(), 3)
+            }
+            true
+        }
+        val player = helper.makeMockServerPlayer(GameType.CREATIVE) as ServerPlayer
+        player.setPos(origin.x + 0.5, origin.y.toDouble(), origin.z + 2.0)
+        helper.assertTrue(TumbleApi.convertAssembly(helper.level, listOf(origin, origin.east()), player) == null,
+            "conversion accepted a block that changed during capture")
+        helper.assertTrue(helper.level.getBlockState(origin).`is`(Blocks.STONE), "removed source block was not restored")
+        helper.assertTrue(helper.level.getBlockState(origin.east()).`is`(Blocks.DIRT), "rollback overwrote the changed block")
+        helper.succeed()
+    }
+
+    @GameTest
     fun pendingAssemblySavesRecoveryDataBeforeBodyCreation(helper: GameTestHelper) {
         val origin = BlockPos(2272, 4, 0)
         helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
@@ -561,7 +583,7 @@ class AssemblyGameTests {
     }
 
     @GameTest
-    fun partiallyRemovedAssemblyCanBeRecovered(helper: GameTestHelper) {
+    fun matchingBlockDoesNotProveRecoveryIsComplete(helper: GameTestHelper) {
         val origin = BlockPos(2208, 4, 0)
         helper.level.setChunkForced(origin.x shr 4, origin.z shr 4, true)
         helper.level.getChunkAt(origin)
@@ -588,8 +610,13 @@ class AssemblyGameTests {
         try {
             manager.entityLoaded(entity, helper.level)
             manager.tick()
+            helper.assertTrue(helper.level.getBlockState(origin) == stone && helper.level.getBlockState(origin.east()).isAir,
+                "recovery treated a matching block as proof of restoration")
+            helper.assertTrue(!entity.isRemoved, "ambiguous recovery entity was discarded")
+            helper.level.setBlock(origin, Blocks.AIR.defaultBlockState(), 3)
+            manager.tick()
             helper.assertTrue(helper.level.getBlockState(origin) == stone && helper.level.getBlockState(origin.east()) == stairs,
-                "recovery did not restore the removed block while retaining the original block")
+                "recovery did not restore the blocks after the obstruction was removed")
             helper.assertTrue(entity.isRemoved, "recovered assembly was not removed")
         } finally {
             service.close()
